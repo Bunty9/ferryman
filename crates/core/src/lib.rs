@@ -6,10 +6,12 @@
 //! `Arc<ArcSwap<RouteTable>>` so a new table can be hot-swapped in without
 //! touching live connections.
 
+mod breaker;
 pub mod config;
 pub mod health;
 pub mod route;
 
-pub use config::{build_table, ConfigToml, RouteToml};
+pub use breaker::CircuitState;
+pub use config::{build_table, load_config, ConfigToml, RouteToml};
 pub use health::health_loop;
-pub use route::{RouteTable, SharedTable, Upstream};
+pub use route::{Route, RouteTable, SharedTable, Upstream};

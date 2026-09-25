@@ -7,7 +7,7 @@
 //! in place.
 
 use arc_swap::ArcSwap;
-use ferryman_core::{build_table, ConfigToml, RouteTable, SharedTable};
+use ferryman_core::{build_table, load_config, RouteTable, SharedTable};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ pub fn watch_config(path: &Path, table: SharedTable) -> notify::Result<Recommend
             if !matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                 return;
             }
-            match reload_once(&p) {
+            match reload_once(&p, &table) {
                 Some(new_table) => {
                     table.store(Arc::new(new_table));
                     tracing::info!(path = %p.display(), "config reloaded");
@@ -38,10 +38,10 @@ pub fn watch_config(path: &Path, table: SharedTable) -> notify::Result<Recommend
     Ok(w)
 }
 
-fn reload_once(path: &Path) -> Option<RouteTable> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let cfg: ConfigToml = toml::from_str(&raw).ok()?;
-    build_table(cfg).ok()
+fn reload_once(path: &Path, table: &SharedTable) -> Option<RouteTable> {
+    let cfg = load_config(path).ok()?;
+    let prev = table.load_full();
+    build_table(cfg, Some(&prev)).ok()
 }
 
 /// Re-exported for completeness — callers may want to construct the initial

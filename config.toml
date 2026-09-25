@@ -1,11 +1,21 @@
 # ferryman routing config. Hot-reloaded on file modification.
 #
-# Lookup is prefix-based, longest-prefix-first. Each upstream gets an
-# independent circuit breaker — failed upstreams trip out for
-# `cooldown_secs` before a half-open probe is allowed.
+# Lookup is prefix-based, longest-prefix-first, matched on path-segment
+# boundaries. Each upstream gets an independent circuit breaker — after
+# `failure_threshold` consecutive failures it trips open for
+# `cooldown_secs`, then allows a single half-open probe through.
 
+# Active health-check interval, in seconds.
 health_interval_secs = 5
+
+# Default circuit-breaker cooldown if a route doesn't set cooldown_secs.
 default_cooldown_secs = 30
+
+# Consecutive failures before a closed circuit opens. Must be >= 1.
+# failure_threshold = 3
+
+# Timeout for a forwarded request to an upstream, in seconds.
+# upstream_timeout_secs = 30
 
 [[routes]]
 prefix = "/svc-a"

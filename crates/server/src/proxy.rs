@@ -10,15 +10,15 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use std::sync::atomic::Ordering;
 
 pub type Body = Full<Bytes>;
 
 /// Handle a single inbound request.
 ///
-/// On no matching route: 404. On a routable match but transport error
+/// On no matching route: 404. On a matched route whose circuit breaker
+/// refuses the request: 503. On a routable match but transport error
 /// (upstream down, DNS failure, etc.): 502 plus a circuit-breaker trip
-/// (`Upstream::mark_failed`). On success: forwards the upstream status +
+/// (`Upstream::record_failure`). On success: forwards the upstream status +
 /// body unchanged.
 pub async fn handle(
     table: SharedTable,
@@ -30,7 +30,7 @@ pub async fn handle(
     let path = req.uri().path().to_string();
 
     let upstream = match snapshot.lookup(&path) {
-        Some(u) => u.clone(),
+        Some(r) => r.upstream.clone(),
         None => {
             metrics::counter!(
                 "ferryman_requests_total",
@@ -44,6 +44,17 @@ pub async fn handle(
         }
     };
 
+    if !upstream.try_acquire() {
+        metrics::counter!(
+            "ferryman_requests_total",
+            "status" => "503"
+        )
+        .increment(1);
+        return Ok(Response::builder()
+            .status(503)
+            .body(Body::new(Bytes::from_static(b"upstream unavailable")))?);
+    }
+
     // Rebuild URI: upstream scheme+authority + original path+query.
     let (mut parts, body) = req.into_parts();
     let mut up_parts = upstream.uri.clone().into_parts();
@@ -55,7 +66,7 @@ pub async fn handle(
     let host = upstream.uri.host().unwrap_or("").to_string();
     match client.request(fwd).await {
         Ok(resp) => {
-            upstream.alive.store(true, Ordering::Relaxed); // recovery
+            upstream.record_success();
             let status = resp.status().as_u16();
             let body = resp.into_body().collect().await?.to_bytes();
             metrics::histogram!(
@@ -71,7 +82,7 @@ pub async fn handle(
             Ok(Response::builder().status(status).body(Body::new(body))?)
         }
         Err(e) => {
-            upstream.mark_failed();
+            upstream.record_failure();
             metrics::counter!(
                 "ferryman_requests_total",
                 "status" => "502"

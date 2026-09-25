@@ -10,7 +10,7 @@ mod reload;
 
 use arc_swap::ArcSwap;
 use clap::Parser;
-use ferryman_core::{build_table, health_loop, ConfigToml, SharedTable};
+use ferryman_core::{build_table, health_loop, load_config, SharedTable};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
@@ -53,10 +53,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
-    let raw = std::fs::read_to_string(&args.config)?;
-    let cfg: ConfigToml = toml::from_str(&raw)?;
+    let cfg = load_config(&args.config)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
-    let table = build_table(cfg)?;
+    let table = build_table(cfg, None)?;
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 
     // Prometheus exporter binds its own listener; the proxy is unaffected by

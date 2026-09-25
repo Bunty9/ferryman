@@ -4,8 +4,7 @@
 > breakers, active health checks, hot-reloaded TOML config. Pingora-pattern
 > at miniature scale. Built to be readable in one sitting.
 
-[![ci](https://img.shields.io/badge/ci-pending-lightgrey.svg)](./.github/workflows/ci.yml)
-[![crates.io](https://img.shields.io/badge/crates.io-pending-lightgrey.svg)](#)
+[![ci](https://github.com/Bunty9/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/ferryman/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem
@@ -27,10 +26,10 @@ top-to-bottom.
                     +--+--------------------------+
                        |
                        |  1. parse req.uri.path
-                       |  2. lookup in Arc<Vec<(prefix, Uri)>>
-                       |     sorted DESC by prefix length
-                       |  3. check upstream.alive (AtomicBool)
-                       |  4. rebuild URI, forward via hyper client
+                       |  2. longest prefix match on a path-segment
+                       |     boundary (no match -> 404)
+                       |  3. ask the upstream's breaker (open -> 503)
+                       |  4. rebuild URI, stream via hyper client
                        v
        +---------------+---------+----------+
        |               |         |          |
@@ -40,10 +39,11 @@ top-to-bottom.
        +-------+-------+---------+
                |
         Background task:
-        - active /health every 5s
-        - circuit breaker state machine
-        - on success: alive = true
-        - on N consecutive fails: alive = false, cooldown=30s
+        - active /health every 5s (any answer < 500 = up)
+        - lock-free closed / open / half-open breaker
+        - N consecutive failures: open for cooldown (30s)
+        - after cooldown: exactly one half-open probe
+        - health success: close immediately
 
 Routing rules: TOML, hot-reloaded via `notify` filesystem watch + arc-swap.
 ```
@@ -53,10 +53,10 @@ Routing rules: TOML, hot-reloaded via `notify` filesystem watch + arc-swap.
 | Layer                | Crate / Tool                                                  |
 | -------------------- | ------------------------------------------------------------- |
 | Async runtime        | `tokio` 1.47 (full)                                           |
-| HTTP server          | `hyper` 1.5 + `hyper-util` + `tower-http`                     |
+| HTTP server          | `hyper` 1.x + `hyper-util` auto (HTTP/1.1 + HTTP/2)           |
 | HTTP client (proxy)  | `hyper-util` legacy `Client<HttpConnector>`                   |
-| HTTP client (health) | `reqwest` 0.12 (rustls-tls)                                   |
-| TLS (Phase 2+)       | `rustls` 0.23 + `tokio-rustls`                                |
+| HTTP client (health) | `reqwest` 0.12 (plain HTTP, no TLS stack)                     |
+| TLS termination      | `rustls` 0.23 (`ring`) + `tokio-rustls`, ALPN h2 / http/1.1   |
 | Config               | `serde` + `toml` + `notify` (FS watch)                        |
 | Hot-swap             | `arc-swap` (atomic `RouteTable` swap)                         |
 | Observability        | `tracing` + `metrics-exporter-prometheus`                     |
@@ -74,11 +74,16 @@ rules: [`config.toml`](./config.toml).
 # Build and run against the example config (2 upstreams, 5s health interval).
 cargo run -p ferryman-server -- --config config.toml
 
-# In another shell, hit a route (404 expected until svc-a/svc-b are up):
+# In another shell, hit a route:
 curl -i http://localhost:8080/svc-a/hello
-# HTTP/1.1 502 ...   (no svc-a:8001 listening yet)
+# HTTP/1.1 502 bad gateway          (no svc-a:8001 listening yet)
+# HTTP/1.1 503 upstream unavailable (once its circuit has opened)
 curl -i http://localhost:8080/no-such-route
 # HTTP/1.1 404 no route
+
+# Optional TLS termination (HTTP/2 via ALPN):
+cargo run -p ferryman-server -- --config config.toml \
+    --tls-cert cert.pem --tls-key key.pem
 
 # Scrape Prometheus metrics:
 curl -s http://localhost:9090/metrics | head
@@ -87,17 +92,65 @@ curl -s http://localhost:9090/metrics | head
 Edit `config.toml` while ferryman is running — the routing table reloads
 atomically without dropping live connections.
 
+## Configuration
+
+See [`config.toml`](./config.toml). Unknown keys are rejected, so typos
+fail loudly instead of silently falling back to defaults.
+
+| Key                         | Default | Meaning                                                      |
+| --------------------------- | ------- | ------------------------------------------------------------ |
+| `health_interval_secs`      | 5       | Active `/health` probe interval (restart to change).         |
+| `default_cooldown_secs`     | 30      | How long an open circuit refuses traffic before one probe.   |
+| `failure_threshold`         | 3       | Consecutive failures that open a closed circuit.             |
+| `upstream_timeout_secs`     | 30      | Time allowed for an upstream to send response headers.       |
+| `[[routes]] prefix`         | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`).   |
+| `[[routes]] upstream`       | —       | `http://host:port` — no path, no query, no https.            |
+| `[[routes]] cooldown_secs`  | default | Per-route cooldown override.                                 |
+
+Routes pointing at the same `host:port` share one circuit breaker. A hot
+reload keeps each surviving upstream's breaker, so an open circuit stays
+open across a config edit. An invalid config on reload is logged and the
+old table stays live.
+
+CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
+(`FERRYMAN_BIND`, `0.0.0.0:8080`), `--metrics-bind`
+(`FERRYMAN_METRICS_BIND`, `0.0.0.0:9090`), `--tls-cert` / `--tls-key`
+(`FERRYMAN_TLS_CERT` / `FERRYMAN_TLS_KEY`).
+
+## Behaviour
+
+| Situation                                              | Response | Counts against breaker |
+| ------------------------------------------------------ | -------- | ---------------------- |
+| No route matches                                       | 404      | —                      |
+| Circuit open                                           | 503      | —                      |
+| `Upgrade` / `CONNECT` (e.g. WebSocket)                 | 501      | —                      |
+| Connect / transport error                              | 502      | yes                    |
+| No response headers within `upstream_timeout_secs`     | 504      | only for bodyless requests |
+| Client's request body fails mid-upload                 | 400      | no                     |
+| Upstream answers 502/503/504                           | passed through | yes              |
+| Anything else from upstream                            | passed through | success          |
+
+Request and response bodies are streamed, never buffered. Hop-by-hop
+headers are stripped both ways; `x-forwarded-for` and `x-forwarded-proto`
+are set; the client's `Host` is kept (HTTP/2 `:authority` becomes `Host`).
+Upstreams always get HTTP/1.1. Slow clients are cut off after 10s of
+header reading or TLS handshake. SIGINT/SIGTERM stop accepting and drain
+in-flight connections for up to 25s.
+
 ## Metrics endpoints
 
 The Prometheus exporter binds a separate listener (default `:9090`).
 Surface:
 
-| Metric                              | Labels                                                    | Description                              |
-| ----------------------------------- | --------------------------------------------------------- | ---------------------------------------- |
-| `ferryman_requests_total`           | `status`, `route` (`"none"` on 404), `upstream` (Phase 2) | Counter of inbound requests.             |
-| `ferryman_request_duration_seconds` | `upstream`                                                | Histogram of end-to-end forward latency. |
-| `ferryman_upstream_alive`           | `upstream`                                                | Gauge: 1.0 = alive, 0.0 = circuit open.  |
-| `ferryman_circuit_state` (Phase 2)  | `upstream`                                                | 0 closed / 1 open / 2 half-open.         |
+| Metric                              | Labels                                             | Description                                   |
+| ----------------------------------- | -------------------------------------------------- | --------------------------------------------- |
+| `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404)    | Counter of inbound requests.                  |
+| `ferryman_request_duration_seconds` | `route`, `upstream`                                | Histogram, time to upstream response headers. |
+| `ferryman_upstream_alive`           | `upstream`                                         | Gauge: 1 = circuit closed, 0 otherwise.       |
+| `ferryman_circuit_state`            | `upstream`                                         | Gauge: 0 closed / 1 open / 2 half-open.       |
+
+`route` is the configured prefix and `upstream` is `host:port`, so label
+cardinality is bounded by the config, never by client input.
 
 ## Bench targets (per `projects-l3-l4.md` § P2)
 
@@ -126,10 +179,14 @@ ferryman/
   Cargo.toml                 # workspace
   config.toml                # example routing config
   crates/
-    core/                    # Upstream, RouteTable, health loop, TOML schema
-    server/                  # hyper service, proxy handler, reload watcher
+    core/                    # breaker, RouteTable, health loop, TOML schema
+      benches/lookup.rs      # criterion bench for RouteTable::lookup
+    server/                  # serve loop, proxy handler, TLS, reload watcher
+      tests/proxy.rs         # end-to-end tests on real sockets
   benches/wrk2.lua           # wrk2 harness for the throughput target
-  scripts/wrk2-smoke.sh      # CI smoke wrapper
+  benches/bench.toml         # routing config for the compose fixture
+  docker-compose.bench.yml   # ferryman + two http-echo upstreams
+  scripts/wrk2-smoke.sh      # boots the compose fixture and runs wrk2
   Dockerfile                 # cargo-chef multi-stage, scratch final (musl)
   fly.toml                   # Fly.io 2-region (sin + iad)
   deny.toml                  # cargo-deny config
@@ -141,15 +198,20 @@ ferryman/
   PROGRESS.md
 ```
 
+## Limitations
+
+- Upstreams are plain HTTP only; `https://` upstreams are rejected.
+- No WebSocket / `Upgrade` passthrough (501).
+- No per-upstream load balancing: one route, one upstream.
+- Kubernetes ConfigMap mounts update via a `..data` symlink swap that
+  the file watcher does not see; restart the pod after a ConfigMap edit.
+- The response body has no idle timeout once headers have arrived.
+
 ## Roadmap
 
-Phase 1 (scaffold + `cargo check` green + first 404 served) is the current
-sprint — see
-[`docs/plans/2026-05-28-ferryman-phase-1-scaffold.md`](./docs/plans/2026-05-28-ferryman-phase-1-scaffold.md).
-Subsequent phases (real upstream forwarding under load, full circuit-breaker
-state machine, TLS termination via rustls, Fly.io demo) are tracked in
-[`PROGRESS.md`](./PROGRESS.md). P4 (ferryman-edge) layers mTLS + JWT +
-hot-reload on top of this base; see `projects-l3-l4.md` § P4.
+Phases and bench numbers are tracked in [`PROGRESS.md`](./PROGRESS.md).
+P4 (ferryman-edge) layers mTLS + JWT + cert hot-reload on top of this
+base; see `projects-l3-l4.md` § P4.
 
 ## License <a id="license"></a>
 

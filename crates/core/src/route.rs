@@ -6,7 +6,7 @@
 //! on cache behaviour and is trivial to reason about.
 
 use crate::breaker::Breaker;
-pub use crate::breaker::CircuitState;
+pub use crate::breaker::{Admission, CircuitState};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,29 +30,30 @@ impl Upstream {
         Self { uri, name, breaker }
     }
 
-    /// May this request be sent to the upstream right now? See
-    /// [`Breaker::try_acquire`] for the half-open semantics.
-    pub fn try_acquire(&self) -> bool {
+    /// May this request be sent to the upstream right now? Returns the
+    /// ticket to pass back to `record_*`; see [`Admission`].
+    pub fn try_acquire(&self) -> Option<Admission> {
         self.breaker.try_acquire()
     }
 
-    pub fn record_success(&self) {
-        self.breaker.record_success()
+    pub fn record_success(&self, admission: Admission) {
+        self.breaker.record_success(admission)
     }
 
-    pub fn record_failure(&self) {
-        self.breaker.record_failure()
+    pub fn record_failure(&self, admission: Admission) {
+        self.breaker.record_failure(admission)
     }
 
     pub fn state(&self) -> CircuitState {
         self.breaker.state()
     }
 
-    /// Carry the breaker's runtime state (not its config) over from a
-    /// previous build of this same upstream, so a hot config reload doesn't
-    /// reset an open circuit.
-    pub(crate) fn adopt_state(&self, prev: &Upstream) {
-        self.breaker.adopt_state(&prev.breaker);
+    /// Same upstream, same breaker, new URI/config. Used by hot reload so
+    /// in-flight requests and health probes holding the old table keep
+    /// reporting to the breaker the new table uses.
+    pub(crate) fn reuse(&self, cooldown: Duration, failure_threshold: u32) -> Self {
+        self.breaker.reconfigure(cooldown, failure_threshold);
+        self.clone()
     }
 }
 
@@ -107,6 +108,15 @@ impl RouteTable {
         self.routes
             .iter()
             .filter_map(move |r| seen.insert(r.upstream.name.clone()).then_some(&r.upstream))
+    }
+
+    /// Set `ferryman_circuit_state` / `ferryman_upstream_alive` for every
+    /// upstream. Call after installing a table (and after the metrics
+    /// recorder is installed) so healthy upstreams are exported too.
+    pub fn publish_gauges(&self) {
+        for u in self.upstreams() {
+            u.breaker.set_gauges();
+        }
     }
 }
 

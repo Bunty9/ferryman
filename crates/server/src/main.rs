@@ -56,18 +56,20 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("--tls-cert and --tls-key must both be set or both omitted"),
     };
 
-    // Load + parse the initial config. Fail fast on first-boot misconfiguration.
-    let cfg = load_config(&args.config)?;
-    let interval = Duration::from_secs(cfg.health_interval_secs);
-    let table = build_table(cfg, None)?;
-    let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
-
     // Prometheus exporter binds its own listener; the proxy is unaffected by
-    // /metrics traffic.
+    // /metrics traffic. Installed before any gauge is set, or the writes go
+    // to the no-op recorder.
     PrometheusBuilder::new()
         .with_http_listener(args.metrics_bind)
         .install()?;
     tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
+
+    // Load + parse the initial config. Fail fast on first-boot misconfiguration.
+    let cfg = load_config(&args.config)?;
+    let interval = Duration::from_secs(cfg.health_interval_secs);
+    let table = build_table(cfg, None)?;
+    table.publish_gauges();
+    let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 
     // Background tasks: active health checker + config watcher.
     tokio::spawn(health_loop(shared.clone(), interval));

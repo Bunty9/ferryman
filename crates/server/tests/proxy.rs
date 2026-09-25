@@ -10,6 +10,7 @@ use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -59,6 +60,29 @@ where
                 continue;
             };
             tokio::spawn(serve_one(stream, handler.clone()));
+        }
+    });
+    addr
+}
+
+/// A stub that can be switched "down": while down it accepts and drops
+/// every connection, so the proxy sees a transport error. Keeps its port
+/// for the whole test (no rebinding races with parallel tests).
+async fn spawn_toggle_stub(down: Arc<AtomicBool>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            if down.load(Ordering::SeqCst) {
+                drop(stream);
+                continue;
+            }
+            tokio::spawn(serve_one(stream, |_req: Request<Incoming>| async {
+                ok("up")
+            }));
         }
     });
     addr
@@ -217,9 +241,7 @@ async fn strips_hop_by_hop_headers_and_sets_forwarded_headers() {
 
 #[tokio::test]
 async fn dead_upstream_502s_until_breaker_opens() {
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = dead.local_addr().unwrap();
-    drop(dead);
+    let addr = spawn_toggle_stub(Arc::new(AtomicBool::new(true))).await;
 
     let table = shared_table(parse_cfg(&format!(
         "failure_threshold = 2\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{addr}\"\n"
@@ -262,61 +284,97 @@ async fn upstream_timeout_is_504() {
 
 #[tokio::test]
 async fn half_open_probe_recovers_after_cooldown() {
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = dead.local_addr().unwrap();
-    drop(dead);
+    let down = Arc::new(AtomicBool::new(true));
+    let addr = spawn_toggle_stub(down.clone()).await;
 
     let table = shared_table(parse_cfg(&format!(
         "failure_threshold = 1\ndefault_cooldown_secs = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{addr}\"\n"
     )));
     let proxy = start_proxy(table).await;
     let client = reqwest::Client::new();
+    let get = || client.get(format!("http://{proxy}/svc-a")).send();
 
     // First request fails and trips the breaker open (threshold 1).
-    let r1 = client
-        .get(format!("http://{proxy}/svc-a"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r1.status(), 502);
+    assert_eq!(get().await.unwrap().status(), 502);
+    // Cooldown hasn't elapsed: breaker refuses outright.
+    assert_eq!(get().await.unwrap().status(), 503);
 
-    // Immediately after, cooldown hasn't elapsed: breaker refuses outright.
-    let r2 = client
-        .get(format!("http://{proxy}/svc-a"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r2.status(), 503);
-
-    // Revive the upstream on the exact same address.
-    let revived = TcpListener::bind(addr).await.unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = revived.accept().await else {
-                continue;
-            };
-            tokio::spawn(serve_one(stream, |_req: Request<Incoming>| async {
-                ok("revived")
-            }));
-        }
-    });
-
+    down.store(false, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
-    let r3 = client
-        .get(format!("http://{proxy}/svc-a"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r3.status(), 200);
-    assert_eq!(r3.text().await.unwrap(), "revived");
+    // The half-open probe succeeds and closes the circuit.
+    let r = get().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "up");
+    assert_eq!(get().await.unwrap().status(), 200);
+}
 
-    let r4 = client
-        .get(format!("http://{proxy}/svc-a"))
+#[tokio::test]
+async fn client_abort_mid_body_does_not_trip_breaker() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    for _ in 0..3 {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        s.write_all(b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\nonly-a-bit")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(s);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let resp = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
+    assert_eq!(resp.status(), 200, "breaker must not open on client aborts");
+}
+
+#[tokio::test]
+async fn http2_client_is_forwarded_as_http1_with_host_and_joined_cookies() {
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("http://{proxy}/svc-a/x"))
+        .header("cookie", "a=1")
+        .header("cookie", "b=2")
         .send()
         .await
         .unwrap();
-    assert_eq!(r4.status(), 200);
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(&format!("host: {proxy}")), "{body}");
+    assert!(body.contains("cookie: a=1; b=2"), "{body}");
+}
+
+#[tokio::test]
+async fn upgrade_requests_get_501() {
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{proxy}/svc-a/ws"))
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
 }
 
 #[tokio::test]

@@ -34,4 +34,4 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["http2"] }

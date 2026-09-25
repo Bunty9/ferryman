@@ -3,7 +3,7 @@
 //! records the result through the circuit breaker.
 
 use crate::route::SharedTable;
-use crate::route::Upstream;
+use crate::route::{Admission, Upstream};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -36,10 +36,21 @@ pub async fn health_loop(table: SharedTable, interval: Duration) {
 
 async fn probe_one(client: &reqwest::Client, up: &Upstream) {
     let url = health_url(&up.uri);
-    match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => up.record_success(),
-        _ => up.record_failure(),
+    // Health checks are authoritative, like the half-open probe: a healthy
+    // answer closes an open circuit at once (fast failover recovery).
+    let status = client.get(&url).send().await.map(|r| r.status());
+    if is_healthy(status.as_ref().ok()) {
+        up.record_success(Admission::Probe);
+    } else {
+        up.record_failure(Admission::Probe);
     }
+}
+
+/// Any answer below 500 means the process is up. Many upstreams have no
+/// `/health` route and answer 404; only transport errors, timeouts and 5xx
+/// count as failures.
+fn is_healthy(status: Option<&reqwest::StatusCode>) -> bool {
+    status.is_some_and(|s| !s.is_server_error())
 }
 
 /// Build the `/health` probe URL from an upstream URI. `http::Uri`'s
@@ -55,6 +66,15 @@ fn health_url(uri: &http::Uri) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_status_mapping() {
+        use reqwest::StatusCode as S;
+        assert!(is_healthy(Some(&S::OK)));
+        assert!(is_healthy(Some(&S::NOT_FOUND)));
+        assert!(!is_healthy(Some(&S::SERVICE_UNAVAILABLE)));
+        assert!(!is_healthy(None));
+    }
 
     #[test]
     fn health_url_has_no_double_slash() {

@@ -8,7 +8,7 @@ use http::header::{self, HeaderName, HeaderValue};
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request, Response};
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -61,16 +61,43 @@ pub async fn handle(
     let route_label = route.prefix.clone();
     let upstream = route.upstream.clone();
 
-    if !upstream.try_acquire() {
+    // Upgrades (WebSocket etc.) need both hops spliced together, which this
+    // proxy doesn't do; say so instead of forwarding a mangled plain GET.
+    if req.headers().contains_key(header::UPGRADE) || req.method() == http::Method::CONNECT {
+        record(started, &route_label, &upstream.name, 501);
+        return Ok(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "protocol upgrades are not supported",
+        ));
+    }
+
+    let Some(admission) = upstream.try_acquire() else {
         record(started, &route_label, &upstream.name, 503);
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream unavailable",
         ));
-    }
+    };
 
     let (mut parts, body) = req.into_parts();
+    // Only a request with no body to stream can blame a timeout on the
+    // upstream; with a body, a slow client looks exactly like a slow server.
+    let bodyless = body.is_end_stream();
     strip_hop_by_hop(&mut parts.headers);
+    if parts.version == http::Version::HTTP_2 {
+        join_cookies(&mut parts.headers);
+    }
+    // HTTP/2 carries the host in `:authority`, not `Host`; pin it before the
+    // URI is rewritten so upstreams see the same Host for h1 and h2 clients.
+    if !parts.headers.contains_key(header::HOST) {
+        if let Some(v) = parts
+            .uri
+            .authority()
+            .and_then(|a| HeaderValue::from_str(a.as_str()).ok())
+        {
+            parts.headers.insert(header::HOST, v);
+        }
+    }
 
     let mut up_parts = upstream.uri.clone().into_parts();
     up_parts.path_and_query = parts.uri.path_and_query().cloned();
@@ -98,27 +125,39 @@ pub async fn handle(
 
     match tokio::time::timeout(table.upstream_timeout, client.request(fwd)).await {
         Err(_elapsed) => {
-            upstream.record_failure();
+            if bodyless {
+                upstream.record_failure(admission);
+            }
             record(started, &route_label, &upstream.name, 504);
             Ok(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream timeout",
             ))
         }
-        Ok(Err(e)) => {
-            upstream.record_failure();
-            record(started, &route_label, &upstream.name, 502);
+        Ok(Err(e)) if is_client_body_error(&e) => {
+            // The client's request body failed (e.g. it hung up mid-upload).
+            // Not the upstream's fault, so the breaker stays out of it.
+            tracing::debug!(error = %e, "client request body failed");
+            record(started, &route_label, &upstream.name, 400);
             Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("upstream error: {e}"),
+                StatusCode::BAD_REQUEST,
+                "request body error",
             ))
+        }
+        Ok(Err(e)) => {
+            upstream.record_failure(admission);
+            tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
+            record(started, &route_label, &upstream.name, 502);
+            Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
         }
         Ok(Ok(resp)) => {
             let status = resp.status();
+            // Health is judged on the response head; the body is streamed
+            // afterwards with no timeout of its own.
             if matches!(status.as_u16(), 502..=504) {
-                upstream.record_failure();
+                upstream.record_failure(admission);
             } else {
-                upstream.record_success();
+                upstream.record_success(admission);
             }
             record(started, &route_label, &upstream.name, status.as_u16());
 
@@ -148,11 +187,50 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+/// Did `client.request` fail because reading the *client's* body failed?
+/// hyper reports errors from the outgoing body as user errors.
+fn is_client_body_error(e: &hyper_util::client::legacy::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(|h| h.is_user())
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// HTTP/2 lets clients split `cookie` into several fields; HTTP/1.1
+/// upstreams expect one (RFC 9113 §8.2.3), so join them with `"; "`.
+fn join_cookies(headers: &mut HeaderMap) {
+    if headers.get_all(header::COOKIE).iter().count() < 2 {
+        return;
+    }
+    let joined = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .map(|v| v.as_bytes())
+        .collect::<Vec<_>>()
+        .join(&b"; "[..]);
+    if let Ok(v) = HeaderValue::from_bytes(&joined) {
+        headers.insert(header::COOKIE, v);
+    }
+}
+
 fn append_forwarded_for(headers: &mut HeaderMap, ip: std::net::IpAddr) {
     let name = HeaderName::from_static("x-forwarded-for");
-    let value = match headers.get(&name).and_then(|v| v.to_str().ok()) {
-        Some(existing) => format!("{existing}, {ip}"),
-        None => ip.to_string(),
+    let existing: Vec<&str> = headers
+        .get_all(&name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let value = if existing.is_empty() {
+        ip.to_string()
+    } else {
+        format!("{}, {ip}", existing.join(", "))
     };
     if let Ok(v) = HeaderValue::from_str(&value) {
         headers.insert(name, v);

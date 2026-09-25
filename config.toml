@@ -5,7 +5,8 @@
 # `failure_threshold` consecutive failures it trips open for
 # `cooldown_secs`, then allows a single half-open probe through.
 
-# Active health-check interval, in seconds.
+# Active health-check interval, in seconds. Each tick GETs `/health` on every
+# upstream; any answer below 500 counts as healthy and closes an open circuit.
 health_interval_secs = 5
 
 # Default circuit-breaker cooldown if a route doesn't set cooldown_secs.

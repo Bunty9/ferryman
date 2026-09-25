@@ -3,3 +3,6 @@ target/
 .remember/
 docs/
 *.md
+# The cargo-chef image pins its own toolchain with the musl target added;
+# rust-toolchain.toml would make rustup switch to a stable without it.
+rust-toolchain.toml

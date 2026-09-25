@@ -1,28 +1,17 @@
-//! ferryman-server — hyper-based reverse proxy with circuit breakers, active
-//! health checks, and hot-reloaded TOML routing rules.
-//!
-//! Phase 1 goal: bind a TCP listener, serve requests through `proxy::handle`,
-//! spawn the health-check loop, and start a filesystem watcher that
-//! atomically swaps the routing table on config change.
-
-mod proxy;
-mod reload;
+//! ferryman-server CLI — parses args, sets up tracing/metrics, loads the
+//! initial routing config, spawns the health-check loop and hot-reload
+//! watcher, then hands off to [`ferryman_server::serve`].
 
 use arc_swap::ArcSwap;
 use clap::Parser;
 use ferryman_core::{build_table, health_loop, load_config, SharedTable};
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::service::service_fn;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as HttpAutoBuilder;
+use ferryman_server::{reload, tls};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -39,6 +28,15 @@ struct Args {
     /// Bind address for the Prometheus `/metrics` listener.
     #[arg(long, env = "FERRYMAN_METRICS_BIND", default_value = "0.0.0.0:9090")]
     metrics_bind: SocketAddr,
+
+    /// TLS certificate PEM path. Requires `--tls-key`; omit both to serve
+    /// plain HTTP.
+    #[arg(long, env = "FERRYMAN_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    /// TLS private key PEM path. Requires `--tls-cert`.
+    #[arg(long, env = "FERRYMAN_TLS_KEY")]
+    tls_key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -51,6 +49,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Some(tls::load_acceptor(cert, key)?),
+        (None, None) => None,
+        _ => anyhow::bail!("--tls-cert and --tls-key must both be set or both omitted"),
+    };
 
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let cfg = load_config(&args.config)?;
@@ -69,34 +73,18 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(health_loop(shared.clone(), interval));
     let _watcher = reload::watch_config(&args.config, shared.clone())?;
 
-    // Shared hyper client for upstream forwarding.
-    let client: Client<HttpConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    tracing::info!(addr = %args.bind, "ferryman-server listening");
+    tracing::info!(addr = %args.bind, tls = tls_acceptor.is_some(), "ferryman-server listening");
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let table = shared.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| proxy::handle(table.clone(), client.clone(), req));
-            if let Err(e) = HttpAutoBuilder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await
-            {
-                tracing::debug!(?peer, ?e, "connection closed with error");
-            }
-        });
-    }
+    ferryman_server::serve(listener, shared, tls_acceptor, shutdown_signal()).await
 }
 
-/// Placeholder for a future `/metrics` router served via tower (e.g. when we
-/// want auth on the metrics surface). The Prometheus exporter currently owns
-/// the listener directly — see `main()`.
-#[allow(dead_code)]
-fn metrics_router() {
-    todo!("Phase 2: optional tower router for /metrics with auth + scrape filters");
+/// Resolves on SIGINT or SIGTERM, for graceful shutdown.
+async fn shutdown_signal() {
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
+    }
 }

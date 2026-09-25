@@ -1,54 +1,70 @@
 //! Filesystem-watch driven hot-reload of the routing table.
 //!
-//! Editor-style writes typically emit a `Modify` event on the file we
-//! actually watch; some tools rename-and-replace which would surface
-//! as a remove + create on the parent directory. Phase 1 watches the file
-//! directly — good enough for `vim`, `nano`, and most editors that write
-//! in place.
+//! Watches the config file's *parent directory*, non-recursively, rather
+//! than the file itself: editors that save via rename-and-replace (write a
+//! temp file, then rename it over the original) emit a remove + create on
+//! the directory rather than a `Modify` on a stable inode, and a watch on
+//! the file alone misses those. An event is acted on only when one of its
+//! paths' file name matches the config file's.
+//!
+//! Note: `health_interval_secs` changes are not picked up by reload — the
+//! health-check loop's ticker interval is fixed at startup and needs a
+//! process restart to change.
 
-use arc_swap::ArcSwap;
 use ferryman_core::{build_table, load_config, RouteTable, SharedTable};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Spin up a `notify` watcher on `path` and return it. Dropping the returned
-/// watcher cancels the subscription.
+/// Spin up a `notify` watcher on `path`'s parent directory and return it.
+/// Dropping the returned watcher cancels the subscription.
 pub fn watch_config(path: &Path, table: SharedTable) -> notify::Result<RecommendedWatcher> {
-    let p = path.to_path_buf();
-    let mut w: RecommendedWatcher =
+    let path = path.to_path_buf();
+    let dir = watch_dir(&path);
+    let file_name: Option<OsString> = path.file_name().map(|n| n.to_os_string());
+
+    let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(ev) = res else {
+            let Ok(event) = res else {
                 return;
             };
-            if !matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+            let touches_config = event
+                .paths
+                .iter()
+                .any(|p| p.file_name() == file_name.as_deref());
+            if !touches_config {
                 return;
             }
-            match reload_once(&p, &table) {
-                Some(new_table) => {
-                    table.store(Arc::new(new_table));
-                    tracing::info!(path = %p.display(), "config reloaded");
-                }
-                None => {
-                    tracing::error!(path = %p.display(), "config reload failed; keeping old table");
-                }
+            if let Some(new_table) = reload_once(&path, &table) {
+                table.store(Arc::new(new_table));
+                tracing::info!(path = %path.display(), "config reloaded");
             }
         })?;
-    w.watch(path, RecursiveMode::NonRecursive)?;
-    Ok(w)
+    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
 }
 
+fn watch_dir(config_path: &Path) -> PathBuf {
+    match config_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Re-read and rebuild the routing table, keeping the old one on any error
+/// (config unreadable, unparsable, or failing validation). Returns `None`
+/// on error, having already logged the full error chain.
 fn reload_once(path: &Path, table: &SharedTable) -> Option<RouteTable> {
-    let cfg = load_config(path).ok()?;
+    let cfg = load_config(path)
+        .inspect_err(|e| {
+            tracing::error!(path = %path.display(), error = %format!("{e:#}"), "config reload failed; keeping old table")
+        })
+        .ok()?;
     let prev = table.load_full();
-    build_table(cfg, Some(&prev)).ok()
-}
-
-/// Re-exported for completeness — callers may want to construct the initial
-/// `SharedTable` themselves rather than via `main()`. Marked `allow(dead_code)`
-/// because Phase 1 only uses it from tests / integration code (none yet);
-/// CI runs with `-D warnings`.
-#[allow(dead_code)]
-pub fn new_shared(table: RouteTable) -> SharedTable {
-    Arc::new(ArcSwap::from_pointee(table))
+    build_table(cfg, Some(&prev))
+        .inspect_err(|e| {
+            tracing::error!(path = %path.display(), error = %format!("{e:#}"), "config reload failed; keeping old table")
+        })
+        .ok()
 }

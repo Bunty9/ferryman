@@ -1,0 +1,5 @@
+target/
+.git/
+.remember/
+docs/
+*.md

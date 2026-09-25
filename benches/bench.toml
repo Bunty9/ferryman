@@ -1,0 +1,16 @@
+# ferryman benchmarking config. Hot-reloaded on file modification.
+#
+# Lookup is prefix-based, longest-prefix-first. Each upstream gets an
+# independent circuit breaker — failed upstreams trip out for
+# `cooldown_secs` before a half-open probe is allowed.
+
+health_interval_secs = 5
+default_cooldown_secs = 30
+
+[[routes]]
+prefix = "/svc-a"
+upstream = "http://svc-a:8001"
+
+[[routes]]
+prefix = "/svc-b"
+upstream = "http://svc-b:8002"

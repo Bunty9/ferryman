@@ -1,0 +1,21 @@
+
+services:
+  svc-a:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:8001", "-text=svc-a"]
+
+  svc-b:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:8002", "-text=svc-b"]
+
+  ferryman:
+    build: .
+    command: ["--config", "/app/bench.toml"]
+    volumes:
+      - ./benches/bench.toml:/app/bench.toml:ro
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      - svc-a
+      - svc-b

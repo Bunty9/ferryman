@@ -381,6 +381,7 @@ dependencies = [
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "notify",
  "reqwest",
  "rustls",

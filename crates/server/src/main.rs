@@ -7,6 +7,7 @@ use clap::Parser;
 use ferryman_core::{build_table, health_loop, load_config, SharedTable};
 use ferryman_server::{reload, tls};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_util::MetricKindMask;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,14 +60,20 @@ async fn main() -> anyhow::Result<()> {
     // Prometheus exporter binds its own listener; the proxy is unaffected by
     // /metrics traffic. Installed before any gauge is set, or the writes go
     // to the no-op recorder.
-    PrometheusBuilder::new()
-        .with_http_listener(args.metrics_bind)
-        .install()?;
-    tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
-
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let cfg = load_config(&args.config)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
+
+    // Prometheus exporter binds its own listener; the proxy is unaffected by
+    // /metrics traffic. Installed before any gauge is set, or the writes go
+    // to the no-op recorder. The health loop rewrites every live gauge each
+    // tick, so gauges of upstreams removed by a reload expire after a few
+    // missed ticks instead of reporting a stale value forever.
+    PrometheusBuilder::new()
+        .with_http_listener(args.metrics_bind)
+        .idle_timeout(MetricKindMask::GAUGE, Some(interval * 3))
+        .install()?;
+    tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
     let table = build_table(cfg, None)?;
     table.publish_gauges();
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));

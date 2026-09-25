@@ -63,7 +63,13 @@ pub async fn handle(
 
     // Upgrades (WebSocket etc.) need both hops spliced together, which this
     // proxy doesn't do; say so instead of forwarding a mangled plain GET.
-    if req.headers().contains_key(header::UPGRADE) || req.method() == http::Method::CONNECT {
+    // `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
+    // like curl --http2 or Java's HttpClient send it on every plain request.
+    let wants_upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
+    if wants_upgrade || req.method() == http::Method::CONNECT {
         record(started, &route_label, &upstream.name, 501);
         return Ok(error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -87,16 +93,17 @@ pub async fn handle(
     if parts.version == http::Version::HTTP_2 {
         join_cookies(&mut parts.headers);
     }
-    // HTTP/2 carries the host in `:authority`, not `Host`; pin it before the
-    // URI is rewritten so upstreams see the same Host for h1 and h2 clients.
-    if !parts.headers.contains_key(header::HOST) {
-        if let Some(v) = parts
-            .uri
-            .authority()
-            .and_then(|a| HeaderValue::from_str(a.as_str()).ok())
-        {
-            parts.headers.insert(header::HOST, v);
-        }
+    // An authority in the request URI (HTTP/2 `:authority`, or an HTTP/1
+    // absolute-form target) overrides `Host` (RFC 9112 §3.2.2). Pin it before
+    // the URI is rewritten so upstreams see the client's host either way.
+    if let Some(v) = parts.uri.authority().and_then(|a| {
+        let host = match a.port() {
+            Some(port) => format!("{}:{port}", a.host()),
+            None => a.host().to_string(),
+        };
+        HeaderValue::from_str(&host).ok()
+    }) {
+        parts.headers.insert(header::HOST, v);
     }
 
     let mut up_parts = upstream.uri.clone().into_parts();

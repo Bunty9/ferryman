@@ -375,6 +375,60 @@ async fn upgrade_requests_get_501() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 501);
+
+    // h2c upgrade offers are ignorable and must be served as plain HTTP/1.1.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{proxy}/svc-a/x"))
+        .header("connection", "upgrade, http2-settings")
+        .header("upgrade", "h2c")
+        .header("http2-settings", "AAMAAABkAAQAAP__")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(!body.contains("upgrade"), "{body}");
+}
+
+#[tokio::test]
+async fn absolute_form_authority_overrides_host() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"GET http://a.example/svc-a/x HTTP/1.1\r\nhost: b.example\r\nconnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.contains("host: a.example"), "{out}");
+}
+
+#[tokio::test]
+async fn idle_connection_is_dropped_after_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let table = shared_table(parse_cfg(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://127.0.0.1:1\"\n",
+    ));
+    let proxy = start_proxy(table).await;
+
+    // A partial h2 preface keeps the auto builder's version sniff waiting.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"PRI").await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(15), s.read(&mut buf))
+        .await
+        .expect("proxy should close the stalled connection")
+        .unwrap_or(0);
+    assert_eq!(n, 0);
 }
 
 #[tokio::test]

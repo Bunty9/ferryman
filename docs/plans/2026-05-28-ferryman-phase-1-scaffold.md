@@ -64,11 +64,10 @@ related:
 3. **`curl -i http://localhost:8080/no-such-route`** returns `HTTP/1.1 404`
    with body `no route`.
 4. **`curl -i http://localhost:8080/svc-a/anything`** returns `HTTP/1.1
-   404` *once the health loop has fired* (it ticks on startup, marks the
-   dead upstream, and `lookup` skips it for the cooldown window). To
-   observe the raw 502 path, raise `health_interval_secs` and curl
-   immediately — Phase 2 adds a startup grace window so the very first
-   request to an unprobed upstream gets a real forward attempt.
+   502` while the dead upstream's circuit is still closed, then `503
+   upstream unavailable` once `failure_threshold` failures (requests or
+   health probes) have opened it. *(Superseded Phase 1 behaviour: lookup
+   used to skip dead upstreams and answer 404.)*
 
 ## Out of scope (deferred to later phases)
 

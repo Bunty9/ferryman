@@ -70,6 +70,15 @@ Metrics endpoint /metrics:
 
 ## 4. Key Rust code
 
+> **Status (2026-09):** the blocks below are the original Phase 1 sketch.
+> The shipped code keeps the shape but differs in the details: the breaker
+> is an explicit closed/open/half-open state machine with ticketed
+> admissions (`crates/core/src/breaker.rs`), lookup matches on path-segment
+> boundaries and ignores health (dead upstream = 503, not a fallback to a
+> shorter prefix), bodies are streamed rather than collected, and reload
+> watches the parent directory with debouncing. See the README's
+> *Behaviour* section for the resulting contract.
+
 ### 4.1 Config + routing table (`crates/core/src/route.rs`)
 
 ```rust

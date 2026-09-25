@@ -41,8 +41,10 @@ pub fn watch_config(path: &Path, table: SharedTable) -> notify::Result<Recommend
             let event = match res {
                 Ok(event) => event,
                 Err(e) => {
-                    // e.g. inotify queue overflow: we may have missed a save.
+                    // e.g. inotify queue overflow: we may have missed a save,
+                    // so reload anyway; a spurious reload is harmless.
                     tracing::warn!(error = %e, "config watch error");
+                    let _ = tx.send(());
                     return;
                 }
             };

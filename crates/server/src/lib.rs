@@ -18,6 +18,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as HttpAutoBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tls::MaybeTlsStream;
 use tokio::net::TcpListener;
@@ -32,8 +34,8 @@ pub type ProxyClient = Client<HttpConnector, Incoming>;
 /// `kill_timeout` so the drain finishes before a SIGKILL.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// Deadline for a client to finish the TLS handshake, and (HTTP/1) to send
-/// a complete request head. Stops idle sockets from pinning file
+/// Deadline for a client to finish the TLS handshake, to send its first
+/// request, and (HTTP/1) to send each complete request head. Stops idle sockets from pinning file
 /// descriptors (slowloris).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -108,26 +110,37 @@ pub async fn serve(
                                 }
                             }
                         }
-                        None => {
-                            // The auto builder sniffs h1 vs h2 from the first
-                            // bytes with no deadline of its own.
-                            // ponytail: TLS clients that stall after the
-                            // handshake still sit in that sniff; bounded by
-                            // the cost of a full handshake per socket.
-                            let mut byte = [0u8; 1];
-                            match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut byte)).await {
-                                Ok(Ok(n)) if n > 0 => MaybeTlsStream::Plain(stream),
-                                _ => return,
-                            }
-                        }
+                        None => MaybeTlsStream::Plain(stream),
                     };
                     let io = TokioIo::new(stream);
+                    let seen_request = Arc::new(AtomicBool::new(false));
+                    let seen = seen_request.clone();
                     let svc = service_fn(move |req| {
+                        seen.store(true, Ordering::Relaxed);
                         proxy::handle(table.clone(), client.clone(), peer, proto, req)
                     });
-                    let conn = builder.serve_connection(io, svc);
-                    if let Err(e) = watcher.watch(conn).await {
-                        tracing::debug!(?peer, ?e, "connection closed with error");
+                    let conn = watcher.watch(builder.serve_connection(io, svc));
+                    tokio::pin!(conn);
+                    // The auto builder's h1-vs-h2 sniff runs before hyper's
+                    // own header timeout exists, so a client that sends a
+                    // byte or two (or an h2 preface) and stalls would sit
+                    // there forever. Drop connections that haven't produced
+                    // a first request in time; nothing is in flight yet.
+                    let first_request_deadline = async {
+                        tokio::time::sleep(HANDSHAKE_TIMEOUT).await;
+                        if seen_request.load(Ordering::Relaxed) {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    tokio::select! {
+                        res = &mut conn => {
+                            if let Err(e) = res {
+                                tracing::debug!(?peer, ?e, "connection closed with error");
+                            }
+                        }
+                        _ = first_request_deadline => {
+                            tracing::debug!(?peer, "no request before deadline; closing");
+                        }
                     }
                 });
             }

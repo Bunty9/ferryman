@@ -134,6 +134,11 @@ impl Breaker {
     pub(crate) fn record_success(&self, admission: Admission) {
         match admission {
             Admission::Probe => {
+                // A health check passing says nothing about whether real
+                // requests are failing, so it must not reset their count.
+                if self.state() == CircuitState::Closed {
+                    return;
+                }
                 self.consecutive_failures.store(0, Ordering::Relaxed);
                 if self
                     .state
@@ -219,7 +224,7 @@ mod tests {
     /// Open the breaker, wait out the cooldown, and take the probe.
     fn half_open(b: &Breaker) {
         b.record_failure(N);
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(250));
         assert_eq!(b.try_acquire(), Some(P));
         assert_eq!(b.state(), CircuitState::HalfOpen);
     }
@@ -253,10 +258,10 @@ mod tests {
 
     #[test]
     fn half_open_single_probe() {
-        let b = Arc::new(breaker(20, 1));
+        let b = Arc::new(breaker(200, 1));
         b.record_failure(N);
         assert_eq!(b.state(), CircuitState::Open);
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(250));
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -274,7 +279,7 @@ mod tests {
 
     #[test]
     fn probe_failure_reopens() {
-        let b = breaker(20, 1);
+        let b = breaker(200, 1);
         half_open(&b);
         b.record_failure(P);
         assert_eq!(b.state(), CircuitState::Open);
@@ -283,7 +288,7 @@ mod tests {
 
     #[test]
     fn probe_success_closes() {
-        let b = breaker(20, 1);
+        let b = breaker(200, 1);
         half_open(&b);
         b.record_success(P);
         assert_eq!(b.state(), CircuitState::Closed);
@@ -300,14 +305,23 @@ mod tests {
     }
 
     #[test]
+    fn health_success_does_not_reset_request_failures() {
+        let b = breaker(10_000, 2);
+        b.record_failure(N);
+        b.record_success(P);
+        b.record_failure(N);
+        assert_eq!(b.state(), CircuitState::Open);
+    }
+
+    #[test]
     fn late_normal_results_are_ignored() {
-        let b = breaker(20, 1);
+        let b = breaker(200, 1);
         b.record_failure(N);
         // A slow request admitted while closed finishes after the trip.
         b.record_success(N);
         assert_eq!(b.state(), CircuitState::Open);
 
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(250));
         assert_eq!(b.try_acquire(), Some(P));
         // Another late failure must not reopen while the probe is out.
         b.record_failure(N);
@@ -316,11 +330,11 @@ mod tests {
 
     #[test]
     fn stuck_half_open_probe_recovers() {
-        let b = breaker(20, 1);
+        let b = breaker(200, 1);
         half_open(&b);
         // Probe never reports back. After another cooldown window a new
         // probe must still be allowed through instead of sticking forever.
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(250));
         assert_eq!(b.try_acquire(), Some(P));
         assert_eq!(b.state(), CircuitState::HalfOpen);
     }

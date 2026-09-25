@@ -48,7 +48,7 @@ impl Upstream {
         self.breaker.state()
     }
 
-    /// Same upstream, same breaker, new URI/config. Used by hot reload so
+    /// Same upstream, same breaker, new config. Used by hot reload so
     /// in-flight requests and health probes holding the old table keep
     /// reporting to the breaker the new table uses.
     pub(crate) fn reuse(&self, cooldown: Duration, failure_threshold: u32) -> Self {
@@ -58,7 +58,8 @@ impl Upstream {
 }
 
 pub(crate) fn upstream_name(uri: &http::Uri) -> String {
-    let host = uri.host().unwrap_or("");
+    // Hostnames are case-insensitive; one name per backend, one breaker.
+    let host = uri.host().unwrap_or("").to_ascii_lowercase();
     let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
         Some("https") => 443,
         _ => 80,

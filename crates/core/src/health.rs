@@ -11,6 +11,9 @@ use tokio::task::JoinSet;
 pub async fn health_loop(table: SharedTable, interval: Duration) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
+        // A 3xx (e.g. an http->https redirect) already proves the upstream
+        // is up; following it would fail for lack of TLS here.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -24,6 +27,9 @@ pub async fn health_loop(table: SharedTable, interval: Duration) {
     loop {
         ticker.tick().await;
         let current = table.load_full();
+        // Refresh every tick: gauges for upstreams dropped by a reload stop
+        // being written and expire from the exporter (see main.rs).
+        current.publish_gauges();
         let mut probes = JoinSet::new();
         for up in current.upstreams() {
             let client = client.clone();

@@ -74,6 +74,9 @@ rules: [`config.toml`](./config.toml).
 # Build and run against the example config (2 upstreams, 5s health interval).
 cargo run -p ferryman-server -- --config config.toml
 
+# Optional: local upstreams that answer 200 on every path.
+cargo run --release -p ferryman-server --example echo_upstream -- 127.0.0.1:8001 &
+
 # In another shell, hit a route:
 curl -i http://localhost:8080/svc-a/hello
 # HTTP/1.1 502 bad gateway          (no svc-a:8001 listening yet)

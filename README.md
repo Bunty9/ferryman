@@ -196,8 +196,10 @@ ferryman/
   rust-toolchain.toml        # stable channel
   .github/workflows/ci.yml   # nextest + clippy + fmt + deny + bench + wrk2
   docs/
+    architecture.md          # internals: request path, breaker, reload
     specs/2026-05-28-ferryman-design.md
     plans/2026-05-28-ferryman-phase-1-scaffold.md
+    plans/2026-09-26-ferryman-phase-2.md
   PROGRESS.md
 ```
 
@@ -211,6 +213,8 @@ ferryman/
 - The response body has no idle timeout once headers have arrived.
 
 ## Roadmap
+
+How it works inside: [`docs/architecture.md`](./docs/architecture.md).
 
 Phases and bench numbers are tracked in [`PROGRESS.md`](./PROGRESS.md).
 P4 (ferryman-edge) layers mTLS + JWT + cert hot-reload on top of this

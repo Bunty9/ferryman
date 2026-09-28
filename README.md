@@ -5,6 +5,8 @@
 > at miniature scale. Built to be readable in one sitting.
 
 [![ci](https://github.com/Bunty9/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/ferryman/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ferryman.svg)](https://crates.io/crates/ferryman)
+[![docs.rs](https://img.shields.io/docsrs/ferryman)](https://docs.rs/ferryman)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem

@@ -42,6 +42,14 @@
 - [ ] Fly.io 2-region deploy + failover demo screencast (needs a Fly
       account; `fly.toml` and a 9 MB scratch image are ready)
 
+## Release — 0.1.0 (done, 2026-09-28)
+
+- [x] `ferryman` and `ferryman-core` 0.1.0 on crates.io; `cargo install
+      --locked ferryman` verified
+- [x] Tag `v0.1.0` + GitHub release
+- [ ] Trusted Publishing + `release.yml` for later releases
+      (`docs/plans/2026-09-28-publishing.md` step 4)
+
 ## Next — P4 (ferryman-edge)
 
 - mTLS, JWT auth plane, cert hot-reload, WebSocket/Upgrade passthrough,

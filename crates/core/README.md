@@ -1,5 +1,8 @@
 # ferryman-core
 
+[![crates.io](https://img.shields.io/crates/v/ferryman-core.svg)](https://crates.io/crates/ferryman-core)
+[![docs.rs](https://img.shields.io/docsrs/ferryman-core)](https://docs.rs/ferryman-core)
+
 Building blocks of the [ferryman](https://github.com/Bunty9/ferryman)
 reverse proxy, usable on their own:
 

@@ -39,6 +39,12 @@ The proxy is published as **`ferryman`** (package, library and binary), so
 `cargo install ferryman` installs a `ferryman` binary. The library crate
 stays `ferryman-core`. The source directory is still `crates/server`.
 
+## Release log
+
+- 2026-09-28: `ferryman-core` 0.1.0 and `ferryman` 0.1.0 published with
+  `cargo publish --workspace`; tag `v0.1.0` and GitHub release created;
+  `cargo install --locked ferryman` verified from the registry.
+
 ## Step 2 — pre-flight (every release)
 
 ```bash

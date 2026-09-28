@@ -15,6 +15,7 @@ use std::time::Duration;
 /// Top-level config file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ConfigToml {
     /// Active health-check interval in seconds.
     #[serde(default = "default_health_interval")]
@@ -47,6 +48,7 @@ fn default_upstream_timeout() -> u64 {
 /// One routing rule.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RouteToml {
     /// Path prefix to match (e.g. `/svc-a`).
     pub prefix: String,

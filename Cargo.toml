@@ -10,8 +10,14 @@ edition = "2021"
 version = "0.1.0"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+authors = ["Bunty9"]
+repository = "https://github.com/Bunty9/ferryman"
+homepage = "https://github.com/Bunty9/ferryman"
 
 [workspace.dependencies]
+# Internal crate: path for local builds, version for crates.io.
+ferryman-core = { path = "crates/core", version = "0.1.0" }
+
 # Runtime + HTTP
 tokio = { version = "1.47", features = ["full"] }
 hyper = { version = "1.5", features = ["full"] }

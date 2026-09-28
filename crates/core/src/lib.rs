@@ -5,6 +5,27 @@
 //! Everything in this crate is reload-safe: `SharedTable` is an
 //! `Arc<ArcSwap<RouteTable>>` so a new table can be hot-swapped in without
 //! touching live connections.
+//!
+//! ```
+//! use ferryman_core::{build_table, ConfigToml};
+//!
+//! let cfg: ConfigToml = toml::from_str(r#"
+//!     [[routes]]
+//!     prefix = "/svc-a"
+//!     upstream = "http://127.0.0.1:8001"
+//! "#)?;
+//! let table = build_table(cfg, None)?;
+//!
+//! let route = table.lookup("/svc-a/users").expect("route");
+//! assert!(table.lookup("/svc-ab").is_none());
+//! if let Some(ticket) = route.upstream.try_acquire() {
+//!     // ... forward the request, then report the outcome:
+//!     route.upstream.record_success(ticket);
+//! } else {
+//!     // circuit open: answer 503
+//! }
+//! # Ok::<(), anyhow::Error>(())
+//! ```
 
 mod breaker;
 pub mod config;

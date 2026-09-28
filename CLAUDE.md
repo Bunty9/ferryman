@@ -12,6 +12,8 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `cargo bench -p ferryman-core --no-run` - criterion lookup bench must compile
 - `cargo run --release -p ferryman-server --example echo_upstream -- 127.0.0.1:8001` - local upstream stub
 - `bash scripts/wrk2-smoke.sh` - compose fixture + wrk2; runs in CI (wrk2 isn't buildable locally: no OpenSSL headers)
+- `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` - no intra-doc links to private items
 - `gh run list -L 3` / `gh run view <id> --log` - CI status and smoke-bench numbers
 
 ## Invariants (don't regress)
@@ -32,6 +34,12 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Don't add `rustls-pemfile` (unmaintained advisory); use `rustls::pki_types::pem::PemObject`.
 - `rust-toolchain.toml` is in `.dockerignore` on purpose: it made rustup switch to a toolchain without the musl target.
 - CI test job sets `RUSTUP_TOOLCHAIN=${{ matrix.rust }}`; otherwise the toolchain file forces stable on the beta leg.
+
+## Publishing
+
+- Version lives in `[workspace.package]` AND the `ferryman-core` entry of `[workspace.dependencies]`; bump both together.
+- `crates/*/LICENSE-*` are symlinks to the root files; keep them (they ship the license texts in each `.crate`).
+- `ConfigToml`/`RouteToml` are `#[non_exhaustive]`: construct via TOML parsing outside the core crate.
 
 ## Testing patterns
 

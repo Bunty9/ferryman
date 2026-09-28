@@ -10,7 +10,7 @@
 //! One save can emit several events (e.g. `MODIFY` then `CLOSE_WRITE`), and
 //! the first may fire while the file is half written. Events are therefore
 //! coalesced: a reload runs once the directory has been quiet for
-//! [`DEBOUNCE`].
+//! `DEBOUNCE` (200ms).
 //!
 //! Limits: `health_interval_secs` changes need a restart (the health loop's
 //! ticker is fixed at startup). Kubernetes ConfigMap mounts swap a `..data`

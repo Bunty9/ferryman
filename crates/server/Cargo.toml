@@ -4,7 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Hyper-based reverse proxy binary — wires ferryman-core into a service."
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Small L7 reverse proxy: prefix routing, per-upstream circuit breakers, active health checks, hot-reloaded TOML config, TLS termination."
+documentation = "https://docs.rs/ferryman-server"
+readme = "../../README.md"
+keywords = ["reverse-proxy", "proxy", "circuit-breaker", "hyper", "http"]
+categories = ["network-programming", "web-programming::http-server", "command-line-utilities"]
 
 [lib]
 name = "ferryman_server"
@@ -15,7 +22,7 @@ name = "ferryman-server"
 path = "src/main.rs"
 
 [dependencies]
-ferryman-core = { path = "../core", version = "0.1.0" }
+ferryman-core = { workspace = true }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

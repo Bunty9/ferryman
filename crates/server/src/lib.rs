@@ -45,7 +45,7 @@ const H2_KEEP_ALIVE: Duration = Duration::from_secs(30);
 
 /// Accept connections on `listener` and serve the proxy until `shutdown`
 /// resolves, then stop accepting and wait (up to
-/// [`GRACEFUL_SHUTDOWN_TIMEOUT`]) for in-flight connections to finish.
+/// `GRACEFUL_SHUTDOWN_TIMEOUT`, 25s) for in-flight connections to finish.
 ///
 /// TLS-terminates each connection first when `tls` is `Some`; otherwise
 /// serves plain HTTP. Either way, both HTTP/1 and HTTP/2 are auto-detected.

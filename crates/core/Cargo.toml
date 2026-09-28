@@ -4,7 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Core types — RouteTable, Upstream, circuit breaker, active health checker for ferryman."
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lock-free circuit breaker, prefix routing table, hot-reloadable TOML config and active health checks for the ferryman reverse proxy."
+documentation = "https://docs.rs/ferryman-core"
+readme = "README.md"
+keywords = ["circuit-breaker", "reverse-proxy", "routing", "health-check", "hyper"]
+categories = ["network-programming", "web-programming::http-server"]
 
 [lib]
 path = "src/lib.rs"

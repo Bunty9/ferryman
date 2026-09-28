@@ -71,11 +71,15 @@ rules: [`config.toml`](./config.toml).
 ## Quick start
 
 ```bash
+# Install the binary from crates.io:
+cargo install --locked ferryman
+ferryman --config config.toml
+
 # Build and run against the example config (2 upstreams, 5s health interval).
-cargo run -p ferryman-server -- --config config.toml
+cargo run -p ferryman -- --config config.toml
 
 # Optional: local upstreams that answer 200 on every path.
-cargo run --release -p ferryman-server --example echo_upstream -- 127.0.0.1:8001 &
+cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8001 &
 
 # In another shell, hit a route:
 curl -i http://localhost:8080/svc-a/hello
@@ -85,7 +89,7 @@ curl -i http://localhost:8080/no-such-route
 # HTTP/1.1 404 no route
 
 # Optional TLS termination (HTTP/2 via ALPN):
-cargo run -p ferryman-server -- --config config.toml \
+cargo run -p ferryman -- --config config.toml \
     --tls-cert cert.pem --tls-key key.pem
 
 # Scrape Prometheus metrics:

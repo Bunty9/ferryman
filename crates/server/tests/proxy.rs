@@ -1,5 +1,5 @@
 //! Integration tests for the proxy: real sockets, tiny hyper upstream
-//! stubs, and `ferryman_server::serve` driven end to end.
+//! stubs, and `ferryman::serve` driven end to end.
 
 use ferryman_core::{build_table, load_config, ConfigToml, SharedTable};
 use http_body_util::{BodyExt, Full};
@@ -93,7 +93,7 @@ async fn spawn_toggle_stub(down: Arc<AtomicBool>) -> SocketAddr {
 async fn start_proxy(table: SharedTable) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(ferryman_server::serve(
+    tokio::spawn(ferryman::serve(
         listener,
         table,
         None,
@@ -454,7 +454,7 @@ async fn hot_reload_picks_up_new_routes_via_rename_replace() {
     let table: SharedTable = Arc::new(arc_swap::ArcSwap::from_pointee(
         build_table(cfg, None).unwrap(),
     ));
-    let _watcher = ferryman_server::reload::watch_config(&config_path, table.clone()).unwrap();
+    let _watcher = ferryman::reload::watch_config(&config_path, table.clone()).unwrap();
     let proxy = start_proxy(table).await;
     let client = reqwest::Client::new();
 

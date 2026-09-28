@@ -13,13 +13,13 @@ contract (config keys, status codes, metrics) is in the
 |                  | `route.rs`                              | `Upstream`, `Route`, `RouteTable`, `SharedTable`, prefix lookup  |
 |                  | `config.rs`                             | TOML schema, `load_config`, validating `build_table`             |
 |                  | `health.rs`                             | Concurrent active health checks                                  |
-| `ferryman-server`| `lib.rs`                                | `serve`: accept loop, deadlines, TLS, graceful shutdown          |
+| `ferryman`       | `lib.rs`                                | `serve`: accept loop, deadlines, TLS, graceful shutdown          |
 |                  | `proxy.rs`                              | Per-request handler                                              |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
 |                  | `reload.rs`                             | Debounced config file watcher                                    |
 |                  | `main.rs`                               | CLI, tracing, metrics exporter, signal handling                  |
 
-`ferryman-server` is a library plus a thin binary so the end-to-end tests
+`ferryman` is a library plus a thin binary so the end-to-end tests
 can drive the real `serve` loop on an ephemeral port.
 
 ## Request lifecycle

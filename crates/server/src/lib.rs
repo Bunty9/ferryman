@@ -1,4 +1,4 @@
-//! ferryman-server — hyper-based reverse proxy service: the per-request
+//! ferryman — hyper-based reverse proxy service: the per-request
 //! handler ([`proxy`]), optional TLS termination ([`tls`]), and the
 //! hot-reload watcher ([`reload`]).
 //!

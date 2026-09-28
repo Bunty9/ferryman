@@ -1,11 +1,11 @@
-//! ferryman-server CLI — parses args, sets up tracing/metrics, loads the
+//! ferryman CLI — parses args, sets up tracing/metrics, loads the
 //! initial routing config, spawns the health-check loop and hot-reload
-//! watcher, then hands off to [`ferryman_server::serve`].
+//! watcher, then hands off to [`ferryman::serve`].
 
 use arc_swap::ArcSwap;
 use clap::Parser;
+use ferryman::{reload, tls};
 use ferryman_core::{build_table, health_loop, load_config, SharedTable};
-use ferryman_server::{reload, tls};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics_util::MetricKindMask;
 use std::net::SocketAddr;
@@ -16,7 +16,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "ferryman-server", about = "ferryman L7 reverse proxy")]
+#[command(name = "ferryman", about = "ferryman L7 reverse proxy")]
 struct Args {
     /// Path to the TOML routing config.
     #[arg(long, env = "FERRYMAN_CONFIG", default_value = "config.toml")]
@@ -83,9 +83,9 @@ async fn main() -> anyhow::Result<()> {
     let _watcher = reload::watch_config(&args.config, shared.clone())?;
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    tracing::info!(addr = %args.bind, tls = tls_acceptor.is_some(), "ferryman-server listening");
+    tracing::info!(addr = %args.bind, tls = tls_acceptor.is_some(), "ferryman listening");
 
-    ferryman_server::serve(listener, shared, tls_acceptor, shutdown_signal()).await
+    ferryman::serve(listener, shared, tls_acceptor, shutdown_signal()).await
 }
 
 /// Resolves on SIGINT or SIGTERM, for graceful shutdown.

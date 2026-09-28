@@ -1,6 +1,6 @@
 ---
 title: ferryman — publishing to crates.io
-status: ready (awaiting naming decision and first manual publish)
+status: 0.1.0 published 2026-09-28
 date: 2026-09-28
 related:
     - ./2026-09-26-ferryman-phase-2.md
@@ -23,29 +23,21 @@ related:
   ship in every `.crate` file (cargo follows the symlinks).
 - `ferryman-core` has its own `README.md`; its example is also a doctest
   in `lib.rs`, so it can't drift.
-- `ferryman-server` depends on core via `[workspace.dependencies]`
+- `ferryman` depends on core via `[workspace.dependencies]`
   (`path` + `version`), which cargo rewrites to a registry dependency on
   publish.
 - `ConfigToml` / `RouteToml` are `#[non_exhaustive]`, so new config keys
   are not a semver break.
 - `cargo publish --workspace --dry-run` packages and verifies both crates;
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` is clean.
-- Names `ferryman`, `ferryman-core`, `ferryman-server` were all free on
-  crates.io as of 2026-09-28.
+- Names `ferryman` and `ferryman-core` were free on crates.io as of
+  2026-09-28.
 
-## Step 1 — decide the binary crate's name (open)
+## Step 1 — binary crate name (decided)
 
-`cargo install <crate>` is how people will find the proxy, and the bare
-`ferryman` name is free today.
-
-| Option | Install command | Binary | Cost |
-| --- | --- | --- | --- |
-| A. Keep `ferryman-server` | `cargo install ferryman-server` | `ferryman-server` | none |
-| B. Rename package to `ferryman` (recommended) | `cargo install ferryman` | `ferryman` | rename `ferryman_server` in tests, Dockerfile, fly.toml, CI, README |
-
-With A, consider also publishing a placeholder `ferryman` pointing at
-`ferryman-server` so the name isn't taken by someone else. B is cleaner
-and cheap now; it gets harder after 0.1.0 is out.
+The proxy is published as **`ferryman`** (package, library and binary), so
+`cargo install ferryman` installs a `ferryman` binary. The library crate
+stays `ferryman-core`. The source directory is still `crates/server`.
 
 ## Step 2 — pre-flight (every release)
 
@@ -71,7 +63,7 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 2. Publish in dependency order (cargo >= 1.90 orders them for you):
    ```bash
    cargo publish --workspace
-   # or: cargo publish -p ferryman-core && cargo publish -p ferryman-server
+   # or: cargo publish -p ferryman-core && cargo publish -p ferryman
    ```
 3. Tag and release:
    ```bash
@@ -79,7 +71,7 @@ in `[workspace.package]` and in the `ferryman-core` entry of
    gh release create v0.1.0 --notes-from-tag
    ```
 4. Check <https://docs.rs/ferryman-core> and
-   <https://docs.rs/ferryman-server> built, then add crates.io and docs.rs
+   <https://docs.rs/ferryman> built, then add crates.io and docs.rs
    badges to `README.md` (they 404 until the crates exist).
 
 ## Step 4 — automate later releases

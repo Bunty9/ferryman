@@ -2,7 +2,7 @@
 //! (including `/health`) with `200 ok`.
 //!
 //! ```bash
-//! cargo run --release -p ferryman-server --example echo_upstream -- 127.0.0.1:8001
+//! cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8001
 //! ```
 
 use http_body_util::Full;

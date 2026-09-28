@@ -10,7 +10,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `cargo test --workspace` - 32 unit + 15 e2e tests; ~10s because `idle_connection_is_dropped_after_deadline` waits out the real 10s deadline
 - `cargo deny check` - must stay clean (CI job); installed at `~/.cargo/bin/cargo-deny`
 - `cargo bench -p ferryman-core --no-run` - criterion lookup bench must compile
-- `cargo run --release -p ferryman-server --example echo_upstream -- 127.0.0.1:8001` - local upstream stub
+- `cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8001` - local upstream stub
 - `bash scripts/wrk2-smoke.sh` - compose fixture + wrk2; runs in CI (wrk2 isn't buildable locally: no OpenSSL headers)
 - `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` - no intra-doc links to private items
@@ -43,7 +43,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 
 ## Testing patterns
 
-- E2E tests in `crates/server/tests/proxy.rs` run `ferryman_server::serve` on `127.0.0.1:0` with hyper stubs.
+- E2E tests in `crates/server/tests/proxy.rs` run `ferryman::serve` on `127.0.0.1:0` with hyper stubs.
 - Simulate a dead upstream with `spawn_toggle_stub` (drops connections), never by dropping/rebinding a port (flaky in parallel).
 - Breaker unit tests use >=200ms cooldowns; 20ms windows were flaky under parallel test load.
 - Raw `TcpStream` writes are used for cases reqwest can't express (partial bodies, absolute-form targets, stalled prefaces).

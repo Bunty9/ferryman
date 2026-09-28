@@ -23,15 +23,15 @@ RUN cargo chef cook --release \
 COPY . .
 RUN cargo build --release \
     --target x86_64-unknown-linux-musl \
-    --bin ferryman-server
+    --bin ferryman
 
 # ---- Stage 4: scratch runtime -----------------------------------------------
 FROM scratch AS runtime
 WORKDIR /app
 COPY --from=builder \
-    /app/target/x86_64-unknown-linux-musl/release/ferryman-server \
-    /usr/local/bin/ferryman-server
+    /app/target/x86_64-unknown-linux-musl/release/ferryman \
+    /usr/local/bin/ferryman
 COPY config.toml /app/config.toml
 EXPOSE 8080 9090
-ENTRYPOINT ["/usr/local/bin/ferryman-server"]
+ENTRYPOINT ["/usr/local/bin/ferryman"]
 CMD ["--config", "/app/config.toml"]

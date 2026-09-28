@@ -71,10 +71,10 @@
 Reproduce locally:
 
 ```bash
-cargo build --release -p ferryman-server --bin ferryman-server --example echo_upstream
+cargo build --release -p ferryman --bin ferryman --example echo_upstream
 ./target/release/examples/echo_upstream 127.0.0.1:8001 &
 ./target/release/examples/echo_upstream 127.0.0.1:8002 &
-./target/release/ferryman-server --config config.toml &
+./target/release/ferryman --config config.toml &
 wrk2 -c 1000 -t 16 -R 50000 -d 60s -s benches/wrk2.lua http://127.0.0.1:8080
 ```
 

@@ -3,11 +3,11 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`
-and `ferryman-server` are released together with the same version.
+and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-09-28
 
 First public release.
 
@@ -22,7 +22,7 @@ First public release.
 - Concurrent active health checks (`health_loop`).
 - `ferryman_circuit_state` and `ferryman_upstream_alive` gauges.
 
-### ferryman-server
+### ferryman
 
 - Streaming HTTP/1.1 + HTTP/2 reverse proxy with 404 / 501 / 502 / 503 /
   504 mapping, hop-by-hop header stripping and `x-forwarded-*` headers.

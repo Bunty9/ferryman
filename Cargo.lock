@@ -351,24 +351,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferryman-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "criterion",
- "http",
- "hyper",
- "metrics",
- "reqwest",
- "serde",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "ferryman-server"
+name = "ferryman"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -390,6 +373,23 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ferryman-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "criterion",
+ "http",
+ "hyper",
+ "metrics",
+ "reqwest",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "ferryman-server"
+name = "ferryman"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,17 +8,17 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Small L7 reverse proxy: prefix routing, per-upstream circuit breakers, active health checks, hot-reloaded TOML config, TLS termination."
-documentation = "https://docs.rs/ferryman-server"
+documentation = "https://docs.rs/ferryman"
 readme = "../../README.md"
 keywords = ["reverse-proxy", "proxy", "circuit-breaker", "hyper", "http"]
 categories = ["network-programming", "web-programming::http-server", "command-line-utilities"]
 
 [lib]
-name = "ferryman_server"
+name = "ferryman"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ferryman-server"
+name = "ferryman"
 path = "src/main.rs"
 
 [dependencies]

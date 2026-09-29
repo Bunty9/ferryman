@@ -30,9 +30,11 @@ use tokio_rustls::TlsAcceptor;
 pub type ProxyClient = Client<HttpConnector, Incoming>;
 
 /// Latency buckets (seconds) for `ferryman_request_duration_seconds`,
-/// spanning sub-millisecond proxy hops to multi-second slow upstreams.
+/// spanning sub-millisecond proxy hops up to `upstream_timeout_secs`'s
+/// default of 30s, so the slowest (about-to-time-out) requests still land
+/// in a real bucket instead of falling into `+Inf`.
 pub const LATENCY_BUCKETS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
 /// How long to wait for in-flight connections to finish after `shutdown`

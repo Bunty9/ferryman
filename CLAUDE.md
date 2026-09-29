@@ -42,10 +42,10 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 
 ## Publishing
 
-- Version lives in `[workspace.package]` AND the `ferryman-core` entry of `[workspace.dependencies]`; bump both together.
+- Version lives in `[workspace.package]` AND the `ferryman-core` entry of `[workspace.dependencies]`; bump both together. On a minor/major bump also update the `version = "0.x"` reqs on both crates in `examples/embedded/Cargo.toml`, and commit the refreshed `Cargo.lock` (`release.yml` builds `--locked`).
 - `crates/*/LICENSE-*` are symlinks to the root files; keep them (they ship the license texts in each `.crate`).
 - `ConfigToml`/`RouteToml` are `#[non_exhaustive]`: construct via TOML parsing outside the core crate.
-- `.github/workflows/release.yml` publishes on a `v*` tag push (Trusted Publishing); see `docs/plans/2026-09-28-publishing.md` for the one remaining manual step and the release procedure.
+- `.github/workflows/release.yml` publishes on a `v*` tag push (Trusted Publishing, three jobs: verify/publish/release, idempotent per-crate publish); see `docs/plans/2026-09-28-publishing.md` for the one remaining manual step, the release procedure, and half-published-release recovery.
 
 ## Testing patterns
 

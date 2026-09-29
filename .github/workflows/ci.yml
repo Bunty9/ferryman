@@ -36,7 +36,7 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo nextest
-        run: cargo nextest run --workspace --no-fail-fast
+        run: cargo nextest run --workspace --no-fail-fast --locked
       - name: example crates are not publishable
         run: |
           cargo metadata --no-deps --format-version 1 \

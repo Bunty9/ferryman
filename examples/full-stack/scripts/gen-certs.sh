@@ -1,7 +1,8 @@
 #!/bin/sh
 # Generates a throwaway CA + server cert for the full-stack demo's TLS
-# termination. Idempotent: does nothing if the CA already exists, so
-# repeated `docker compose up` runs don't rotate certs under a live proxy.
+# termination. Idempotent: does nothing if a complete set of certs already
+# exists, so repeated `docker compose up` runs don't rotate certs under a
+# live proxy.
 #
 # Usage: gen-certs.sh [output-dir]   (default: certs, relative to cwd)
 #
@@ -13,10 +14,17 @@ set -eu
 OUT_DIR="${1:-certs}"
 mkdir -p "$OUT_DIR"
 
-if [ -f "$OUT_DIR/ca.pem" ]; then
-    echo "[gen-certs] $OUT_DIR/ca.pem already exists, skipping"
+if [ -f "$OUT_DIR/ca.pem" ] && [ -f "$OUT_DIR/server.pem" ] && [ -f "$OUT_DIR/server-key.pem" ]; then
+    echo "[gen-certs] $OUT_DIR already has ca.pem/server.pem/server-key.pem, skipping generation"
+    # Enforce perms every run, even when skipping generation: an older
+    # checkout (from before this chmod existed, or a partial/interrupted
+    # run) can leave a world-readable ca-key.pem sitting there indefinitely
+    # otherwise, since generation itself never runs again.
+    if [ -f "$OUT_DIR/ca-key.pem" ]; then chmod 0600 "$OUT_DIR/ca-key.pem"; fi
+    chmod 0644 "$OUT_DIR/server.pem" "$OUT_DIR/server-key.pem" "$OUT_DIR/ca.pem"
     exit 0
 fi
+echo "[gen-certs] $OUT_DIR is missing one or more of ca.pem/server.pem/server-key.pem, (re)generating"
 
 command -v openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null
 

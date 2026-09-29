@@ -47,7 +47,12 @@ services:
       # config file's *parent directory* for rename-replace saves, which a
       # single-file bind mount can't deliver (see README's production notes).
       - ./config:/etc/ferryman:ro
-      - ./certs:/certs:ro
+      # Single-file mounts here (unlike the config mount above): certs
+      # aren't hot-reloaded, so there's no rename-replace-detection reason
+      # to mount the whole directory, and doing so would also hand this
+      # container read access to ./certs/ca-key.pem, which it never needs.
+      - ./certs/server.pem:/certs/server.pem:ro
+      - ./certs/server-key.pem:/certs/server-key.pem:ro
     depends_on:
       certgen:
         condition: service_completed_successfully

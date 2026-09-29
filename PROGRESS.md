@@ -47,7 +47,8 @@
 - [x] `ferryman` and `ferryman-core` 0.1.0 on crates.io; `cargo install
       --locked ferryman` verified
 - [x] Tag `v0.1.0` + GitHub release
-- [ ] Trusted Publishing + `release.yml` for later releases
+- [ ] Trusted Publishing: `.github/workflows/release.yml` now exists in
+      the repo; the only thing left is the crates.io setting itself
       (`docs/plans/2026-09-28-publishing.md` step 4)
 
 ## Release — 0.2.0 (2026-09-29)

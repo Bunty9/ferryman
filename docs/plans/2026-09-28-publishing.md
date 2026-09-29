@@ -82,37 +82,44 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 
 ## Step 4 — automate later releases
 
-After the crates exist, enable crates.io Trusted Publishing (crate
-settings, then *Trusted Publishing*: repo `Bunty9/ferryman`, workflow
-`release.yml`) and drop the long-lived token. Then add:
+`.github/workflows/release.yml` exists in the repo already: on a `v*` tag
+push it verifies the tag matches `[workspace.package]` version (and that
+the `ferryman-core` entry in `[workspace.dependencies]` agrees), runs
+`cargo test --workspace --locked`, publishes both crates via
+`rust-lang/crates-io-auth-action@v1` + `cargo publish --workspace
+--locked`, and creates the GitHub release from the matching
+`CHANGELOG.md` section (skipping release creation if one already exists
+for that tag, rather than failing).
 
-```yaml
-# .github/workflows/release.yml
-name: release
-on:
-  push:
-    tags: ["v*"]
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: write
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-      - run: cargo publish --workspace
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - run: gh release create "$GITHUB_REF_NAME" --notes-from-tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-```
+**One manual step is left**, and it can only be done by the maintainer on
+crates.io (there is no API/CLI for it): for **both** crates —
+`ferryman` and `ferryman-core` — go to the crate's page on crates.io,
+*Settings* → *Trusted Publishing* → *Add GitHub*:
 
-It is left out of the repo until Trusted Publishing is configured, since
-it can't work before the first manual publish.
+- Repository owner: `Bunty9`
+- Repository name: `ferryman`
+- Workflow filename: `release.yml`
+- Environment: (leave blank — the job doesn't use one)
+
+Until that's done for both crates, `cargo publish` in the workflow will
+fail with an OIDC/auth error; the long-lived token from Step 3 works as a
+fallback in the meantime but isn't used by the workflow.
+
+### Release procedure (once Trusted Publishing is set up)
+
+1. Bump the version in **both** `[workspace.package]` and the
+   `ferryman-core` entry of `[workspace.dependencies]` in `Cargo.toml`.
+2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` (move
+   `[Unreleased]` content into it).
+3. Commit that to `main` and wait for CI to go green on the commit.
+4. Tag it and push the tag:
+   ```bash
+   git tag -a vX.Y.Z -m "ferryman X.Y.Z"
+   git push origin vX.Y.Z
+   ```
+5. `release.yml` runs on the tag push: tests, publishes both crates to
+   crates.io, and creates the `vX.Y.Z` GitHub release from the
+   `CHANGELOG.md` section. Nothing further to do by hand.
 
 ## Versioning policy
 

@@ -1,6 +1,6 @@
 ---
 title: ferryman — publishing to crates.io
-status: 0.1.0 published 2026-09-28
+status: 0.2.0 published 2026-09-29; release.yml workflow added
 date: 2026-09-28
 related:
     - ./2026-09-26-ferryman-phase-2.md
@@ -52,7 +52,7 @@ export PATH=$HOME/.cargo/bin:$PATH
 git switch main && git pull && git status          # clean tree
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --locked
 cargo deny check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo publish --workspace --dry-run
@@ -82,19 +82,48 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 
 ## Step 4 — automate later releases
 
-`.github/workflows/release.yml` exists in the repo already: on a `v*` tag
-push it verifies the tag matches `[workspace.package]` version (and that
-the `ferryman-core` entry in `[workspace.dependencies]` agrees), runs
-`cargo test --workspace --locked`, publishes both crates via
-`rust-lang/crates-io-auth-action@v1` + `cargo publish --workspace
---locked`, and creates the GitHub release from the matching
-`CHANGELOG.md` section (skipping release creation if one already exists
-for that tag, rather than failing).
+`.github/workflows/release.yml` exists in the repo already. On a `v*` tag
+push it runs three jobs, each with only the permissions and checkout it
+needs (see "why three jobs" below):
 
-**One manual step is left**, and it can only be done by the maintainer on
-crates.io (there is no API/CLI for it): for **both** crates —
-`ferryman` and `ferryman-core` — go to the crate's page on crates.io,
-*Settings* → *Trusted Publishing* → *Add GitHub*:
+1. **`verify`** (`permissions: contents: read`, checkout with
+   `persist-credentials: false`) — checks the tag points at a commit on
+   `main` (`git merge-base --is-ancestor`), checks the tag matches
+   `[workspace.package]` version and that the `ferryman-core` entry in
+   `[workspace.dependencies]` agrees, extracts the matching
+   `CHANGELOG.md` section into `release-notes.md` and uploads it as a
+   build artifact, then runs `cargo test --workspace --locked`.
+2. **`publish`** (needs `verify`; `permissions: id-token: write,
+   contents: read`, checkout with `persist-credentials: false`) —
+   authenticates via `rust-lang/crates-io-auth-action@v1` (Trusted
+   Publishing, no long-lived token), then publishes `ferryman-core` and
+   `ferryman`, **in that order, one crate at a time**: for each, it first
+   checks whether that exact `name/version` already exists on crates.io
+   and skips it if so, otherwise runs `cargo publish -p <name> --locked`.
+   This makes the job idempotent — see "recovering from a half-published
+   release" below.
+3. **`release`** (needs `publish`; `permissions: contents: write`, no
+   checkout at all) — downloads the `release-notes` artifact and runs
+   `gh release create` (skipping if a release for the tag already
+   exists). This job runs no `cargo` command and no dependency code, by
+   design.
+
+**Why three jobs, not one.** A single job would run `cargo test` and
+`cargo publish` — both of which execute arbitrary third-party code
+(`build.rs`, proc macros, test binaries) — in the same process context as
+the `id-token: write` OIDC token (used to mint the crates.io publish
+token) and a `contents: write` `GITHUB_TOKEN` persisted by `actions/
+checkout` into `.git/config`. Any dependency's build script could read
+`ACTIONS_ID_TOKEN_REQUEST_TOKEN`/`_URL` or `git config` for the repo
+token. Splitting into jobs means the job that runs untrusted code
+(`verify`, `publish`) never holds `contents: write`, and the job that
+holds `contents: write` (`release`) runs no untrusted code and doesn't
+even check out the repository.
+
+**One manual step is left**, and it's done in the crates.io web UI (no
+API/CLI for it): for **both** crates — `ferryman` and `ferryman-core` —
+go to the crate's page on crates.io, *Settings* → *Trusted Publishing* →
+*Add GitHub*:
 
 - Repository owner: `Bunty9`
 - Repository name: `ferryman`
@@ -105,21 +134,58 @@ Until that's done for both crates, `cargo publish` in the workflow will
 fail with an OIDC/auth error; the long-lived token from Step 3 works as a
 fallback in the meantime but isn't used by the workflow.
 
+### Recovering from a half-published release
+
+`ferryman` depends on `ferryman-core`, so the `publish` job always does
+`ferryman-core` first. If `ferryman-core` publishes successfully but
+`ferryman` then fails (network blip, crates.io hiccup, a transient CI
+issue), crates.io now has the new `ferryman-core` but not `ferryman`, and
+no GitHub release was created (the `release` job needs `publish` to
+succeed first).
+
+Because each crate's publish step checks crates.io for that exact
+`name/version` before publishing, simply **re-running the failed
+workflow run** (or pushing the tag again isn't needed/possible — re-run
+the job from the Actions UI) picks up where it left off: `ferryman-core`
+is found to already exist and is skipped, `ferryman` gets published, and
+the `release` job then creates the GitHub release. No manual crates.io
+intervention needed for this case.
+
+If the workflow can't be re-run (e.g. the tag itself was wrong), publish
+`ferryman` by hand — `cargo publish -p ferryman --locked` from a clean
+checkout of the tagged commit, with a crates.io token via `cargo login`
+— and then create the release manually: `gh release create vX.Y.Z
+--notes-file <(...)` using the same `CHANGELOG.md` section (see the
+`awk` command in `release.yml`'s "Extract CHANGELOG.md section" step).
+
 ### Release procedure (once Trusted Publishing is set up)
 
-1. Bump the version in **both** `[workspace.package]` and the
-   `ferryman-core` entry of `[workspace.dependencies]` in `Cargo.toml`.
+1. Bump the version in **`[workspace.package]`**, the `ferryman-core`
+   entry of **`[workspace.dependencies]`** in the root `Cargo.toml`, and
+   — on a minor/major bump only — the `version = "0.2"`-style
+   requirement on both `ferryman` and `ferryman-core` in
+   `examples/embedded/Cargo.toml` (a path dependency's `version` req
+   still has to be satisfied by the local package's version even though
+   the path is what's actually built against; a stale `"0.2"` after a
+   bump to `0.3.0` fails workspace resolution).
 2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` (move
    `[Unreleased]` content into it).
-3. Commit that to `main` and wait for CI to go green on the commit.
-4. Tag it and push the tag:
+3. Run `cargo test --workspace --locked` (or any `cargo` command) once
+   locally so `Cargo.lock` picks up the version bump, and commit the
+   refreshed `Cargo.lock` along with the version/changelog changes —
+   `release.yml` builds with `--locked` throughout, so a stale lockfile
+   fails the release instead of silently resolving something else.
+4. Commit that to `main` and wait for CI to go green on the commit.
+5. Tag it and push the tag:
    ```bash
    git tag -a vX.Y.Z -m "ferryman X.Y.Z"
    git push origin vX.Y.Z
    ```
-5. `release.yml` runs on the tag push: tests, publishes both crates to
+6. `release.yml` runs on the tag push: tests, publishes both crates to
    crates.io, and creates the `vX.Y.Z` GitHub release from the
-   `CHANGELOG.md` section. Nothing further to do by hand.
+   `CHANGELOG.md` section. Nothing further to do by hand — and if any
+   step fails partway, see "recovering from a half-published release"
+   above.
 
 ## Versioning policy
 

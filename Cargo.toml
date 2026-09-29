@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/server",
+    "examples/full-stack/demo-upstream",
 ]
 
 [workspace.package]

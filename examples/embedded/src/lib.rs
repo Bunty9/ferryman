@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 /// Latency buckets (seconds) for the `ferryman_request_duration_seconds`
 /// histogram, re-exported from ferryman so an embedding app configures its
@@ -257,26 +258,25 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|&v| v).await;
 }
 
-/// Await `handle` for up to `bound`, aborting it — rather than leaving it
-/// detached and still running — if it doesn't finish in time. `&mut handle`
-/// (not `handle`) in the `select!` below is what makes this safe: it polls
-/// the task without consuming the `JoinHandle`, so the `None` arm still has
-/// it available to call `.abort()` on.
+/// Await `handle` until `deadline`, aborting it — rather than leaving it
+/// detached and still running — if it doesn't finish in time. `deadline` is
+/// a shared `Instant` (not a per-call `Duration`), so a caller awaiting
+/// several tasks in sequence bounds their *total* wait, not each one
+/// separately. `abort_handle()` is taken before the await so it's still
+/// available to abort the task after `handle` itself has been consumed by
+/// `timeout_at`.
 async fn await_or_abort(
-    mut handle: JoinHandle<()>,
-    bound: Duration,
+    handle: JoinHandle<()>,
+    deadline: Instant,
     name: &str,
 ) -> anyhow::Result<()> {
-    let joined = tokio::select! {
-        r = &mut handle => Some(r),
-        _ = tokio::time::sleep(bound) => None,
-    };
-    match joined {
-        Some(r) => r.with_context(|| format!("{name} task panicked")),
-        None => {
-            handle.abort();
+    let abort_handle = handle.abort_handle();
+    match tokio::time::timeout_at(deadline, handle).await {
+        Ok(r) => r.with_context(|| format!("{name} task panicked")),
+        Err(_elapsed) => {
+            abort_handle.abort();
             Err(anyhow::anyhow!(
-                "{name} task did not shut down within {bound:?}"
+                "{name} task did not shut down by the deadline"
             ))
         }
     }
@@ -286,21 +286,18 @@ async fn await_or_abort(
 /// result is itself an `anyhow::Result<()>` (from `ferryman::serve`) that
 /// must be propagated, not just a panic to report.
 async fn await_or_abort_fallible(
-    mut handle: JoinHandle<anyhow::Result<()>>,
-    bound: Duration,
+    handle: JoinHandle<anyhow::Result<()>>,
+    deadline: Instant,
     name: &str,
 ) -> anyhow::Result<()> {
-    let joined = tokio::select! {
-        r = &mut handle => Some(r),
-        _ = tokio::time::sleep(bound) => None,
-    };
-    match joined {
-        Some(Ok(inner)) => inner,
-        Some(Err(join_err)) => Err(join_err).with_context(|| format!("{name} task panicked")),
-        None => {
-            handle.abort();
+    let abort_handle = handle.abort_handle();
+    match tokio::time::timeout_at(deadline, handle).await {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(join_err)) => Err(join_err).with_context(|| format!("{name} task panicked")),
+        Err(_elapsed) => {
+            abort_handle.abort();
             Err(anyhow::anyhow!(
-                "{name} task did not shut down within {bound:?}"
+                "{name} task did not shut down by the deadline"
             ))
         }
     }
@@ -334,21 +331,26 @@ impl Running {
         // there's nothing in flight, so it returns almost immediately.
         const SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
 
+        // One deadline, computed once and shared by every await below —
+        // not a fresh `SHUTDOWN_BOUND` per task — so three sequential
+        // awaits bound the *total* wait to ~30s instead of stacking up to
+        // 90s worst case (30s each for proxy, admin, upkeep).
+        let deadline = Instant::now() + SHUTDOWN_BOUND;
+
         // Await every remaining task, aborting (rather than leaving it
-        // detached) whichever one doesn't finish within `SHUTDOWN_BOUND` —
-        // and keep awaiting the others even if an earlier one already
-        // errored, so a slow/failed proxy shutdown still results in the
-        // admin and upkeep tasks being stopped instead of leaked. The `?`s
-        // below then return the *first* error, once every task has been
-        // dealt with.
-        let proxy_result = await_or_abort_fallible(self.proxy_task, SHUTDOWN_BOUND, "proxy").await;
-        let admin_result = await_or_abort(self.admin_task, SHUTDOWN_BOUND, "admin").await;
+        // detached) whichever one doesn't finish by `deadline` — and keep
+        // awaiting the others even if an earlier one already errored, so a
+        // slow/failed proxy shutdown still results in the admin and upkeep
+        // tasks being stopped instead of leaked. The `?`s below then
+        // return the *first* error, once every task has been dealt with.
+        let proxy_result = await_or_abort_fallible(self.proxy_task, deadline, "proxy").await;
+        let admin_result = await_or_abort(self.admin_task, deadline, "admin").await;
         // The upkeep loop watches the same shutdown signal and exits
         // cooperatively (see `start`); by now it should already be done or
         // a single `select!` poll away from it, but await it properly
         // rather than leaving it to finish on its own after `shutdown` has
         // already returned.
-        let upkeep_result = await_or_abort(self.upkeep_task, SHUTDOWN_BOUND, "upkeep").await;
+        let upkeep_result = await_or_abort(self.upkeep_task, deadline, "upkeep").await;
 
         proxy_result?;
         admin_result?;

@@ -4,9 +4,9 @@
 
 use arc_swap::ArcSwap;
 use clap::Parser;
-use ferryman::{reload, tls};
+use ferryman::{reload, tls, LATENCY_BUCKETS};
 use ferryman_core::{build_table, health_loop, load_config, SharedTable};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use metrics_util::MetricKindMask;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "ferryman", about = "ferryman L7 reverse proxy")]
+#[command(name = "ferryman", about = "ferryman L7 reverse proxy", version)]
 struct Args {
     /// Path to the TOML routing config.
     #[arg(long, env = "FERRYMAN_CONFIG", default_value = "config.toml")]
@@ -57,9 +57,6 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("--tls-cert and --tls-key must both be set or both omitted"),
     };
 
-    // Prometheus exporter binds its own listener; the proxy is unaffected by
-    // /metrics traffic. Installed before any gauge is set, or the writes go
-    // to the no-op recorder.
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let cfg = load_config(&args.config)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
@@ -70,6 +67,10 @@ async fn main() -> anyhow::Result<()> {
     // tick, so gauges of upstreams removed by a reload expire after a few
     // missed ticks instead of reporting a stale value forever.
     PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full("ferryman_request_duration_seconds".into()),
+            LATENCY_BUCKETS,
+        )?
         .with_http_listener(args.metrics_bind)
         .idle_timeout(MetricKindMask::GAUGE, Some(interval * 3))
         .install()?;

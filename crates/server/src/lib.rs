@@ -29,6 +29,12 @@ use tokio_rustls::TlsAcceptor;
 /// streamed straight through (`Incoming` in, `Incoming` out), no buffering.
 pub type ProxyClient = Client<HttpConnector, Incoming>;
 
+/// Latency buckets (seconds) for `ferryman_request_duration_seconds`,
+/// spanning sub-millisecond proxy hops to multi-second slow upstreams.
+pub const LATENCY_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 /// How long to wait for in-flight connections to finish after `shutdown`
 /// resolves, before dropping them anyway. Kept under fly.toml's 30s
 /// `kill_timeout` so the drain finishes before a SIGKILL.

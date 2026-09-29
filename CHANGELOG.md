@@ -7,6 +7,16 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Added
+
+- `--version`.
+- `ferryman::LATENCY_BUCKETS`.
+
+### Changed
+
+- Request duration is exported as a histogram with buckets instead of a
+  summary.
+
 ## [0.1.0] - 2026-09-28
 
 First public release.

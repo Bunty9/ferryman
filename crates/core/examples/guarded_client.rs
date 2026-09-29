@@ -19,6 +19,33 @@
 //! racing an outage could flip a freshly-opened breaker straight back to
 //! closed.
 //!
+//! When admission is refused (`Err(Guarded::Open)`), the caller has to
+//! decide what "fail fast" means for it — return a fallback or cached
+//! value, respond 503 to *its own* caller, or otherwise fail immediately —
+//! but never spin-retry `guarded` itself: retrying doesn't get a different
+//! answer until the cooldown elapses and the single half-open probe is
+//! admitted, so a tight retry loop just burns CPU for the same `Open`.
+//!
+//! ## Timeouts: put them inside `guarded`, not outside it
+//!
+//! `guarded(&up, tokio::time::timeout(d, call))` — timeout *inside* the
+//! guarded future — is correct: whatever ticket `try_acquire` handed back
+//! stays live for the whole `call`-or-timeout race, so a call that hangs
+//! past `d` still reports a failure back to the breaker (see
+//! `guarded_with_deadline` below), exactly like a call that returned `Err`
+//! on its own.
+//!
+//! `tokio::time::timeout(d, guarded(&up, call))` — timeout *outside* — is
+//! the trap: `timeout` racing `guarded`'s future doesn't cancel and wait for
+//! it, it just stops polling it and drops it. If `call` was already
+//! admitted (the ticket was acquired) and the timeout fires first, that
+//! ticket is dropped without ever reaching `record_success`/`record_failure`
+//! — the breaker never learns the call was slow, so a genuinely hung
+//! upstream never trips it. Worse if the dropped ticket was the single
+//! half-open [`Admission::Probe`](ferryman_core::Admission::Probe): the
+//! breaker is left stuck half-open (see "Ticket semantics" above) until the
+//! next cooldown elapses on its own, instead of reopening for that outage.
+//!
 //! ```bash
 //! cargo run -p ferryman-core --example guarded_client
 //! ```
@@ -33,6 +60,13 @@ enum Guarded<E> {
     Open,
     /// The call was made and failed.
     Failed(E),
+}
+
+/// Outcome of a call guarded with a deadline: either it ran and failed, or
+/// it didn't finish before `deadline`.
+enum TimedOut<E> {
+    Failed(E),
+    Elapsed,
 }
 
 /// Run `call` only if the breaker admits it, and report the outcome back on
@@ -55,6 +89,26 @@ async fn guarded<T, E>(
             Err(Guarded::Failed(err))
         }
     }
+}
+
+/// Like [`guarded`], but races `call` against `deadline` *inside* the
+/// guarded future, so the ticket `try_acquire` returned is still live (and
+/// gets reported) if `call` doesn't finish in time — see the module doc
+/// comment's "Timeouts" section for why the timeout has to go here and not
+/// around the whole `guarded(..)` call.
+async fn guarded_with_deadline<T, E>(
+    up: &Upstream,
+    deadline: Duration,
+    call: impl Future<Output = Result<T, E>>,
+) -> Result<T, Guarded<TimedOut<E>>> {
+    guarded(up, async move {
+        match tokio::time::timeout(deadline, call).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(err)) => Err(TimedOut::Failed(err)),
+            Err(_elapsed) => Err(TimedOut::Elapsed),
+        }
+    })
+    .await
 }
 
 /// Stand-in for a flaky dependency: broken for calls 3-8, healthy otherwise.
@@ -99,5 +153,37 @@ async fn main() {
         if n < 20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    // A second, independent breaker demonstrating `guarded_with_deadline`:
+    // a call that hangs well past its deadline still reports a failure,
+    // because the timeout races `call` *inside* `guarded`'s ticket instead
+    // of dropping the ticket from outside it (see the module doc comment's
+    // "Timeouts" section).
+    println!();
+    println!("-- guarded_with_deadline: a hung call still counts as a breaker failure --");
+    let slow_up = Upstream::new(
+        "http://slow.internal".parse().expect("valid uri"),
+        Duration::from_millis(500),
+        3,
+    );
+    let hangs_forever = async {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Ok::<(), &'static str>(())
+    };
+    match guarded_with_deadline(&slow_up, Duration::from_millis(200), hangs_forever).await {
+        Err(Guarded::Failed(TimedOut::Elapsed)) => println!(
+            "call timed out after 200ms -> recorded as a failure, breaker state={:?}",
+            slow_up.state()
+        ),
+        other => panic!(
+            "expected the call to time out and record a failure, got: {}",
+            match other {
+                Ok(_) => "Ok",
+                Err(Guarded::Open) => "Open",
+                Err(Guarded::Failed(TimedOut::Failed(_))) => "Failed",
+                Err(Guarded::Failed(TimedOut::Elapsed)) => unreachable!(),
+            }
+        ),
     }
 }

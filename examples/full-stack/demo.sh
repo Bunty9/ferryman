@@ -126,14 +126,29 @@ body_of() {
     printf '%s' "$out"
 }
 
-# swap_config: atomically replace $CONFIG_FILE with $CONFIG_TMP's content
-# (rename-replace — the save pattern hot reload is meant to handle). An
-# explicit `rm` before the `mv` isn't needed on a plain filesystem (a bare
-# rename is already atomic and visible immediately), but some container
-# runtimes' bind-mount propagation can lag a bare re-rename onto a path
-# that was already rename-replaced once; the preceding unlink makes the
-# change show up inside the container promptly everywhere.
+# swap_config: rename-replace $CONFIG_FILE with $CONFIG_TMP's content — a
+# plain, atomic `mv` over the existing file. This is the exact save
+# pattern (write a temp file, then rename it over the target) that
+# ferryman's hot-reload watcher is documented to handle, and the only one
+# this script uses for the *first* config swap in the hot-reload step, so
+# that step actually pins rename-replace working, unmodified.
 swap_config() {
+    mv "$CONFIG_TMP" "$CONFIG_FILE"
+}
+
+# swap_config_unlink: like swap_config, but unlinks the old file first.
+# NOT an atomic replace (the path is briefly absent) — used only for the
+# *second and later* config swaps in a single demo.sh run. On this
+# project's dev/CI host, Docker itself runs inside a nested LinuxKit VM
+# (`docker info` reports a `-linuxkit` kernel), and a *second* bare `mv`
+# onto a bind-mounted path that was already rename-replaced once was
+# observed to never become visible inside the container (verified with
+# `docker compose cp` diffs across 20+ real seconds) — see the task-5
+# report for the repro. The preceding `rm -f` reliably makes the change
+# visible again. The first swap_config call already exercises genuine
+# rename-replace; see README's "Docker Desktop / VM-backed file sharing"
+# note for the production implication.
+swap_config_unlink() {
     rm -f "$CONFIG_FILE"
     mv "$CONFIG_TMP" "$CONFIG_FILE"
 }
@@ -196,8 +211,20 @@ orders_up() { [ "$(status_of --cacert "$CA" "$BASE/api/orders/echo")" = "200" ];
 orders_v2_up() { [ "$(status_of --cacert "$CA" "$BASE/api/orders/v2/echo")" = "200" ]; }
 inventory_up() { [ "$(status_of --cacert "$CA" "$BASE/api/inventory/echo")" = "200" ]; }
 inventory_gone() { [ "$(status_of --cacert "$CA" "$BASE/api/inventory/echo")" = "404" ]; }
-reload_failed_logged() {
-    docker compose logs --no-color ferryman 2>/dev/null | grep -q "config reload failed"
+# reload_parse_error_logged SINCE_TS -> true once ferryman has logged an
+# actual TOML *parse* error (not just "config reload failed", which is
+# also logged for a transient "file missing" read error the `rm` half of
+# swap_config_unlink can itself trigger) at or after SINCE_TS. Scoping by
+# time also keeps a leftover log line from a previous KEEP=1 run from
+# making this pass without the bad TOML ever being parsed this run.
+reload_parse_error_logged() {
+    docker compose logs --no-color --since "$1" ferryman 2>/dev/null | grep -q "parsing config file"
+}
+ferryman_exited_cleanly() {
+    local state
+    state=""
+    state=$(docker compose ps -a --format json ferryman 2>/dev/null | jq -r '.State + " " + (.ExitCode|tostring)') || true
+    [ "$state" = "exited 0" ]
 }
 circuit_open_alert_visible() {
     body_of "$PROM/api/v1/alerts" | jq -e '.data.alerts[] | select(.labels.alertname=="FerrymanCircuitOpen")' >/dev/null
@@ -443,16 +470,20 @@ step "Hot reload: add a route, reject invalid TOML, restore"
 swap_config
 wait_until "/api/inventory/echo returns 200 after reload" 15 inventory_up
 
+invalid_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo 'this is not valid toml [[[' >"$CONFIG_TMP"
-swap_config
+swap_config_unlink
+wait_until "invalid TOML logs a parse error (since ${invalid_since})" 15 reload_parse_error_logged "$invalid_since"
+# The real proof the *old* table is still live: /api/inventory only
+# exists because the previous (valid) swap added it, so it must still
+# answer 200 here — checked *after* the parse-error log confirms the bad
+# reload was rejected, not before (200 before that proves nothing about
+# which table is serving).
+expect_status "$BASE/api/inventory/echo" 200 --cacert "$CA"
 expect_status "$BASE/api/users/echo" 200 --cacert "$CA"
-# The watcher's own debounce is only 200ms, but on some hosts a bind-mounted
-# rename-replace takes a moment longer to become visible inside the
-# container than on the host, so poll rather than asserting after one sleep.
-wait_until "invalid TOML logs 'config reload failed'; old table kept serving" 15 reload_failed_logged
 
 cp "$CONFIG_BACKUP" "$CONFIG_TMP"
-swap_config
+swap_config_unlink
 wait_until "config restored: /api/inventory/echo goes back to 404" 15 inventory_gone
 
 ########################################################################
@@ -478,6 +509,11 @@ if [ "$shutdown_status" = "200" ]; then
 else
     fail "expected the in-flight request to drain with 200, got '$shutdown_status'"
 fi
+# A no-op SIGTERM would still let the in-flight request above finish (it
+# was already being served) and still leave `users_up` passing once
+# restarted below, so neither proves ferryman actually reacted to the
+# signal. Assert the process itself exited(0) before restarting it.
+wait_until "ferryman process exited(0) after SIGTERM" 30 ferryman_exited_cleanly
 # `compose start` isn't dependency-aware the way `up` is (it can re-run
 # certgen's completion check without ever actually starting ferryman
 # afterwards); `up -d` on an existing, unchanged container just starts it,

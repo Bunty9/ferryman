@@ -206,11 +206,28 @@ mv config/.tmp config/ferryman.toml
 curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/inventory/echo  # 200, within ~1s
 
 echo 'not valid toml [[[' > config/.tmp && mv config/.tmp config/ferryman.toml
-curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/users/echo      # still 200 — old table kept
-docker compose logs ferryman | grep 'config reload failed'                                          # logged, with the parse error
+docker compose logs ferryman | grep 'parsing config file'   # logged, with the parse error — wait for this line first
+# /api/inventory only exists because the *previous* swap added it, so it
+# still answering 200 here (checked *after* the parse error is logged) is
+# the actual proof the bad reload was rejected and the old table is still
+# live — /api/users would return 200 either way and proves nothing:
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/inventory/echo  # still 200 — old table kept
 
 cp /tmp/orig.toml config/ferryman.toml   # restore
 ```
+
+> **Docker Desktop / VM-backed file sharing:** if Docker itself runs
+> inside a VM (Docker Desktop on macOS/Windows, or a nested setup like
+> this repo's own dev host — check `docker info | grep -i kernel` for a
+> `-linuxkit` or similar kernel), a *second* bare `mv` onto a
+> bind-mounted path that was already rename-replaced once may not
+> propagate into the container promptly (or at all) — the container can
+> keep serving the previous version indefinitely. A plain Linux Docker
+> host doesn't have this problem. If a reload isn't picking up on such a
+> host, `rm` the target before the `mv` (an unlink forces the mount to
+> re-resolve the path) or just restart the container. `demo.sh` does
+> this automatically after its first config swap (see `swap_config` vs
+> `swap_config_unlink` in the script).
 
 **12. `Upgrade` requests are rejected, not proxied**
 

@@ -14,6 +14,26 @@ set -eu
 OUT_DIR="${1:-certs}"
 mkdir -p "$OUT_DIR"
 
+# docker-compose.yml bind-mounts ./certs/server.pem and
+# ./certs/server-key.pem as single files into the ferryman container. If
+# ferryman starts before this script has ever run (e.g. `docker compose up
+# --no-deps ferryman` on a fresh clone), Docker creates the missing host
+# path as a *directory*, since it has no way to know the container side is
+# meant to be a file. openssl's `-out` would then fail on that path with a
+# cryptic, redirected-to-/dev/null error, so catch it here with a clear
+# message instead.
+for f in server.pem server-key.pem; do
+    if [ -d "$OUT_DIR/$f" ]; then
+        echo "[gen-certs] $OUT_DIR/$f is a directory, not a file." >&2
+        echo "[gen-certs] This happens when Docker auto-creates a bind-mount target for a" >&2
+        echo "[gen-certs] single-file mount before the file exists (e.g. running 'docker" >&2
+        echo "[gen-certs] compose up --no-deps ferryman' before certgen has ever run)." >&2
+        echo "[gen-certs] Remove it and rerun 'docker compose up': rm -rf $OUT_DIR/server.pem $OUT_DIR/server-key.pem" >&2
+        echo "[gen-certs] (it may be root-owned, since Docker created it: sudo rm -rf ... if so)" >&2
+        exit 1
+    fi
+done
+
 if [ -f "$OUT_DIR/ca.pem" ] && [ -f "$OUT_DIR/server.pem" ] && [ -f "$OUT_DIR/server-key.pem" ]; then
     echo "[gen-certs] $OUT_DIR already has ca.pem/server.pem/server-key.pem, skipping generation"
     # Enforce perms every run, even when skipping generation: an older

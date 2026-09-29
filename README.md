@@ -101,6 +101,17 @@ curl -s http://localhost:9090/metrics | head
 Edit `config.toml` while ferryman is running — the routing table reloads
 atomically without dropping live connections.
 
+## Examples
+
+Reference examples live under [`examples/`](./examples) (index:
+[`examples/README.md`](./examples/README.md)):
+
+| Example | What it shows |
+| --- | --- |
+| [`examples/full-stack/`](./examples/full-stack) | Full Docker Compose deployment: ferryman, TLS, three demo upstreams, Prometheus + Grafana, an asserted `demo.sh` tour. |
+| [`examples/embedded/`](./examples/embedded) | Embedding `ferryman::serve` as a library inside your own async Rust app, with its own admin server. |
+| [`crates/core/examples/guarded_client.rs`](./crates/core/examples/guarded_client.rs) | `ferryman-core`'s circuit breaker guarding any fallible async call, no proxy involved. |
+
 ## Configuration
 
 See [`config.toml`](./config.toml). Unknown keys are rejected, so typos
@@ -151,12 +162,12 @@ in-flight connections for up to 25s.
 The Prometheus exporter binds a separate listener (default `:9090`).
 Surface:
 
-| Metric                              | Labels                                             | Description                                   |
-| ----------------------------------- | -------------------------------------------------- | --------------------------------------------- |
-| `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404)    | Counter of inbound requests.                  |
-| `ferryman_request_duration_seconds` | `route`, `upstream`                                | Histogram (buckets `le`), time to upstream response headers. |
-| `ferryman_upstream_alive`           | `upstream`                                         | Gauge: 1 = circuit closed, 0 otherwise.       |
-| `ferryman_circuit_state`            | `upstream`                                         | Gauge: 0 closed / 1 open / 2 half-open.       |
+| Metric                              | Labels                                          | Description                                                  |
+| ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ |
+| `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404) | Counter of inbound requests.                                 |
+| `ferryman_request_duration_seconds` | `route`, `upstream`                             | Histogram (buckets `le`), time to upstream response headers. |
+| `ferryman_upstream_alive`           | `upstream`                                      | Gauge: 1 = circuit closed, 0 otherwise.                      |
+| `ferryman_circuit_state`            | `upstream`                                      | Gauge: 0 closed / 1 open / 2 half-open.                      |
 
 `route` is the configured prefix and `upstream` is `host:port`, so label
 cardinality is bounded by the config, never by client input.
@@ -190,8 +201,12 @@ ferryman/
   crates/
     core/                    # breaker, RouteTable, health loop, TOML schema
       benches/lookup.rs      # criterion bench for RouteTable::lookup
+      examples/guarded_client.rs  # breaker guarding a fallible async call
     server/                  # serve loop, proxy handler, TLS, reload watcher
       tests/proxy.rs         # end-to-end tests on real sockets
+  examples/                  # reference examples, see examples/README.md
+    full-stack/              # Docker Compose: ferryman + upstreams + Prometheus/Grafana
+    embedded/                # ferryman::serve embedded as a library
   benches/wrk2.lua           # wrk2 harness for the throughput target
   benches/bench.toml         # routing config for the compose fixture
   docker-compose.bench.yml   # ferryman + two http-echo upstreams

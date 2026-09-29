@@ -12,6 +12,8 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `cargo bench -p ferryman-core --no-run` - criterion lookup bench must compile
 - `cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8001` - local upstream stub
 - `bash scripts/wrk2-smoke.sh` - compose fixture + wrk2; runs in CI (wrk2 isn't buildable locally: no OpenSSL headers)
+- `bash examples/full-stack/demo.sh --ci` - full-stack reference example; runs in CI (`examples` job)
+- `cargo test -p ferryman-embedded-example` - embedded-library reference example's tests
 - `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` - no intra-doc links to private items
 - `gh run list -L 3` / `gh run view <id> --log` - CI status and smoke-bench numbers
@@ -25,6 +27,9 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Client-side body errors (`hyper::Error::is_user`) and timeouts on requests with bodies must not trip the breaker.
 - Metric labels are config-bounded (`route` = prefix, `upstream` = host:port); never label with raw paths.
 - Gauges: exporter is installed before any gauge write; health loop republishes every tick (removed upstreams expire via `idle_timeout`).
+- `examples/*` crates are workspace members with `publish = false`.
+- Examples use only ferryman's public API — no `pub(crate)`/internal access.
+- Example demo timings (health interval, cooldown, timeouts) are shortened for a fast tour; each is commented with its production value.
 
 ## Dependency gotchas
 

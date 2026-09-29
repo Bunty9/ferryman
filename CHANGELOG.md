@@ -11,11 +11,19 @@ and `ferryman` are released together with the same version.
 
 - `--version`.
 - `ferryman::LATENCY_BUCKETS`.
+- Three reference examples: `examples/full-stack` (Docker Compose:
+  ferryman + demo upstreams + Prometheus/Grafana, TLS, asserted tour),
+  `examples/embedded` (embedding `ferryman::serve` as a library), and
+  `crates/core/examples/guarded_client.rs` (`ferryman-core`'s circuit
+  breaker guarding any async call). See `examples/README.md`.
 
 ### Changed
 
 - Request duration is exported as a histogram with buckets instead of a
-  summary.
+  summary. **Breaking for dashboards/alerts**: existing
+  `ferryman_request_duration_seconds{quantile=...}` queries no longer
+  match and must move to `histogram_quantile(...)` over the `_bucket`
+  series.
 
 ## [0.1.0] - 2026-09-28
 

@@ -1,0 +1,4 @@
+# Certs are generated locally by scripts/gen-certs.sh (or the `certgen`
+# compose service) and are never committed.
+*
+!.gitignore

@@ -1,0 +1,95 @@
+services:
+  # Generates a throwaway CA + server cert into ./certs on first run (see
+  # scripts/gen-certs.sh). Idempotent, so re-running `up` doesn't rotate
+  # certs under a live ferryman.
+  certgen:
+    image: alpine:3.20
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./certs:/certs
+    command: ["sh", "/scripts/gen-certs.sh", "/certs"]
+
+  users:
+    build:
+      context: ../..
+      dockerfile: examples/full-stack/demo-upstream/Dockerfile
+    environment:
+      SERVICE_NAME: users
+
+  orders:
+    build:
+      context: ../..
+      dockerfile: examples/full-stack/demo-upstream/Dockerfile
+    environment:
+      SERVICE_NAME: orders
+
+  orders-v2:
+    build:
+      context: ../..
+      dockerfile: examples/full-stack/demo-upstream/Dockerfile
+    environment:
+      SERVICE_NAME: orders-v2
+
+  ferryman:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command:
+      [
+        "--config", "/etc/ferryman/ferryman.toml",
+        "--bind", "0.0.0.0:8443",
+        "--metrics-bind", "0.0.0.0:9090",
+        "--tls-cert", "/certs/server.pem",
+        "--tls-key", "/certs/server-key.pem",
+      ]
+    volumes:
+      # A directory mount, not a single-file mount: hot reload watches the
+      # config file's *parent directory* for rename-replace saves, which a
+      # single-file bind mount can't deliver (see README's production notes).
+      - ./config:/etc/ferryman:ro
+      - ./certs:/certs:ro
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+      users:
+        condition: service_started
+      orders:
+        condition: service_started
+      orders-v2:
+        condition: service_started
+    ports:
+      - "${FERRYMAN_HTTPS_PORT:-8443}:8443"
+      - "${FERRYMAN_METRICS_PORT:-9090}:9090"
+    # Real-world value; SIGTERM drains in-flight connections for up to 25s
+    # (see CLAUDE.md / docs/architecture.md), so this must exceed that.
+    stop_grace_period: 30s
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      [
+        "--config.file=/etc/prometheus/prometheus.yml",
+        "--storage.tsdb.path=/prometheus",
+        "--storage.tsdb.retention.time=1h",
+      ]
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    depends_on:
+      - ferryman
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus

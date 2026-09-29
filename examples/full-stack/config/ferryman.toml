@@ -1,0 +1,42 @@
+# Demo routing config for the full-stack reference example.
+#
+# Timings are shortened so `demo.sh` runs in well under a minute; each one
+# is commented with the value you'd actually run in production (see the
+# top-level config.toml for those defaults).
+
+# Active health-check interval. Production: 5s.
+health_interval_secs = 2
+
+# Circuit-breaker cooldown before a single half-open probe is let through.
+# Production: 30s.
+default_cooldown_secs = 5
+
+# Consecutive failures before a closed circuit opens. This matches the
+# production default (3) — nothing to shorten here.
+failure_threshold = 3
+
+# Timeout for a forwarded request to an upstream. Production: 30s.
+upstream_timeout_secs = 2
+
+# /api/users and /account intentionally point at the same upstream, so they
+# share one circuit breaker — a failure on either route counts against both.
+[[routes]]
+prefix = "/api/users"
+upstream = "http://users:8080"
+
+[[routes]]
+prefix = "/account"
+upstream = "http://users:8080"
+
+[[routes]]
+prefix = "/api/orders"
+upstream = "http://orders:8080"
+
+# Longest-prefix-first match: /api/orders/v2/* goes to orders-v2, not
+# orders, even though /api/orders also matches. Its own cooldown_secs is
+# set explicitly here (same value as the default) just to demonstrate the
+# per-route override.
+[[routes]]
+prefix = "/api/orders/v2"
+upstream = "http://orders-v2:8080"
+cooldown_secs = 5

@@ -180,12 +180,12 @@ curl -s http://localhost:9090/metrics | grep 'ferryman_circuit_state{upstream="o
 # Recovery: the breaker now blocks the proxied admin/fail?on=0 too, so the
 # real move is to restart (or replace) the sick instance:
 docker compose restart orders
-# a passing health probe closes an open circuit immediately (it's the
-# breaker's half-open Probe admission, and success closes on the spot) —
-# the cooldown only gates *when* a probe is admitted, and it's typically
-# already elapsed by the time you restart (it started ticking back when the
-# circuit first opened, not at restart time). So the wait here is ≈ one
-# health_interval_secs (2s in this demo), not health_interval + cooldown:
+# a passing health probe closes an open circuit immediately: health_loop
+# records its result as Admission::Probe directly (crates/core/src/health.rs),
+# without going through try_acquire, so it bypasses the cooldown/half-open
+# gating that a real request probe goes through entirely — it runs on every
+# tick regardless of breaker state, and a success closes the circuit on the
+# spot. So the wait here is ≈ one health_interval_secs (2s in this demo):
 curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/orders/echo  # 200
 ```
 
@@ -314,7 +314,12 @@ Each is commented in `config/ferryman.toml` with its production value.
   `demo.sh`'s hot-reload step exercises). A single-file bind mount
   (`-v ./config/ferryman.toml:/etc/ferryman/ferryman.toml:ro`) replaces
   the mounted inode on the container side in a way the watcher can't see
-  the same way; always mount the containing directory.
+  the same way; always mount the containing directory. Certs are the
+  exception: they aren't hot-reloaded, so `ferryman` mounts
+  `./certs/server.pem` and `./certs/server-key.pem` individually
+  (single-file mounts are fine here) instead of the whole `./certs`
+  directory — which would also hand the container read access to
+  `ca-key.pem`, the CA private key, for no reason.
 - **Kubernetes ConfigMaps.** A ConfigMap mounted as a volume updates via
   an atomic swap of a `..data` symlink, not a rename-replace or in-place
   write on the file ferryman actually opens. The watcher does not see

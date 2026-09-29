@@ -57,11 +57,15 @@ services:
         condition: service_started
       orders-v2:
         condition: service_started
+    # Bound to loopback only: this is a local demo, not something to expose
+    # to the network. To deliberately expose a port (e.g. to reach it from
+    # another host), drop the `127.0.0.1:` prefix on that line, or publish
+    # it explicitly elsewhere (e.g. behind your own load balancer).
     ports:
-      - "${FERRYMAN_HTTPS_PORT:-8443}:8443"
-      - "${FERRYMAN_METRICS_PORT:-9090}:9090"
+      - "127.0.0.1:${FERRYMAN_HTTPS_PORT:-8443}:8443"
+      - "127.0.0.1:${FERRYMAN_METRICS_PORT:-9090}:9090"
     # Real-world value; SIGTERM drains in-flight connections for up to 25s
-    # (see CLAUDE.md / docs/architecture.md), so this must exceed that.
+    # (see docs/architecture.md), so this must exceed that.
     stop_grace_period: 30s
 
   prometheus:
@@ -76,7 +80,7 @@ services:
         "--storage.tsdb.retention.time=1h",
       ]
     ports:
-      - "${PROMETHEUS_PORT:-9091}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9091}:9090"
     depends_on:
       - ferryman
 
@@ -90,6 +94,6 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     depends_on:
       - prometheus

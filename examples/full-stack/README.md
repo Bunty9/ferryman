@@ -77,6 +77,12 @@ for all three up front. The first `--build` compiles ferryman from source
 (cargo-chef + musl, a few minutes); after that, only genuinely changed
 layers rebuild.
 
+The root `Dockerfile` builds natively on an amd64 or an arm64 host (e.g.
+Apple Silicon's Docker Desktop, which defaults to `linux/arm64` — it picks
+the right musl target via BuildKit's `TARGETARCH`). Cross-arch builds
+(building a `linux/arm64` image from an amd64 host, or vice versa) aren't
+supported; see the comment at the top of the `Dockerfile`.
+
 While the stack is up:
 
 - ferryman: `https://localhost:8443` (see `certs/ca.pem` for the CA)
@@ -87,7 +93,18 @@ While the stack is up:
   find it under Dashboards, or go straight to `/d/ferryman/ferryman`)
 
 All four ports are overridable: `FERRYMAN_HTTPS_PORT`,
-`FERRYMAN_METRICS_PORT`, `PROMETHEUS_PORT`, `GRAFANA_PORT`.
+`FERRYMAN_METRICS_PORT`, `PROMETHEUS_PORT`, `GRAFANA_PORT`. `docker-compose.yml`
+publishes all of them on `127.0.0.1` only — this is a local demo (and
+Grafana's default `admin`/`admin` login is live, not something to expose);
+to deliberately reach a service from another host, drop the `127.0.0.1:`
+prefix on that service's `ports:` entry.
+
+Importing `grafana/dashboards/ferryman.json` into a Grafana you already run
+(rather than this example's auto-provisioned one): the dashboard's panels
+are pinned to datasource uid `prometheus` (provisioned dashboards can't use
+the `${DS_PROMETHEUS}` template-variable `__inputs` prompt Grafana's export
+UI normally offers on import), so either name your existing Prometheus
+datasource's uid `prometheus`, or edit the uid in the JSON after importing.
 
 `demo.sh` tears the stack down (`docker compose down -v`) on exit,
 including on failure. Set `KEEP=1` to leave it running for manual
@@ -137,9 +154,9 @@ curl -sS --cacert "$CA" --http1.1 -H 'Connection: x-secret' -H 'x-secret: 1' \
 ```bash
 curl -sS -o /dev/null --cacert "$CA" -w 'ttfb=%{time_starttransfer}s total=%{time_total}s\n' \
   "https://localhost:8443/api/users/stream?chunks=5&interval_ms=400"
-# ttfb well under 1s (first chunk streams immediately), total >= ~2s (5 chunks * 400ms)
+# ttfb well under 1s (first chunk streams immediately), total >= 1.6s (5 chunks * 400ms, minus the first chunk's own interval)
 
-dd if=/dev/urandom bs=1M count=8 2>/dev/null | \
+head -c 8388608 /dev/urandom | \
   curl -sS --cacert "$CA" --data-binary @- https://localhost:8443/api/users/echo | jq .body_bytes
 # 8388608
 ```
@@ -163,8 +180,12 @@ curl -s http://localhost:9090/metrics | grep 'ferryman_circuit_state{upstream="o
 # Recovery: the breaker now blocks the proxied admin/fail?on=0 too, so the
 # real move is to restart (or replace) the sick instance:
 docker compose restart orders
-# the next passing health check closes the circuit on its own, within one
-# health_interval_secs + cooldown_secs (shortened to 2s / 5s in this demo):
+# a passing health probe closes an open circuit immediately (it's the
+# breaker's half-open Probe admission, and success closes on the spot) —
+# the cooldown only gates *when* a probe is admitted, and it's typically
+# already elapsed by the time you restart (it started ticking back when the
+# circuit first opened, not at restart time). So the wait here is ≈ one
+# health_interval_secs (2s in this demo), not health_interval + cooldown:
 curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/orders/echo  # 200
 ```
 
@@ -216,7 +237,7 @@ cp config/ferryman.toml /tmp/orig.toml
 mv config/.tmp config/ferryman.toml
 curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/inventory/echo  # 200, within ~1s
 
-echo 'not valid toml [[[' > config/.tmp && mv config/.tmp config/ferryman.toml
+echo 'not valid toml [[[' > config/.tmp && rm -f config/ferryman.toml && mv config/.tmp config/ferryman.toml
 docker compose logs ferryman | grep 'parsing config file'   # logged, with the parse error — wait for this line first
 # /api/inventory only exists because the *previous* swap added it, so it
 # still answering 200 here (checked *after* the parse error is logged) is
@@ -333,3 +354,14 @@ you're trading a slower single-stage build (recompiles ferryman's whole
 dependency tree on every version bump) for a much shorter Dockerfile,
 which is usually the right trade for a consumer of the crate rather than
 a contributor to it.
+
+**A caveat if you do this:** crates.io's published `ferryman` 0.1.0 still
+exports request duration as a Prometheus *summary*
+(`ferryman_request_duration_seconds{quantile=...}`), not the histogram
+(`..._bucket`) this example's `prometheus/alerts.yml` and Grafana latency
+panel both query with `histogram_quantile(...)`. That change is unreleased
+(see `CHANGELOG.md`'s `[Unreleased]` section) — against a 0.1.0 binary, the
+dashboard's latency panel stays empty and `FerrymanSlowP99` never fires.
+Everything else in this example (routing, breaker, failover, hot reload,
+the other alerts) works unchanged against 0.1.0; wait for a release newer
+than 0.1.0 before expecting the bucket-based panel/alert to work too.

@@ -110,10 +110,13 @@ trap cleanup EXIT
 # ---- curl helpers (never let a network hiccup trip `set -e`) ------------
 
 # status_of [curl args...] -> prints the HTTP status code, "000" on error.
+# --max-time 5 up front so a hung connection can't wedge the script forever;
+# a caller needing longer (e.g. the upstream-timeout step) passes its own
+# --max-time after "$@", which wins (curl uses the last of a repeated flag).
 status_of() {
     local code
     code=""
-    code=$(curl -sS -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || true
+    code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || true
     if [ -z "$code" ]; then code="000"; fi
     printf '%s' "$code"
 }
@@ -122,7 +125,7 @@ status_of() {
 body_of() {
     local out
     out=""
-    out=$(curl -sS "$@" 2>/dev/null) || true
+    out=$(curl -sS --max-time 5 "$@" 2>/dev/null) || true
     printf '%s' "$out"
 }
 
@@ -157,7 +160,7 @@ swap_config_unlink() {
 # $CAP_HDR_FILE / $CAP_BODY_FILE.
 capture() {
     CAP_STATUS=""
-    CAP_STATUS=$(curl -sS -D "$CAP_HDR_FILE" -o "$CAP_BODY_FILE" -w '%{http_code}' "$@" 2>/dev/null) || true
+    CAP_STATUS=$(curl -sS --max-time 5 -D "$CAP_HDR_FILE" -o "$CAP_BODY_FILE" -w '%{http_code}' "$@" 2>/dev/null) || true
     if [ -z "$CAP_STATUS" ]; then CAP_STATUS="000"; fi
 }
 
@@ -191,18 +194,22 @@ expect_body_contains() {
 }
 
 # wait_until DESC TIMEOUT_SECS PREDICATE_FN [args...]
+# Measured against $SECONDS (real elapsed shell time), not attempt count:
+# each predicate call can itself take close to its own --max-time (a stalled
+# connection, not just a fast reject), so counting attempts as if each one
+# were ~1s underestimates real elapsed time and can let this run well past
+# TIMEOUT_SECS before giving up.
 wait_until() {
     local desc="$1" timeout="$2"
     shift 2
-    local waited=0
+    local start=$SECONDS
     while ! "$@" >/dev/null 2>&1; do
-        waited=$((waited + 1))
-        if [ "$waited" -ge "$timeout" ]; then
+        if [ $((SECONDS - start)) -ge "$timeout" ]; then
             fail "timed out after ${timeout}s waiting for: $desc"
         fi
         sleep 1
     done
-    ok "$desc (within ${waited}s)"
+    ok "$desc (within $((SECONDS - start))s)"
 }
 
 # ---- predicates used with wait_until -----------------------------------
@@ -223,7 +230,11 @@ reload_parse_error_logged() {
 ferryman_exited_cleanly() {
     local state
     state=""
-    state=$(docker compose ps -a --format json ferryman 2>/dev/null | jq -r '.State + " " + (.ExitCode|tostring)') || true
+    # `docker compose ps --format json` emits JSON-lines (one object) on
+    # some Compose v2 versions and a single JSON array on others; handle
+    # both instead of assuming one.
+    state=$(docker compose ps -a --format json ferryman 2>/dev/null \
+        | jq -r 'if type == "array" then .[0] else . end | .State + " " + (.ExitCode|tostring)') || true
     [ "$state" = "exited 0" ]
 }
 circuit_open_alert_visible() {
@@ -293,13 +304,13 @@ expect_body_contains "$BASE/nope" "no route" --cacert "$CA"
 # Step 3: TLS termination + HTTP/2 ALPN
 ########################################################################
 step "TLS termination and HTTP/2 ALPN negotiation"
-ver2=$(curl -sS -o /dev/null --cacert "$CA" --http2 -w '%{http_version}' "$BASE/api/users/echo" 2>/dev/null) || ver2=""
+ver2=$(curl -sS --max-time 5 -o /dev/null --cacert "$CA" --http2 -w '%{http_version}' "$BASE/api/users/echo" 2>/dev/null) || ver2=""
 if [ "$ver2" = "2" ]; then
     ok "--http2 negotiates HTTP/2 (ALPN h2)"
 else
     fail "expected http_version 2 with --http2, got '$ver2'"
 fi
-ver1=$(curl -sS -o /dev/null --cacert "$CA" --http1.1 -w '%{http_version}' "$BASE/api/users/echo" 2>/dev/null) || ver1=""
+ver1=$(curl -sS --max-time 5 -o /dev/null --cacert "$CA" --http1.1 -w '%{http_version}' "$BASE/api/users/echo" 2>/dev/null) || ver1=""
 if [ "$ver1" = "1.1" ]; then
     ok "--http1.1 negotiates HTTP/1.1"
 else
@@ -326,7 +337,7 @@ fi
 # Step 5: streaming responses + large request bodies
 ########################################################################
 step "Streaming responses stream; large request bodies aren't buffered"
-times=$(curl -sS -o /dev/null --cacert "$CA" -w '%{time_starttransfer} %{time_total}' \
+times=$(curl -sS --max-time 15 -o /dev/null --cacert "$CA" -w '%{time_starttransfer} %{time_total}' \
     "$BASE/api/users/stream?chunks=5&interval_ms=400" 2>/dev/null) || times="99 99"
 tstart=$(printf '%s' "$times" | cut -d' ' -f1)
 ttotal=$(printf '%s' "$times" | cut -d' ' -f2)
@@ -338,8 +349,8 @@ else
     fail "stream timing: time_starttransfer=${tstart}s time_total=${ttotal}s"
 fi
 
-bytes=$(dd if=/dev/urandom bs=1M count=8 2>/dev/null \
-    | curl -sS --cacert "$CA" --data-binary @- "$BASE/api/users/echo" 2>/dev/null \
+bytes=$(head -c 8388608 /dev/urandom \
+    | curl -sS --max-time 30 --cacert "$CA" --data-binary @- "$BASE/api/users/echo" 2>/dev/null \
     | jq -r '.body_bytes') || bytes=""
 if [ "$bytes" = "8388608" ]; then
     ok "8 MiB POST body echoed as body_bytes=8388608"

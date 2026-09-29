@@ -42,9 +42,19 @@ openssl x509 -req -in "$OUT_DIR/server.csr" \
 
 rm -f "$OUT_DIR/server.csr" "$OUT_DIR/ca.srl" "$OUT_DIR/server-ext.cnf"
 
-# The ferryman container (FROM scratch, runs as root) and the host both
-# need to read these; make them world-readable rather than relying on
-# matching uids across containers.
-chmod 0644 "$OUT_DIR"/*.pem
+# The ferryman container (FROM scratch, runs as root) and the host both need
+# to read the server cert/key ferryman actually serves with, so those two
+# stay world-readable rather than relying on matching uids across
+# containers. The CA *key* is different: nothing needs it at runtime (it
+# only ever signs the server cert, once, right here) and it's the one file
+# in this directory that lets someone mint their own trusted certs for this
+# demo CA, so lock it down instead of leaving it world-readable too.
+chmod 0644 "$OUT_DIR/server.pem" "$OUT_DIR/server-key.pem" "$OUT_DIR/ca.pem"
+chmod 0600 "$OUT_DIR/ca-key.pem"
 
+# Note for cleanup: openssl in the certgen container runs as root, so these
+# files end up root-owned on a Linux host (harmless for docker compose
+# itself, which reads them as root inside containers, but it means a plain
+# `rm -rf certs/*` from your own shell may need `sudo`). `docker compose
+# down -v` doesn't touch this bind-mounted directory either way.
 echo "[gen-certs] done"

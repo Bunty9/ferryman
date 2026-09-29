@@ -10,12 +10,18 @@ groups:
           summary: "ferryman target is not being scraped"
 
       - alert: FerrymanCircuitOpen
-        expr: max by (upstream) (ferryman_circuit_state) == 1
+        # > 0 (not == 1): ferryman_circuit_state is 0=closed, 1=open,
+        # 2=half_open, and a half-open probe can briefly flip an open
+        # breaker to 2 and back to 1. `== 1` would go false for that instant
+        # and reset the `for:` pending timer; `> 0` stays true across an
+        # open<->half-open flap, so a genuinely persistent outage still
+        # fires after 30s instead of restarting its timer on every probe.
+        expr: max by (upstream) (ferryman_circuit_state) > 0
         for: 30s
         labels:
           severity: warning
         annotations:
-          summary: "Circuit breaker open for upstream {{ $labels.upstream }}"
+          summary: "Circuit breaker open (or half-open) for upstream {{ $labels.upstream }}"
 
       - alert: FerrymanUpstreamDown
         expr: min by (upstream) (ferryman_upstream_alive) == 0

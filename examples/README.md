@@ -9,5 +9,9 @@
 Each example's own README has more detail. `full-stack` and `embedded`
 are workspace members with `publish = false`; `guarded_client` is a
 Cargo example of the published `ferryman-core` crate, not a separate
-package. All three use only ferryman's public API — they build and run
-the same way a consumer of the published crates would.
+package. All three use only ferryman's public API. `embedded` and
+`guarded_client` build and run the same way a consumer of the published
+crates.io 0.1.0 crates would; `full-stack` builds ferryman from this
+checkout, and its Grafana latency panel and `FerrymanSlowP99` alert need a
+release newer than 0.1.0 if you swap in the published crate instead (see
+`examples/full-stack/README.md`'s "Using crates.io instead of this repo").

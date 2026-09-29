@@ -144,9 +144,8 @@ no GitHub release was created (the `release` job needs `publish` to
 succeed first).
 
 Because each crate's publish step checks crates.io for that exact
-`name/version` before publishing, simply **re-running the failed
-workflow run** (or pushing the tag again isn't needed/possible — re-run
-the job from the Actions UI) picks up where it left off: `ferryman-core`
+`name/version` before publishing, **re-running the failed jobs** from the
+Actions UI (don't re-push the tag) picks up where it left off: `ferryman-core`
 is found to already exist and is skipped, `ferryman` gets published, and
 the `release` job then creates the GitHub release. No manual crates.io
 intervention needed for this case.

@@ -162,20 +162,31 @@ async fn main() {
     // "Timeouts" section).
     println!();
     println!("-- guarded_with_deadline: a hung call still counts as a breaker failure --");
+    // threshold 1: a single timeout is enough to trip it, so the breaker
+    // state below actually proves the hang was recorded (not just that the
+    // call returned Elapsed).
     let slow_up = Upstream::new(
         "http://slow.internal".parse().expect("valid uri"),
         Duration::from_millis(500),
-        3,
+        1,
     );
     let hangs_forever = async {
         tokio::time::sleep(Duration::from_secs(3600)).await;
         Ok::<(), &'static str>(())
     };
     match guarded_with_deadline(&slow_up, Duration::from_millis(200), hangs_forever).await {
-        Err(Guarded::Failed(TimedOut::Elapsed)) => println!(
-            "call timed out after 200ms -> recorded as a failure, breaker state={:?}",
-            slow_up.state()
-        ),
+        Err(Guarded::Failed(TimedOut::Elapsed)) => {
+            let state = slow_up.state();
+            println!(
+                "call timed out after 200ms -> recorded as a failure, breaker state={state:?}"
+            );
+            assert_eq!(
+                state,
+                CircuitState::Open,
+                "the timeout must have been counted as a failure, opening the breaker"
+            );
+            println!("breaker is Open: the hang was counted, not silently dropped");
+        }
         other => panic!(
             "expected the call to time out and record a failure, got: {}",
             match other {

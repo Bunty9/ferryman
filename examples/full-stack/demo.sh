@@ -404,19 +404,36 @@ wait_until "/api/orders/echo recovers to 200 after restart" 15 orders_up
 step "Failover: stopping orders-v2 doesn't affect the orders route"
 docker compose stop orders-v2
 
-saw_502=0
-saw_503=0
-i=0
-while [ "$i" -lt 5 ]; do
-    i=$((i + 1))
-    code=$(status_of --cacert "$CA" "$BASE/api/orders/v2/echo")
-    if [ "$code" = "502" ]; then saw_502=1; fi
-    if [ "$code" = "503" ]; then saw_503=1; fi
+# A stopped upstream looks like a gateway error to ferryman either way,
+# but which status depends on how fast the runner notices the container
+# is gone: a fast connection refused / NXDOMAIN is 502; if DNS resolution
+# or the connect attempt instead hangs past upstream_timeout_secs before
+# failing (observed on GitHub Actions' ubuntu-latest runners — 2s per
+# attempt there, vs near-instant on a typical dev box), ferryman's own
+# timeout fires first and it's a 504 instead. Both mean "couldn't reach
+# it" from the client's side, so treat them as the same signal. Each
+# attempt can itself cost up to upstream_timeout_secs, so bound this by
+# elapsed time (with a request cap as a backstop), not just a request
+# count.
+saw_gateway_error=0
+saw_refused=0
+codes_seen=""
+start_ts=$(date +%s)
+budget=20
+tries=0
+while :; do
+    tries=$((tries + 1))
+    code=$(status_of --cacert "$CA" --max-time 5 "$BASE/api/orders/v2/echo")
+    codes_seen="$codes_seen $code"
+    if [ "$code" = "502" ] || [ "$code" = "504" ]; then saw_gateway_error=1; fi
+    if [ "$code" = "503" ]; then saw_refused=1; fi
+    if [ "$saw_gateway_error" = 1 ] && [ "$saw_refused" = 1 ]; then break; fi
+    if [ $(($(date +%s) - start_ts)) -ge "$budget" ] || [ "$tries" -ge 20 ]; then break; fi
 done
-if [ "$saw_502" = 1 ] && [ "$saw_503" = 1 ]; then
-    ok "orders-v2: saw both 502 (transport failure) and 503 (breaker open) within 5 requests"
+if [ "$saw_gateway_error" = 1 ] && [ "$saw_refused" = 1 ]; then
+    ok "orders-v2: saw a gateway error (502/504) then breaker-open 503 within ${budget}s (codes:${codes_seen})"
 else
-    fail "orders-v2: expected both 502 and 503 within 5 requests (saw_502=$saw_502 saw_503=$saw_503)"
+    fail "orders-v2: expected both a gateway error (502/504) and breaker-open 503 within ${budget}s (codes:${codes_seen})"
 fi
 
 expect_status "$BASE/api/orders/echo" 200 --cacert "$CA"

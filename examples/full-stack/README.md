@@ -172,11 +172,22 @@ curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/
 
 ```bash
 docker compose stop orders-v2
-curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/orders/v2/echo  # 502 at first (connect refused), then 503 (breaker open)
+curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/orders/v2/echo  # gateway error at first, then 503 (breaker open)
 curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/orders/echo     # still 200 — different breaker, different upstream
 docker compose start orders-v2
 curl -sS -o /dev/null -w '%{http_code}\n' --cacert "$CA" https://localhost:8443/api/orders/v2/echo  # back to 200 within ~15s
 ```
+
+> **502 vs 504 for a stopped upstream:** which "gateway error" status you
+> see first depends on how the host notices the container is gone. A
+> fast connection refused or NXDOMAIN is a **502**. If DNS resolution or
+> the connect attempt instead hangs — observed on GitHub Actions'
+> `ubuntu-latest` runners — ferryman's own `upstream_timeout_secs` (2s in
+> this demo) fires first and it's a **504** instead. Both mean "couldn't
+> reach the upstream" and both count as a breaker failure; `demo.sh`
+> treats them as the same signal rather than assuming 502 specifically.
+
+
 
 **9. Prometheus: scraping, histograms, and the circuit-open alert**
 

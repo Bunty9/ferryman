@@ -50,6 +50,14 @@
 - [ ] Trusted Publishing + `release.yml` for later releases
       (`docs/plans/2026-09-28-publishing.md` step 4)
 
+## Release — 0.2.0 (2026-09-29)
+
+- [x] Request latency exported as a Prometheus histogram (breaking for
+      `quantile` queries), `--version`, `ferryman::LATENCY_BUCKETS`,
+      arch-aware Dockerfile
+- [x] Reference examples: `examples/full-stack` (Compose + asserted tour,
+      blocking CI job), `examples/embedded`, `guarded_client`
+
 ## Next — P4 (ferryman-edge)
 
 - mTLS, JWT auth plane, cert hot-reload, WebSocket/Upgrade passthrough,

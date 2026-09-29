@@ -151,10 +151,10 @@ swap) are not seen by the watcher.
   needs a C toolchain the musl build lacks, and with a single provider
   compiled in `ServerConfig::builder()` needs no `install_default`.
 - reqwest (health checks) has no TLS stack; upstreams are http only.
-- The Docker build (cargo-chef, `x86_64-unknown-linux-musl`, `FROM
-  scratch`) produces a ~9 MB image. `rust-toolchain.toml` is excluded from
-  the build context so the image's toolchain, which has the musl target,
-  is used.
+- The Docker build (cargo-chef, a musl target picked from `TARGETARCH`:
+  `x86_64` or `aarch64`, built natively, `FROM scratch`) produces a ~9 MB
+  image. `rust-toolchain.toml` is excluded from the build context so the
+  image's toolchain, which has the musl target, is used.
 
 ## Known limits
 

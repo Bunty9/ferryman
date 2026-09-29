@@ -84,8 +84,8 @@ exit.
 
    ```toml
    [dependencies]
-   ferryman = "0.1"
-   ferryman-core = "0.1"
+   ferryman = "0.2"
+   ferryman-core = "0.2"
 
    tokio = { version = "1.47", features = ["full"] }
    hyper = { version = "1.5", features = ["full"] }
@@ -143,11 +143,22 @@ rather than building its own recorder: an app embedding ferryman is
 expected to own that one global install, typically alongside whatever else
 it records metrics for, and hand the resulting handle to `start`.
 
-Tests are the one place this rule doesn't apply: `tests/embedded.rs` builds
-a private, *uninstalled* recorder per test with
-`PrometheusBuilder::new().build_recorder().handle()`, so many
-`#[tokio::test]`s in the same process never collide over the single global
-slot.
+The handle you pass to `start` must come from the recorder you actually
+installed. ferryman records every metric through the global `metrics::`
+macros, so a handle from a recorder that was never installed renders an
+**empty `/metrics`**: no `ferryman_*` series at all, and no error.
+
+Tests work around the one-install-per-process rule in two ways:
+
+- `tests/embedded.rs` builds a private, *uninstalled* recorder per test
+  (`PrometheusBuilder::new().build_recorder().handle()`), so many
+  `#[tokio::test]`s in one process don't collide over the global slot.
+  That is fine only because those tests never assert on `/metrics`.
+- `tests/metrics.rs` is a separate test binary (its own process), so it
+  can call `prometheus_builder(..).install_recorder()` once and assert that
+  `/metrics` really contains `ferryman_upstream_alive` and
+  `ferryman_request_duration_seconds_bucket`. Copy that pattern for any
+  test that checks metrics.
 
 ## The "run upkeep periodically" rule
 

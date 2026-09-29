@@ -7,10 +7,14 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-29
+
 ### Added
 
 - `--version`.
-- `ferryman::LATENCY_BUCKETS`.
+- `ferryman::LATENCY_BUCKETS` (0.5 ms to 30 s).
+- Native arm64 Docker builds: the Dockerfile picks the musl target from
+  `TARGETARCH`, so Apple Silicon hosts build without emulation.
 - Three reference examples: `examples/full-stack` (Docker Compose:
   ferryman + demo upstreams + Prometheus/Grafana, TLS, asserted tour),
   `examples/embedded` (embedding `ferryman::serve` as a library), and
@@ -51,5 +55,6 @@ First public release.
 - Prometheus metrics on a separate listener.
 - `echo_upstream` example for local benchmarking.
 
-[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Bunty9/ferryman/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bunty9/ferryman/releases/tag/v0.1.0

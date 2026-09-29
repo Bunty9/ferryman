@@ -30,16 +30,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 /// Latency buckets (seconds) for the `ferryman_request_duration_seconds`
-/// histogram — the same values as `ferryman::LATENCY_BUCKETS`
-/// (crates/server/src/lib.rs).
-///
-/// Duplicated here rather than imported: `ferryman::LATENCY_BUCKETS` is not
-/// in the 0.1.0 release this example is written against — use
-/// `ferryman::LATENCY_BUCKETS` once a release that exports it is out, and
-/// delete this const.
-pub const LATENCY_BUCKETS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-];
+/// histogram, re-exported from ferryman so an embedding app configures its
+/// recorder with exactly the buckets the `ferryman` binary uses.
+pub use ferryman::LATENCY_BUCKETS;
 
 /// Everything needed to start an embedded ferryman instance.
 pub struct Settings {

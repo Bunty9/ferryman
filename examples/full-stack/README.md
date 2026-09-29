@@ -355,13 +355,9 @@ dependency tree on every version bump) for a much shorter Dockerfile,
 which is usually the right trade for a consumer of the crate rather than
 a contributor to it.
 
-**A caveat if you do this:** crates.io's published `ferryman` 0.1.0 still
-exports request duration as a Prometheus *summary*
-(`ferryman_request_duration_seconds{quantile=...}`), not the histogram
-(`..._bucket`) this example's `prometheus/alerts.yml` and Grafana latency
-panel both query with `histogram_quantile(...)`. That change is unreleased
-(see `CHANGELOG.md`'s `[Unreleased]` section) — against a 0.1.0 binary, the
-dashboard's latency panel stays empty and `FerrymanSlowP99` never fires.
-Everything else in this example (routing, breaker, failover, hot reload,
-the other alerts) works unchanged against 0.1.0; wait for a release newer
-than 0.1.0 before expecting the bucket-based panel/alert to work too.
+**Use ferryman 0.2.0 or later.** 0.1.0 exported request duration as a
+Prometheus *summary* (`ferryman_request_duration_seconds{quantile=...}`)
+rather than the histogram (`..._bucket`) that this example's
+`prometheus/alerts.yml` and Grafana latency panel query with
+`histogram_quantile(...)`. Against a 0.1.0 binary the latency panel stays
+empty and `FerrymanSlowP99` never fires; everything else works.

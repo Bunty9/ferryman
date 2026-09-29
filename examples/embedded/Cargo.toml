@@ -17,8 +17,8 @@ publish = false
 # `path` keys deleted, see README.md — still resolves against the published
 # crates on crates.io). Written explicitly here, not via `workspace = true`,
 # so a reader can copy these two lines verbatim into their own project.
-ferryman = { path = "../../crates/server", version = "0.1" }
-ferryman-core = { path = "../../crates/core", version = "0.1" }
+ferryman = { path = "../../crates/server", version = "0.2" }
+ferryman-core = { path = "../../crates/core", version = "0.2" }
 
 tokio = { workspace = true }
 hyper = { workspace = true }

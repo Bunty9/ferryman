@@ -65,8 +65,15 @@ pub struct Settings {
 /// Always end its life with [`Running::shutdown`] rather than dropping it:
 /// dropping a `Running` does *not* stop the background tasks it spawned
 /// (Tokio doesn't cancel a `JoinHandle`'s task on drop), so a dropped
-/// `Running` leaks a proxy listener, an admin listener, a health-check
-/// loop, and a config watcher that keep running forever.
+/// `Running` leaks its proxy listener, its admin listener, its active
+/// health-check loop, its metrics-upkeep loop, and its config watcher —
+/// every one of them keeps running forever. `shutdown` stops all of them:
+/// the proxy and admin listeners are asked to drain and are awaited, the
+/// metrics-upkeep loop exits cooperatively via the same shutdown signal,
+/// and the health-check loop — which, unlike the others, has no
+/// cooperative-cancellation hook of its own (see
+/// `ferryman_core::health_loop`'s doc comment) — is aborted once the proxy
+/// has finished draining.
 pub struct Running {
     /// Where the proxy ended up listening (useful when `Settings::proxy_bind`
     /// asked for an ephemeral port).
@@ -78,8 +85,10 @@ pub struct Running {
     /// scraping `/status`.
     pub table: SharedTable,
     shutdown_tx: watch::Sender<bool>,
+    health_task: JoinHandle<()>,
     proxy_task: JoinHandle<anyhow::Result<()>>,
     admin_task: JoinHandle<()>,
+    upkeep_task: JoinHandle<()>,
     // Held only so the filesystem watch subscription outlives `start`;
     // dropping it would cancel hot-reload. Never read directly.
     _watcher: RecommendedWatcher,
@@ -119,28 +128,20 @@ pub fn prometheus_builder(health_interval: Duration) -> anyhow::Result<Prometheu
 /// as `main.rs` does) — see README.md's "install once" rule for why `start`
 /// takes a ready-made handle rather than building its own recorder.
 pub async fn start(settings: Settings, metrics: PrometheusHandle) -> anyhow::Result<Running> {
+    // --- Everything fallible happens first, before a single task is
+    // spawned. A bind failing because the port is already taken is the
+    // most likely way `start` fails in practice; if a background task
+    // (e.g. the health-check loop) were already running by the time that
+    // happens, an embedding app that retries `start` after an `Err` would
+    // accumulate one orphaned task per failed attempt, since returning
+    // `Err` from `start` gives the caller no `Running` to call `shutdown`
+    // on and thus no way to stop what's already spawned. Keeping every
+    // `?` above every `tokio::spawn` is what makes `start` safe to retry.
     let cfg = load_config(&settings.config)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
 
     let table = build_table(cfg, None)?;
-    // Gauges are only ever visible through a recorder that's already
-    // installed; since `metrics` is the caller's installed recorder, this
-    // is safe to call before anything else touches the table.
-    table.publish_gauges();
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
-
-    // Active health checker: probes every upstream's /health on a fixed
-    // interval and reports results through the same breakers the proxy
-    // reads. Runs for as long as its task lives; there's no cooperative
-    // cancellation, hence the shutdown-flag design below for the tasks that
-    // *do* need to stop cleanly (the proxy and admin accept loops).
-    tokio::spawn(health_loop(shared.clone(), interval));
-
-    // Hot-reload watcher: re-reads and hot-swaps the table on config file
-    // changes. Its `RecommendedWatcher` must be kept alive (stored in
-    // `Running`) or the subscription is cancelled immediately.
-    let watcher = ferryman::reload::watch_config(&settings.config, shared.clone())
-        .context("starting config file watcher")?;
 
     let tls = match &settings.tls {
         Some((cert, key)) => Some(
@@ -159,6 +160,28 @@ pub async fn start(settings: Settings, metrics: PrometheusHandle) -> anyhow::Res
         .await
         .with_context(|| format!("binding admin listener on {}", settings.admin_bind))?;
     let admin_addr = admin_listener.local_addr()?;
+
+    // Hot-reload watcher: re-reads and hot-swaps the table on config file
+    // changes. Its `RecommendedWatcher` must be kept alive (stored in
+    // `Running`) or the subscription is cancelled immediately.
+    let watcher = ferryman::reload::watch_config(&settings.config, shared.clone())
+        .context("starting config file watcher")?;
+
+    // --- Nothing below this point is fallible: only spawns follow.
+    //
+    // Gauges are only ever visible through a recorder that's already
+    // installed; since `metrics` is the caller's installed recorder, this
+    // is safe now.
+    shared.load().publish_gauges();
+
+    // Active health checker: probes every upstream's /health on a fixed
+    // interval and reports results through the same breakers the proxy
+    // reads. It has no cooperative-cancellation hook of its own (see its
+    // doc comment in crates/core/src/health.rs — "Cancel by aborting the
+    // spawned task"), so unlike the proxy/admin/upkeep tasks below, it
+    // isn't wired to `shutdown_rx` at all; `Running::shutdown` aborts this
+    // handle directly instead.
+    let health_task: JoinHandle<()> = tokio::spawn(health_loop(shared.clone(), interval));
 
     // `watch` (not `oneshot`) so the same signal can be cloned and awaited
     // by three independent tasks (proxy, admin, upkeep) without consuming
@@ -197,12 +220,11 @@ pub async fn start(settings: Settings, metrics: PrometheusHandle) -> anyhow::Res
     // of its own HTTP-listener exporter task; `install_recorder` (what this
     // example uses, since the admin server renders `/metrics` itself) does
     // not, so the caller is responsible for calling `run_upkeep()`
-    // periodically. This task is the one place that happens. It isn't
-    // tracked in `Running` because it has nothing to join on failure (it
-    // never returns an error) and it stops on its own, via the same
-    // shutdown signal, once `shutdown_tx.send(true)` fires.
+    // periodically. This task is the one place that happens; it exits
+    // cooperatively via `shutdown_rx`, same as the proxy and admin tasks,
+    // and `Running::shutdown` awaits it (tracked below, not fire-and-forget).
     let mut upkeep_shutdown_rx = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let upkeep_task: JoinHandle<()> = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
@@ -217,8 +239,10 @@ pub async fn start(settings: Settings, metrics: PrometheusHandle) -> anyhow::Res
         admin_addr,
         table: shared,
         shutdown_tx,
+        health_task,
         proxy_task,
         admin_task,
+        upkeep_task,
         _watcher: watcher,
     })
 }
@@ -235,11 +259,11 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
 }
 
 impl Running {
-    /// Stop accepting new connections/requests and wait for the proxy and
-    /// admin tasks to finish, up to a generous bound. Idempotent to call
-    /// (`shutdown_tx.send` on an instance with no live receivers is a
-    /// harmless no-op), but only meant to be called once — it consumes
-    /// `self`.
+    /// Stop accepting new connections/requests and wait for every
+    /// background task `start` spawned to finish, up to a generous bound.
+    /// Idempotent to call (`shutdown_tx.send` on an instance with no live
+    /// receivers is a harmless no-op), but only meant to be called once —
+    /// it consumes `self`.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         // Flip the flag once; every clone of `shutdown_rx` wakes on its next
         // poll of `wait_for`.
@@ -264,6 +288,24 @@ impl Running {
             .await
             .context("admin task did not shut down in time")?
             .context("admin task panicked")?;
+
+        // The upkeep loop watches the same shutdown signal and exits
+        // cooperatively (see `start`); by now it should already be done or
+        // a single `select!` poll away from it, but await it properly
+        // rather than leaving it to finish on its own after `shutdown` has
+        // already returned.
+        tokio::time::timeout(SHUTDOWN_BOUND, self.upkeep_task)
+            .await
+            .context("upkeep task did not shut down in time")?
+            .context("upkeep task panicked")?;
+
+        // `health_loop` has no shutdown signal wired in (see the comment on
+        // `health_task` in `start`) and holds no state that needs an
+        // orderly cleanup — each probe is an independent, fire-and-forget
+        // `reqwest` call — so aborting it here, after the proxy has
+        // finished draining, is correct: no request or probe result is
+        // lost, it just stops being scheduled.
+        self.health_task.abort();
 
         Ok(())
     }

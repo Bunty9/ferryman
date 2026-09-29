@@ -18,9 +18,14 @@ as a separate process.
   `GET /healthz` (liveness), `GET /status` (JSON breaker state per
   upstream), and `GET /metrics` (Prometheus exposition format) — routes
   ferryman's own binary doesn't offer as a single family.
-- Cooperative shutdown with a `tokio::sync::watch` flag, so the proxy
-  listener, the admin listener, and the metrics-upkeep task all stop
-  together on one signal.
+- Shutdown that actually stops everything `start` spawned: the proxy
+  listener, the admin listener, and the metrics-upkeep task cooperatively
+  stop via one shared `tokio::sync::watch` flag; the active health-check
+  loop (which has no cancellation hook of its own — see
+  `ferryman_core::health_loop`'s doc comment) is aborted right after, once
+  the proxy has finished draining. `Running::shutdown` waits for all of it
+  before returning, so nothing is still probing or listening in the
+  background afterwards.
 
 `src/main.rs` is a thin CLI wrapper around exactly that API (parse args,
 install the metrics recorder, `start`, wait for Ctrl-C/SIGTERM, `shutdown`),
@@ -64,17 +69,60 @@ exit.
 
 ## Copying this into your own project
 
-1. Copy `src/lib.rs` and `src/admin.rs` (or just the parts you need) into
-   your crate.
-2. In your `Cargo.toml`, add the two ferryman dependencies **with the
-   `path` key deleted** — this example's `Cargo.toml` keeps `path` only so
-   this repo's workspace builds against the local checkout; a real
-   consumer depends on the published crates:
+1. Copy `src/lib.rs` and `src/admin.rs` (or just the parts you need; also
+   copy `src/main.rs` if you want the CLI wrapper too) into your crate.
+2. In your `Cargo.toml`, add the dependencies below **with the two
+   ferryman `path` keys deleted** — this example's `Cargo.toml` keeps
+   `path` only so this repo's workspace builds against the local checkout;
+   a real consumer depends on the published crates. This is the full list
+   `lib.rs`/`admin.rs` need to compile, copied from this repo's root
+   `Cargo.toml` `[workspace.dependencies]` (same versions this example is
+   tested against — see the version-pinning note below):
 
    ```toml
+   [dependencies]
    ferryman = "0.1"
    ferryman-core = "0.1"
+
+   tokio = { version = "1.47", features = ["full"] }
+   hyper = { version = "1.5", features = ["full"] }
+   hyper-util = { version = "0.1", features = ["full"] }
+   http-body-util = "0.1"
+   arc-swap = "1.7"
+   notify = "6"
+   metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+   metrics-util = { version = "0.19", default-features = false }
+   serde_json = "1"
+   anyhow = "1"
+   tracing = "0.1"
+
+   # Only needed if you also copy main.rs's CLI wrapper:
+   tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+   clap = { version = "4", features = ["derive", "env"] }
    ```
+
+   Two of these matter more than they look:
+
+   - **`notify = "6"`** — `Running`'s private field holding the config
+     watcher is typed `notify::RecommendedWatcher`, and
+     `ferryman::reload::watch_config` returns that exact type from
+     `notify` 6.x. A different major version of `notify` in your
+     dependency graph is a *different, incompatible* `RecommendedWatcher`
+     type (Cargo/Rust don't unify two majors of the same crate), so the
+     code in `lib.rs` simply won't compile against it.
+   - **If your own app also calls `metrics::counter!`/`gauge!`/`histogram!`
+     directly** (to record its own metrics into the same recorder this
+     example installs), your app's `metrics` dependency must be on the
+     same major version ferryman/ferryman-core use internally — currently
+     `metrics = "0.24"` (see the root `Cargo.toml`). The `metrics` crate is
+     a facade, like `log` or `tracing`: each major version has its own
+     independent global-recorder slot. A `metrics 0.23` app talking through
+     a `metrics::set_global_recorder` installed by `metrics 0.24` code
+     doesn't error at compile time or at runtime — it just silently
+     resolves to a *different* recorder, so nothing you record shows up
+     in `/metrics`, and none of ferryman's own series get corrupted either.
+     There's no compiler or runtime error to catch this; it just looks
+     like your metrics never showed up.
 
 3. From your own `main` (or wherever your app starts its background work),
    call `start(settings, metrics)` once and hold on to the returned

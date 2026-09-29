@@ -175,3 +175,60 @@ async fn embedded_instance_proxies_reports_status_and_shuts_down() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression test: `start` used to spawn the health-check loop *before*
+/// attempting either bind, so a `start` that failed because a port was
+/// already taken (the most likely real startup failure) still left an
+/// orphaned health-check loop running — one per failed attempt, for an
+/// embedding app that retries `start` after an `Err`. `start` now does all
+/// fallible work (config load, table build, TLS load, both binds, the
+/// watcher) before spawning anything, so a bind failure here must return
+/// `Err` without a `Running` to show for it and without leaving any task
+/// behind.
+#[tokio::test]
+async fn start_fails_when_admin_bind_is_already_taken() {
+    // Bind the port ourselves first so `start`'s own admin bind is
+    // guaranteed to fail with "address in use".
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_bind = taken.local_addr().unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "ferryman-embedded-test-bindfail-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.toml");
+    // The upstream doesn't need to exist: `start` must fail at the admin
+    // bind, long before anything would try to reach it.
+    std::fs::write(
+        &config_path,
+        "[[routes]]\nprefix = \"/svc\"\nupstream = \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap();
+
+    let settings = Settings {
+        config: config_path,
+        proxy_bind: "127.0.0.1:0".parse().unwrap(),
+        admin_bind,
+        tls: None,
+    };
+    let metrics = PrometheusBuilder::new().build_recorder().handle();
+
+    // `Running` doesn't implement `Debug` (it holds `JoinHandle`s and a
+    // `notify::RecommendedWatcher`, neither of which need it for anything
+    // else this crate does), so unwrap the `Result::Err` side by hand
+    // instead of `expect_err`, which requires the `Ok` side to be `Debug`.
+    let result = start(settings, metrics).await;
+    let err = match result {
+        Ok(_) => panic!("admin_bind is already taken by `taken`, start must fail"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("binding admin listener"), "{err}");
+
+    drop(taken);
+    let _ = std::fs::remove_dir_all(&dir);
+}

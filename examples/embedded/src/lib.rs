@@ -258,13 +258,25 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|&v| v).await;
 }
 
+/// `ferryman::serve` stops accepting immediately but then drains in-flight
+/// connections for up to its own internal 25s timeout
+/// (`GRACEFUL_SHUTDOWN_TIMEOUT` in crates/server/src/lib.rs) before dropping
+/// them anyway. `Running::shutdown`'s total bound is set comfortably above
+/// that so a wedged drain can't hang `shutdown` forever — in production this
+/// can legitimately take close to 25s under load; in the test suite there's
+/// nothing in flight, so it returns almost immediately.
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
+
 /// Await `handle` until `deadline`, aborting it — rather than leaving it
 /// detached and still running — if it doesn't finish in time. `deadline` is
 /// a shared `Instant` (not a per-call `Duration`), so a caller awaiting
 /// several tasks in sequence bounds their *total* wait, not each one
 /// separately. `abort_handle()` is taken before the await so it's still
 /// available to abort the task after `handle` itself has been consumed by
-/// `timeout_at`.
+/// `timeout_at`. Note that `.abort()` only requests cancellation
+/// cooperatively (at the task's next await point) and isn't awaited here —
+/// the caller gets an error back immediately and doesn't wait for the abort
+/// to actually take effect.
 async fn await_or_abort(
     handle: JoinHandle<()>,
     deadline: Instant,
@@ -276,7 +288,7 @@ async fn await_or_abort(
         Err(_elapsed) => {
             abort_handle.abort();
             Err(anyhow::anyhow!(
-                "{name} task did not shut down by the deadline"
+                "{name} task did not shut down within the {SHUTDOWN_BOUND:?} shutdown deadline"
             ))
         }
     }
@@ -297,7 +309,7 @@ async fn await_or_abort_fallible(
         Err(_elapsed) => {
             abort_handle.abort();
             Err(anyhow::anyhow!(
-                "{name} task did not shut down by the deadline"
+                "{name} task did not shut down within the {SHUTDOWN_BOUND:?} shutdown deadline"
             ))
         }
     }
@@ -305,8 +317,9 @@ async fn await_or_abort_fallible(
 
 impl Running {
     /// Stop accepting new connections/requests and wait for every
-    /// background task `start` spawned to finish, up to a generous bound.
-    /// Only meant to be called once — it consumes `self`.
+    /// background task `start` spawned to finish, up to `SHUTDOWN_BOUND`
+    /// (30s total, not per task — see below). Only meant to be called
+    /// once — it consumes `self`.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         // Flip the flag once; every clone of `shutdown_rx` wakes on its next
         // poll of `wait_for`.
@@ -321,15 +334,6 @@ impl Running {
         // function — success, a task error, or a timeout — leaves it
         // stopped, never still running in the background.
         self.health_task.abort();
-
-        // `ferryman::serve` stops accepting immediately but then drains
-        // in-flight connections for up to its own internal 25s timeout
-        // (`GRACEFUL_SHUTDOWN_TIMEOUT` in crates/server/src/lib.rs) before
-        // dropping them anyway. Bound the wait comfortably above that so a
-        // wedged drain can't hang `shutdown` forever — in production this
-        // can legitimately take close to 25s under load; in the test suite
-        // there's nothing in flight, so it returns almost immediately.
-        const SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
 
         // One deadline, computed once and shared by every await below —
         // not a fresh `SHUTDOWN_BOUND` per task — so three sequential

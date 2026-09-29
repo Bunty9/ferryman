@@ -7,6 +7,34 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-29
+
+No API or behaviour changes to the `ferryman` binary or either library.
+
+### Added
+
+- `.github/workflows/release.yml`: pushing a `vX.Y.Z` tag checks the tag
+  (on `main`, matches the workspace version, has a CHANGELOG section),
+  runs the tests, publishes both crates via crates.io Trusted Publishing
+  (per crate, skipping versions already published), then creates the
+  GitHub release from this file.
+
+### Fixed
+
+- `ferryman-core`'s `guarded_client` example: the timeout section now
+  proves a hang is counted as a failure (the breaker opens).
+- `examples/embedded`: shutdown is bounded by one 30 s deadline in total
+  (was up to ~90 s); timeout errors name the bound.
+- `examples/full-stack`: the ferryman container no longer mounts the CA
+  private key; `gen-certs.sh` enforces `0600` on it, recovers from partial
+  runs, and fails clearly if Docker created directories in place of cert
+  files. README step 7 now correctly explains that health checks close an
+  open circuit directly, without waiting for the cooldown.
+
+### Changed
+
+- CI runs the test suite with `--locked`.
+
 ## [0.2.0] - 2026-09-29
 
 ### Added
@@ -55,6 +83,7 @@ First public release.
 - Prometheus metrics on a separate listener.
 - `echo_upstream` example for local benchmarking.
 
-[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Bunty9/ferryman/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Bunty9/ferryman/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bunty9/ferryman/releases/tag/v0.1.0

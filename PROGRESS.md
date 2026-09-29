@@ -47,9 +47,8 @@
 - [x] `ferryman` and `ferryman-core` 0.1.0 on crates.io; `cargo install
       --locked ferryman` verified
 - [x] Tag `v0.1.0` + GitHub release
-- [ ] Trusted Publishing: `.github/workflows/release.yml` now exists in
-      the repo; the only thing left is the crates.io setting itself
-      (`docs/plans/2026-09-28-publishing.md` step 4)
+- [x] Trusted Publishing: `.github/workflows/release.yml` plus the
+      crates.io setting for both crates (2026-09-29)
 
 ## Release — 0.2.0 (2026-09-29)
 
@@ -58,6 +57,12 @@
       arch-aware Dockerfile
 - [x] Reference examples: `examples/full-stack` (Compose + asserted tour,
       blocking CI job), `examples/embedded`, `guarded_client`
+
+## Release — 0.2.1 (2026-09-29)
+
+- [x] First release cut by `release.yml` via crates.io Trusted Publishing
+- [x] Example fixes (guarded_client proof, embedded shutdown bound, CA key
+      mount) and `--locked` CI
 
 ## Next — P4 (ferryman-edge)
 

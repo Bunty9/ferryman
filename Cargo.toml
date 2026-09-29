@@ -9,7 +9,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "0.2.1"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Bunty9"]
@@ -18,7 +18,7 @@ homepage = "https://github.com/Bunty9/ferryman"
 
 [workspace.dependencies]
 # Internal crate: path for local builds, version for crates.io.
-ferryman-core = { path = "crates/core", version = "0.2.0" }
+ferryman-core = { path = "crates/core", version = "0.2.1" }
 
 # Runtime + HTTP
 tokio = { version = "1.47", features = ["full"] }

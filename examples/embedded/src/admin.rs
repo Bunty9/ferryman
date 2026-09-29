@@ -7,8 +7,8 @@
 //!
 //! Ferryman's own binary doesn't offer any of these three routes as a
 //! single family — `/metrics` is a separate exporter-owned listener, and
-//! there's no `/healthz` or `/status` at all (see task-3-brief.md). An app
-//! embedding ferryman gets to decide that; this is one reasonable answer.
+//! there's no `/healthz` or `/status` at all. An app embedding ferryman
+//! gets to decide that; this is one reasonable answer.
 
 use ferryman_core::{CircuitState, SharedTable};
 use http_body_util::Full;

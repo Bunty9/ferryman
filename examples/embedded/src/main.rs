@@ -34,8 +34,11 @@ struct Args {
     bind: SocketAddr,
 
     /// Bind address for this example's admin server
-    /// (`/healthz`, `/status`, `/metrics`).
-    #[arg(long, default_value = "0.0.0.0:9091")]
+    /// (`/healthz`, `/status`, `/metrics`). Defaults to loopback-only on
+    /// 9191, not 9091: that's the host port `examples/full-stack`'s
+    /// docker-compose.yml publishes Prometheus on, and this admin server
+    /// isn't meant to be reachable off the box anyway.
+    #[arg(long, default_value = "127.0.0.1:9191")]
     admin_bind: SocketAddr,
 
     /// TLS certificate PEM path. Requires `--tls-key`; omit both to serve

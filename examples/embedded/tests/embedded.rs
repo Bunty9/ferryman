@@ -110,7 +110,13 @@ async fn embedded_instance_proxies_reports_status_and_shuts_down() {
     // `build_recorder()` (unlike `install_recorder()`) never touches the
     // process-global metrics recorder, so many `#[tokio::test]`s across this
     // whole test binary can each build their own handle without colliding —
-    // see the "install-recorder-once" rule in README.md.
+    // see the "install-recorder-once" rule in README.md. The tradeoff: this
+    // handle is never installed, and ferryman records metrics through the
+    // global `metrics::` macros, not through the handle passed to `start` —
+    // so this handle's `/metrics` would render *empty* no matter how much
+    // traffic this test proxies. That's fine here, since this file never
+    // asserts on `/metrics` content; `tests/metrics.rs` is the one test that
+    // does, in its own process, with a real installed recorder.
     let metrics = PrometheusBuilder::new().build_recorder().handle();
 
     let running = start(settings, metrics).await.expect("start");

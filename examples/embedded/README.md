@@ -49,17 +49,20 @@ Then, in another terminal, run this example against `examples/embedded/config.to
 cargo run -p ferryman-embedded-example -- --config examples/embedded/config.toml
 ```
 
-It listens on `0.0.0.0:8080` (proxy) and `0.0.0.0:9091` (admin) by default —
-override with `--bind` / `--admin-bind`. If those ports are taken on your
-box, pick free ones and edit `config.toml`'s upstreams to match wherever you
-started the two `echo_upstream` instances.
+It listens on `0.0.0.0:8080` (proxy) and `127.0.0.1:9191` (admin, loopback
+only by default) — override with `--bind` / `--admin-bind`. If those ports
+are taken on your box, pick free ones and edit `config.toml`'s upstreams to
+match wherever you started the two `echo_upstream` instances. (9191, not
+9091: `examples/full-stack`'s docker-compose.yml publishes Prometheus on
+host port 9091, and this admin server isn't meant to be reachable off the
+box anyway.)
 
 While it's running:
 
 ```bash
-curl http://127.0.0.1:9091/healthz     # -> 200 ok
-curl http://127.0.0.1:9091/status      # -> {"upstreams":[{"name":"127.0.0.1:8001",...,"state":"closed"},...]}
-curl http://127.0.0.1:9091/metrics     # -> Prometheus exposition text
+curl http://127.0.0.1:9191/healthz     # -> 200 ok
+curl http://127.0.0.1:9191/status      # -> {"upstreams":[{"name":"127.0.0.1:8001",...,"state":"closed"},...]}
+curl http://127.0.0.1:9191/metrics     # -> Prometheus exposition text
 curl http://127.0.0.1:8080/svc-a/hi    # -> proxied through to the :8001 stub
 ```
 
@@ -178,8 +181,10 @@ Embed ferryman as a library (this pattern) when:
 - You want ferryman's metrics folded into an admin/observability surface
   your app already runs, instead of a second `/metrics` port.
 - You want programmatic access to the live routing table (`Running::table`)
-  from your own code — e.g. to drive an admin UI, or to build the initial
-  config from something other than a TOML file on disk.
+  from your own code, e.g. to drive an admin UI (`start` still needs a TOML
+  file on disk for the *initial* config — `Settings::config` is a path, not
+  in-memory config — but hot reload and `Running::table` both give you
+  live access after that).
 - The extra wiring in `src/lib.rs` (spawning the health loop, the watcher,
   the two listeners, and tying them to one shutdown signal) is something
   you're happy to own and keep working as ferryman's API evolves, in

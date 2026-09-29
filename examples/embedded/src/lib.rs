@@ -33,13 +33,12 @@ use tokio::task::JoinHandle;
 /// histogram — the same values as `ferryman::LATENCY_BUCKETS`
 /// (crates/server/src/lib.rs).
 ///
-/// Duplicated here rather than imported: this example is written against
-/// ferryman 0.1.0 as published on crates.io, and that release doesn't
-/// export the constant yet (it was added on the unreleased `examples`
-/// branch this repo is built from). Once you depend on ferryman >= 0.1.1,
-/// delete this const and use `ferryman::LATENCY_BUCKETS` instead.
+/// Duplicated here rather than imported: `ferryman::LATENCY_BUCKETS` is not
+/// in the 0.1.0 release this example is written against — use
+/// `ferryman::LATENCY_BUCKETS` once a release that exports it is out, and
+/// delete this const.
 pub const LATENCY_BUCKETS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
 /// Everything needed to start an embedded ferryman instance.
@@ -68,12 +67,11 @@ pub struct Settings {
 /// `Running` leaks its proxy listener, its admin listener, its active
 /// health-check loop, its metrics-upkeep loop, and its config watcher —
 /// every one of them keeps running forever. `shutdown` stops all of them:
-/// the proxy and admin listeners are asked to drain and are awaited, the
-/// metrics-upkeep loop exits cooperatively via the same shutdown signal,
-/// and the health-check loop — which, unlike the others, has no
+/// the health-check loop — which, unlike the others, has no
 /// cooperative-cancellation hook of its own (see
-/// `ferryman_core::health_loop`'s doc comment) — is aborted once the proxy
-/// has finished draining.
+/// `ferryman_core::health_loop`'s doc comment) — is aborted first, and the
+/// proxy and admin listeners and the metrics-upkeep loop are then asked to
+/// drain/exit cooperatively via the same shutdown signal and awaited.
 pub struct Running {
     /// Where the proxy ended up listening (useful when `Settings::proxy_bind`
     /// asked for an ephemeral port).
@@ -123,10 +121,18 @@ pub fn prometheus_builder(health_interval: Duration) -> anyhow::Result<Prometheu
 /// checker and the config-file watcher, then bind and serve both the proxy
 /// and the admin listeners in the background.
 ///
-/// `metrics` is a [`PrometheusHandle`] the *caller* already built and
-/// installed (typically via `prometheus_builder(..)?.install_recorder()?`,
-/// as `main.rs` does) — see README.md's "install once" rule for why `start`
-/// takes a ready-made handle rather than building its own recorder.
+/// `metrics` must be the [`PrometheusHandle`] of the *installed* global
+/// recorder — i.e. the caller already built and installed it (typically via
+/// `prometheus_builder(..)?.install_recorder()?`, as `main.rs` does) before
+/// calling `start`. `start` and the rest of ferryman record metrics through
+/// the global `metrics::` macros, not through this handle directly, so a
+/// handle from an *uninstalled* recorder (e.g.
+/// `PrometheusBuilder::new().build_recorder().handle()`) never observes
+/// anything ferryman records — `render()`ing it comes back empty regardless
+/// of how much traffic was proxied. See README.md's "install once" rule for
+/// why `start` takes a ready-made handle rather than building its own
+/// recorder, and `tests/metrics.rs` for the one place this crate's test
+/// suite actually installs a recorder and asserts on `/metrics` content.
 pub async fn start(settings: Settings, metrics: PrometheusHandle) -> anyhow::Result<Running> {
     // --- Everything fallible happens first, before a single task is
     // spawned. A bind failing because the port is already taken is the
@@ -258,16 +264,73 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|&v| v).await;
 }
 
+/// Await `handle` for up to `bound`, aborting it — rather than leaving it
+/// detached and still running — if it doesn't finish in time. `&mut handle`
+/// (not `handle`) in the `select!` below is what makes this safe: it polls
+/// the task without consuming the `JoinHandle`, so the `None` arm still has
+/// it available to call `.abort()` on.
+async fn await_or_abort(
+    mut handle: JoinHandle<()>,
+    bound: Duration,
+    name: &str,
+) -> anyhow::Result<()> {
+    let joined = tokio::select! {
+        r = &mut handle => Some(r),
+        _ = tokio::time::sleep(bound) => None,
+    };
+    match joined {
+        Some(r) => r.with_context(|| format!("{name} task panicked")),
+        None => {
+            handle.abort();
+            Err(anyhow::anyhow!(
+                "{name} task did not shut down within {bound:?}"
+            ))
+        }
+    }
+}
+
+/// Same as [`await_or_abort`], for `proxy_task` specifically: its join
+/// result is itself an `anyhow::Result<()>` (from `ferryman::serve`) that
+/// must be propagated, not just a panic to report.
+async fn await_or_abort_fallible(
+    mut handle: JoinHandle<anyhow::Result<()>>,
+    bound: Duration,
+    name: &str,
+) -> anyhow::Result<()> {
+    let joined = tokio::select! {
+        r = &mut handle => Some(r),
+        _ = tokio::time::sleep(bound) => None,
+    };
+    match joined {
+        Some(Ok(inner)) => inner,
+        Some(Err(join_err)) => Err(join_err).with_context(|| format!("{name} task panicked")),
+        None => {
+            handle.abort();
+            Err(anyhow::anyhow!(
+                "{name} task did not shut down within {bound:?}"
+            ))
+        }
+    }
+}
+
 impl Running {
     /// Stop accepting new connections/requests and wait for every
     /// background task `start` spawned to finish, up to a generous bound.
-    /// Idempotent to call (`shutdown_tx.send` on an instance with no live
-    /// receivers is a harmless no-op), but only meant to be called once —
-    /// it consumes `self`.
+    /// Only meant to be called once — it consumes `self`.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         // Flip the flag once; every clone of `shutdown_rx` wakes on its next
         // poll of `wait_for`.
         let _ = self.shutdown_tx.send(true);
+
+        // `health_loop` has no shutdown signal wired in (see the comment on
+        // `health_task` in `start`) and holds no state that needs an
+        // orderly cleanup — each probe is an independent, fire-and-forget
+        // `reqwest` call — so this is the only way to stop it. Done first
+        // and unconditionally, before any of the awaits below (which can
+        // themselves time out or return an error): every path out of this
+        // function — success, a task error, or a timeout — leaves it
+        // stopped, never still running in the background.
+        self.health_task.abort();
 
         // `ferryman::serve` stops accepting immediately but then drains
         // in-flight connections for up to its own internal 25s timeout
@@ -278,35 +341,25 @@ impl Running {
         // there's nothing in flight, so it returns almost immediately.
         const SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
 
-        let proxy_result = tokio::time::timeout(SHUTDOWN_BOUND, self.proxy_task)
-            .await
-            .context("proxy task did not shut down in time")?
-            .context("proxy task panicked")?;
-        proxy_result?;
-
-        tokio::time::timeout(SHUTDOWN_BOUND, self.admin_task)
-            .await
-            .context("admin task did not shut down in time")?
-            .context("admin task panicked")?;
-
+        // Await every remaining task, aborting (rather than leaving it
+        // detached) whichever one doesn't finish within `SHUTDOWN_BOUND` —
+        // and keep awaiting the others even if an earlier one already
+        // errored, so a slow/failed proxy shutdown still results in the
+        // admin and upkeep tasks being stopped instead of leaked. The `?`s
+        // below then return the *first* error, once every task has been
+        // dealt with.
+        let proxy_result = await_or_abort_fallible(self.proxy_task, SHUTDOWN_BOUND, "proxy").await;
+        let admin_result = await_or_abort(self.admin_task, SHUTDOWN_BOUND, "admin").await;
         // The upkeep loop watches the same shutdown signal and exits
         // cooperatively (see `start`); by now it should already be done or
         // a single `select!` poll away from it, but await it properly
         // rather than leaving it to finish on its own after `shutdown` has
         // already returned.
-        tokio::time::timeout(SHUTDOWN_BOUND, self.upkeep_task)
-            .await
-            .context("upkeep task did not shut down in time")?
-            .context("upkeep task panicked")?;
+        let upkeep_result = await_or_abort(self.upkeep_task, SHUTDOWN_BOUND, "upkeep").await;
 
-        // `health_loop` has no shutdown signal wired in (see the comment on
-        // `health_task` in `start`) and holds no state that needs an
-        // orderly cleanup — each probe is an independent, fire-and-forget
-        // `reqwest` call — so aborting it here, after the proxy has
-        // finished draining, is correct: no request or probe result is
-        // lost, it just stops being scheduled.
-        self.health_task.abort();
-
+        proxy_result?;
+        admin_result?;
+        upkeep_result?;
         Ok(())
     }
 }

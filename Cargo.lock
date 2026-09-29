@@ -406,6 +406,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferryman-embedded-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "clap",
+ "ferryman",
+ "ferryman-core",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "notify",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

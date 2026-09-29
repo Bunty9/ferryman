@@ -1,0 +1,20 @@
+# Example routing config for the embedded-library example.
+#
+# Run two upstream stubs first, then point this at them:
+#   cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8001
+#   cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8002
+# ...then:
+#   cargo run -p ferryman-embedded-example -- --config examples/embedded/config.toml
+
+health_interval_secs = 5
+default_cooldown_secs = 30
+failure_threshold = 3
+upstream_timeout_secs = 30
+
+[[routes]]
+prefix = "/svc-a"
+upstream = "http://127.0.0.1:8001"
+
+[[routes]]
+prefix = "/svc-b"
+upstream = "http://127.0.0.1:8002"

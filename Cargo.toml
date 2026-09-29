@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/server",
+    "examples/embedded",
     "examples/full-stack/demo-upstream",
 ]
 

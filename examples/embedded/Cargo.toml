@@ -1,0 +1,38 @@
+[package]
+name = "ferryman-embedded-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# No explicit [lib]/[[bin]] tables: Cargo's defaults already give the names
+# this example documents — a lib target named `ferryman_embedded_example`
+# (hyphens become underscores) from src/lib.rs, and a bin target named
+# `ferryman-embedded-example` from src/main.rs.
+
+[dependencies]
+# Both `path` (so this workspace always builds against the crate as it sits
+# in this checkout) and `version` (so a copy of this manifest — with the
+# `path` keys deleted, see README.md — still resolves against the published
+# crates on crates.io). Written explicitly here, not via `workspace = true`,
+# so a reader can copy these two lines verbatim into their own project.
+ferryman = { path = "../../crates/server", version = "0.1" }
+ferryman-core = { path = "../../crates/core", version = "0.1" }
+
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+arc-swap = { workspace = true }
+notify = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+metrics-util = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }

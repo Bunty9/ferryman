@@ -215,7 +215,7 @@ ferryman/
   fly.toml                   # Fly.io 2-region (sin + iad)
   deny.toml                  # cargo-deny config
   rust-toolchain.toml        # stable channel
-  .github/workflows/ci.yml   # nextest + clippy + fmt + deny + bench + wrk2
+  .github/workflows/ci.yml   # nextest + clippy + fmt + deny + bench + wrk2 + examples
   docs/
     architecture.md          # internals: request path, breaker, reload
     specs/2026-05-28-ferryman-design.md

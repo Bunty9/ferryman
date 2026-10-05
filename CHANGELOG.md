@@ -7,6 +7,22 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Security
+
+- Forwarded-header spoofing: a client could send `X-Real-IP`, `Forwarded`,
+  `X-Forwarded-Host` (and `X-Forwarded-Proto` where it was not overwritten)
+  and have them reach the upstream unchanged; e.g. Vaultwarden trusts
+  `X-Real-IP` by default. Now, for every peer not in `trusted_proxies` (all
+  peers when the list is empty, the default), `X-Real-IP` is overwritten with
+  the peer IP and `Forwarded` / `X-Forwarded-Host` are stripped;
+  `X-Forwarded-Proto` is still set from the connection and `X-Forwarded-For`
+  still appended. Peers in `trusted_proxies` keep their incoming values (see
+  README "Forwarded headers").
+  **Migration:** if ferryman runs behind nginx or a load balancer that sets
+  these headers, add its address range to `trusted_proxies`, otherwise they
+  are replaced or stripped. Vaultwarden users on 0.2.2: set
+  `IP_HEADER=X-Forwarded-For`; from this release `X-Real-IP` is trustworthy.
+
 ### Added
 
 - `keepalive_timeout_secs` is now applied: it is the HTTP/1 keep-alive idle

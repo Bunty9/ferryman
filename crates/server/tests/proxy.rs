@@ -239,6 +239,64 @@ async fn strips_hop_by_hop_headers_and_sets_forwarded_headers() {
     assert!(body.contains("x-forwarded-for: 127.0.0.1"), "{body}");
 }
 
+/// Send forged forwarding headers through a proxy with the given extra
+/// config and return the echoed upstream view.
+async fn forged_headers_echo(extra_cfg: &str) -> String {
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "{extra_cfg}\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    reqwest::Client::new()
+        .get(format!("http://{proxy}/svc-a/x"))
+        .header("x-real-ip", "6.6.6.6")
+        .header("forwarded", "for=6.6.6.6;proto=https")
+        .header("x-forwarded-host", "evil.example")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-for", "6.6.6.6")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn untrusted_peer_cannot_forge_forwarded_headers() {
+    // Empty list and a list that does not contain the peer behave the same.
+    for cfg in ["", "trusted_proxies = [\"10.0.0.0/8\"]"] {
+        let body = forged_headers_echo(cfg).await;
+        assert!(body.contains("x-real-ip: 127.0.0.1"), "{body}");
+        assert!(!body.contains("6.6.6.6;"), "{body}");
+        assert!(!body.contains("forwarded:"), "{body}");
+        assert!(!body.contains("x-forwarded-host"), "{body}");
+        assert!(!body.contains("evil.example"), "{body}");
+        assert!(body.contains("x-forwarded-proto: http\n"), "{body}");
+        // 0.2.2 behaviour: XFF is appended to, not replaced.
+        assert!(
+            body.contains("x-forwarded-for: 6.6.6.6, 127.0.0.1"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn trusted_peer_forwarded_headers_are_preserved() {
+    let body = forged_headers_echo("trusted_proxies = [\"127.0.0.1/32\"]").await;
+    assert!(body.contains("x-forwarded-proto: https\n"), "{body}");
+    assert!(body.contains("x-forwarded-host: evil.example"), "{body}");
+    assert!(body.contains("x-real-ip: 6.6.6.6"), "{body}");
+    assert!(
+        body.contains("forwarded: for=6.6.6.6;proto=https"),
+        "{body}"
+    );
+    assert!(
+        body.contains("x-forwarded-for: 6.6.6.6, 127.0.0.1"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn dead_upstream_502s_until_breaker_opens() {
     let addr = spawn_toggle_stub(Arc::new(AtomicBool::new(true))).await;

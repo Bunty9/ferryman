@@ -10,7 +10,6 @@ pub mod reload;
 pub mod tls;
 
 use ferryman_core::SharedTable;
-use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -26,8 +25,8 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 /// Shared hyper client used to forward requests to upstreams. Bodies are
-/// streamed straight through (`Incoming` in, `Incoming` out), no buffering.
-pub type ProxyClient = Client<HttpConnector, Incoming>;
+/// streamed straight through (`RequestBody` wraps the inbound `Incoming`), no buffering.
+pub type ProxyClient = Client<HttpConnector, proxy::RequestBody>;
 
 /// Latency buckets (seconds) for `ferryman_request_duration_seconds`,
 /// spanning sub-millisecond proxy hops up to `upstream_timeout_secs`'s

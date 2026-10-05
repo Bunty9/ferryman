@@ -42,8 +42,11 @@ accept ── set TCP_NODELAY
             strip hop-by-hop, join h2 cookies, Host from authority,
             URI = upstream scheme+authority + original path+query,
             version = HTTP/1.1, x-forwarded-for / -proto
-       6. client.request() under upstream_timeout (to response headers)
-            timeout          -> 504 (breaker failure only if bodyless)
+       6. client.request(); body wrapped in RequestBody (idle timeout
+          between frames, signals EOS). upstream_timeout (to response
+          headers) starts at body EOS, or immediately if bodyless
+            timeout          -> 504 + breaker failure
+            upload stalled   -> 408 (no breaker effect)
             client body err  -> 400 (no breaker effect)
             transport err    -> 502 + breaker failure
             502/503/504      -> passed through + breaker failure

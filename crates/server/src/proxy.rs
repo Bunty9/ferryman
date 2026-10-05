@@ -11,8 +11,13 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request, Response};
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+use tokio::time::Sleep;
 
 use crate::ProxyClient;
 
@@ -20,6 +25,96 @@ use crate::ProxyClient;
 /// generated ones (404/502/503/504), so `handle`'s return type doesn't leak
 /// the streaming vs. buffered distinction to callers.
 pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+/// The client's request body, streamed to the upstream with two additions:
+/// it enforces `request_body_idle_timeout_secs` between frames (a stalled
+/// upload errors with [`BodyIdleTimeout`]), and it reports end-of-stream so
+/// `handle` can start the upstream timeout only once the whole body is sent.
+/// Never buffers.
+pub struct RequestBody {
+    inner: Incoming,
+    idle: Duration,
+    sleep: Pin<Box<Sleep>>,
+    eos: Option<oneshot::Sender<()>>,
+}
+
+/// The client stalled its upload for longer than `request_body_idle_timeout_secs`.
+#[derive(Debug)]
+pub struct BodyIdleTimeout;
+
+impl std::fmt::Display for BodyIdleTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body idle timeout")
+    }
+}
+impl std::error::Error for BodyIdleTimeout {}
+
+impl RequestBody {
+    fn new(inner: Incoming, idle: Duration) -> (Self, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let mut b = Self {
+            inner,
+            idle,
+            sleep: Box::pin(tokio::time::sleep(idle)),
+            eos: Some(tx),
+        };
+        b.signal_if_done();
+        (b, rx)
+    }
+
+    fn signal_if_done(&mut self) {
+        if self.inner.is_end_stream() {
+            if let Some(tx) = self.eos.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+impl Body for RequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                this.sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle);
+                // The last frame of a content-length body may not be followed
+                // by another poll, so check here as well as on `None`.
+                this.signal_if_done();
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => {
+                if let Some(tx) = this.eos.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                if this.sleep.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(Some(Err(BodyIdleTimeout.into())))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 /// Headers that are meaningful only for one hop and must never be forwarded,
 /// per RFC 7230 §6.1 (plus `keep-alive`, which predates the RFC but is
@@ -86,9 +181,9 @@ pub async fn handle(
     };
 
     let (mut parts, body) = req.into_parts();
-    // Only a request with no body to stream can blame a timeout on the
-    // upstream; with a body, a slow client looks exactly like a slow server.
-    let bodyless = body.is_end_stream();
+    // `upstream_timeout` starts at end-of-request-body (immediately when
+    // bodyless), so a slow upload can't be mistaken for a slow upstream.
+    let (body, body_done) = RequestBody::new(body, table.request_body_idle_timeout());
     strip_hop_by_hop(&mut parts.headers);
     if parts.version == http::Version::HTTP_2 {
         join_cookies(&mut parts.headers);
@@ -131,18 +226,40 @@ pub async fn handle(
 
     let fwd = Request::from_parts(parts, body);
 
-    match tokio::time::timeout(table.upstream_timeout, client.request(fwd)).await {
-        Err(_elapsed) => {
-            if bodyless {
-                upstream.record_failure(admission);
-            }
+    let upstream_timeout = table.upstream_timeout;
+    let timer = async move {
+        // Sender dropped without EOS (body failed): the request future
+        // reports that; never time out the upstream for it.
+        if body_done.await.is_ok() {
+            tokio::time::sleep(upstream_timeout).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let result = tokio::select! {
+        r = client.request(fwd) => Some(r),
+        () = timer => None,
+    };
+    match result {
+        None => {
+            // The body is fully sent, so this is the upstream's fault.
+            upstream.record_failure(admission);
             record(started, &route_label, &upstream.name, 504);
             Ok(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream timeout",
             ))
         }
-        Ok(Err(e)) if is_client_body_error(&e) => {
+        Some(Err(e)) if is_body_idle_timeout(&e) => {
+            // The client stalled its upload: 408, no breaker effect.
+            tracing::debug!("client request body idle timeout");
+            record(started, &route_label, &upstream.name, 408);
+            Ok(error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "request body timeout",
+            ))
+        }
+        Some(Err(e)) if is_client_body_error(&e) => {
             // The client's request body failed (e.g. it hung up mid-upload).
             // Not the upstream's fault, so the breaker stays out of it.
             tracing::debug!(error = %e, "client request body failed");
@@ -152,13 +269,13 @@ pub async fn handle(
                 "request body error",
             ))
         }
-        Ok(Err(e)) => {
+        Some(Err(e)) => {
             upstream.record_failure(admission);
             tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
             record(started, &route_label, &upstream.name, 502);
             Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
         }
-        Ok(Ok(resp)) => {
+        Some(Ok(resp)) => {
             let status = resp.status();
             // Health is judged on the response head; the body is streamed
             // afterwards with no timeout of its own.
@@ -193,6 +310,18 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     for name in &HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
+}
+
+/// Did `client.request` fail because the client stalled its upload?
+fn is_body_idle_timeout(e: &hyper_util::client::legacy::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if err.is::<BodyIdleTimeout>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Did `client.request` fail because reading the *client's* body failed?

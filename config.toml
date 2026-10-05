@@ -28,7 +28,8 @@ default_cooldown_secs = 30
 
 # Longest gap between request-body frames before a stalled upload is given
 # up on, in seconds (1..=86400). Default 30.
-# (Parsed and validated; not yet applied by the server.)
+# A stalled upload gets 408 and never counts against the breaker.
+# upstream_timeout_secs only starts once the request body is fully sent.
 # request_body_idle_timeout_secs = 30
 
 # Peers (CIDR ranges or bare IPs, IPv4 and IPv6) whose forwarding headers

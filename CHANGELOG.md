@@ -7,6 +7,18 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Fixed
+
+- Long uploads no longer fail with 504: `upstream_timeout_secs` used to cover
+  the whole request including streaming the client's body. It now starts when
+  the request body is complete (immediately for bodyless requests).
+  `request_body_idle_timeout_secs` is now applied: a client that stalls its
+  upload longer than that gets 408, with no breaker effect.
+  **Behaviour change:** an upstream timeout after the body completed now
+  counts as a breaker failure for requests with bodies too (previously only
+  bodyless requests counted).
+  `ferryman::ProxyClient` is now `Client<HttpConnector, proxy::RequestBody>`.
+
 ### Security
 
 - Forwarded-header spoofing: a client could send `X-Real-IP`, `Forwarded`,

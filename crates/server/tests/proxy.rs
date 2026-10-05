@@ -403,6 +403,98 @@ async fn client_abort_mid_body_does_not_trip_breaker() {
     assert_eq!(resp.status(), 200, "breaker must not open on client aborts");
 }
 
+async fn read_status_line(s: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut chunk))
+            .await
+            .expect("proxy answered in time")
+            .unwrap();
+        buf.extend_from_slice(&chunk[..n]);
+        if n == 0 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn slow_upload_is_not_an_upstream_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "upstream_timeout_secs = 2\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 20\r\nconnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        s.write_all(b"abcd").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    }
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(resp.ends_with(&"abcd".repeat(5)), "{resp}");
+}
+
+#[tokio::test]
+async fn stalled_upload_is_408_and_does_not_trip_breaker() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "request_body_idle_timeout_secs = 1\nfailure_threshold = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\nonly-a-bit")
+        .await
+        .unwrap();
+    let status = read_status_line(&mut s).await;
+    assert!(status.starts_with("HTTP/1.1 408"), "{status}");
+
+    let resp = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
+}
+
+#[tokio::test]
+async fn slow_upstream_after_body_is_504_and_counts_against_breaker() {
+    let upstream = spawn_stub(|req| async move {
+        let _ = req.into_body().collect().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        ok("too-slow")
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "upstream_timeout_secs = 1\nfailure_threshold = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let client = reqwest::Client::new();
+    let post = || {
+        client
+            .post(format!("http://{proxy}/svc-a"))
+            .body("payload")
+            .send()
+    };
+
+    assert_eq!(post().await.unwrap().status(), 504);
+    assert_eq!(post().await.unwrap().status(), 503);
+}
+
 #[tokio::test]
 async fn http2_client_is_forwarded_as_http1_with_host_and_joined_cookies() {
     let upstream = spawn_stub(echo).await;

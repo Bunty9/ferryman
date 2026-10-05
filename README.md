@@ -208,8 +208,9 @@ hot reload.
 | Circuit open                                           | 503      | —                      |
 | `Upgrade` / `CONNECT` (e.g. WebSocket)                 | 501      | —                      |
 | Connect / transport error                              | 502      | yes                    |
-| No response headers within `upstream_timeout_secs`     | 504      | only for bodyless requests |
+| No response headers within `upstream_timeout_secs` of the request body completing (of the request start if bodyless) | 504 | yes |
 | Client's request body fails mid-upload                 | 400      | no                     |
+| Client stalls its upload for `request_body_idle_timeout_secs` | 408 | no                |
 | Upstream answers 502/503/504                           | passed through | yes              |
 | Anything else from upstream                            | passed through | success          |
 

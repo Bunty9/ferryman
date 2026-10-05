@@ -20,7 +20,8 @@ kill_timeout = "30s"
   RUST_LOG = "info"
   FERRYMAN_CONFIG = "/app/config.toml"
   FERRYMAN_BIND = "0.0.0.0:8080"
-  FERRYMAN_METRICS_BIND = "0.0.0.0:9090"
+  # Dual-stack: Fly's private network (where metrics are scraped) is IPv6.
+  FERRYMAN_METRICS_BIND = "[::]:9090"
 
 [http_service]
   internal_port = 8080

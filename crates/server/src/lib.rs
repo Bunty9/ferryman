@@ -40,7 +40,8 @@ pub type StreamingClient = Client<HttpConnector, proxy::RequestBody>;
 /// Latency buckets (seconds) for `ferryman_request_duration_seconds`,
 /// spanning sub-millisecond proxy hops up to `upstream_timeout_secs`'s
 /// default of 30s, so the slowest (about-to-time-out) requests still land
-/// in a real bucket instead of falling into `+Inf`.
+/// in a real bucket instead of falling into `+Inf`. The duration is measured
+/// from request start to response headers, so it includes the request upload.
 pub const LATENCY_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];

@@ -14,6 +14,8 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -31,21 +33,39 @@ use hyper_util::client::legacy::Client;
 pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 
 /// The client's request body, streamed to the upstream with two additions:
-/// it enforces `request_body_idle_timeout_secs` between frames (a stalled
-/// upload errors with [`BodyIdleTimeout`]), and it reports end-of-stream so
-/// `handle` can start the upstream timeout only once the whole body is sent.
-/// Never buffers.
+/// it enforces `request_body_idle_timeout_secs` between frames and
+/// `request_body_timeout_secs` overall (an over-slow upload errors, which
+/// `handle` turns into 408), and it reports end-of-stream so `handle` can
+/// start the upstream timeout only once the whole body is sent. Never buffers.
 pub struct RequestBody {
     inner: Incoming,
     idle: Duration,
-    sleep: Pin<Box<Sleep>>,
-    total: Pin<Box<Sleep>>,
+    deadline: tokio::time::Instant,
+    // Armed only while waiting on the client, so a slow upstream connect or
+    // an upstream that is not reading is never blamed on the client.
+    idle_sleep: Option<Pin<Box<Sleep>>>,
+    total_sleep: Option<Pin<Box<Sleep>>>,
     eos: Option<oneshot::Sender<()>>,
+    state: Arc<BodyState>,
+}
+
+/// What `handle`'s timer can see of the body: whether hyper polled it, and
+/// whether the last poll was left waiting on the client (as opposed to hyper
+/// having stopped reading, e.g. an upstream whose receive buffer is full).
+#[derive(Default)]
+struct BodyState {
+    polled: AtomicBool,
+    waiting_on_client: AtomicBool,
+}
+
+struct Eos {
+    rx: oneshot::Receiver<()>,
+    state: Arc<BodyState>,
 }
 
 /// The client stalled its upload for longer than `request_body_idle_timeout_secs`.
 #[derive(Debug)]
-pub struct BodyIdleTimeout;
+pub(crate) struct BodyIdleTimeout;
 
 impl std::fmt::Display for BodyIdleTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,7 +76,7 @@ impl std::error::Error for BodyIdleTimeout {}
 
 /// The client took longer than `request_body_timeout_secs` to send its body.
 #[derive(Debug)]
-pub struct BodyTotalTimeout;
+pub(crate) struct BodyTotalTimeout;
 
 impl std::fmt::Display for BodyTotalTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -66,17 +86,20 @@ impl std::fmt::Display for BodyTotalTimeout {
 impl std::error::Error for BodyTotalTimeout {}
 
 impl RequestBody {
-    fn new(inner: Incoming, idle: Duration, total: Duration) -> (Self, oneshot::Receiver<()>) {
+    fn new(inner: Incoming, idle: Duration, total: Duration) -> (Self, Eos) {
         let (tx, rx) = oneshot::channel();
+        let state = Arc::new(BodyState::default());
         let mut b = Self {
             inner,
             idle,
-            sleep: Box::pin(tokio::time::sleep(idle)),
-            total: Box::pin(tokio::time::sleep(total)),
+            deadline: tokio::time::Instant::now() + total,
+            idle_sleep: None,
+            total_sleep: None,
             eos: Some(tx),
+            state: state.clone(),
         };
         b.signal_if_done();
-        (b, rx)
+        (b, Eos { rx, state })
     }
 
     fn signal_if_done(&mut self) {
@@ -97,34 +120,47 @@ impl Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
-        // Polled on every call (not just when Pending) so a trickling client
-        // can't keep resetting the idle timer past the total cap.
-        if this.total.as_mut().poll(cx).is_ready() {
+        this.state.polled.store(true, Ordering::Relaxed);
+        if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                this.sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + this.idle);
+                this.idle_sleep = None;
+                this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 // The last frame of a content-length body may not be followed
                 // by another poll, so check here as well as on `None`.
                 this.signal_if_done();
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(Some(Err(e))) => {
+                this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                Poll::Ready(Some(Err(e.into())))
+            }
             Poll::Ready(None) => {
+                this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 if let Some(tx) = this.eos.take() {
                     let _ = tx.send(());
                 }
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                if this.sleep.as_mut().poll(cx).is_ready() {
-                    Poll::Ready(Some(Err(BodyIdleTimeout.into())))
-                } else {
-                    Poll::Pending
+                this.state.waiting_on_client.store(true, Ordering::Relaxed);
+                let idle = this.idle;
+                let idle_sleep = this
+                    .idle_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                if idle_sleep.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Some(Err(BodyIdleTimeout.into())));
                 }
+                let deadline = this.deadline;
+                let total_sleep = this
+                    .total_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+                if total_sleep.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
+                }
+                Poll::Pending
             }
         }
     }
@@ -169,8 +205,8 @@ pub async fn handle_streaming(
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let wrap = |body, idle, total| {
-        let (b, rx) = RequestBody::new(body, idle, total);
-        (b, Some(rx))
+        let (b, eos) = RequestBody::new(body, idle, total);
+        (b, Some(eos))
     };
     handle_inner(table, client, peer, proto, req, wrap).await
 }
@@ -202,7 +238,7 @@ async fn handle_inner<B>(
     peer: SocketAddr,
     proto: &'static str,
     req: Request<Incoming>,
-    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<oneshot::Receiver<()>>),
+    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
 ) -> Result<Response<ResponseBody>, Infallible>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -298,18 +334,45 @@ where
     let fwd = Request::from_parts(parts, body);
 
     let upstream_timeout = table.upstream_timeout;
+    let body_timeout = table.request_body_timeout();
+    // Completes when the request must be failed as an upstream timeout (504).
     let timer = async move {
-        // Sender dropped without EOS (body failed): the request future
-        // reports that; never time out the upstream for it.
-        let started_ok = match body_done {
-            Some(rx) => rx.await.is_ok(),
-            None => true,
+        let Some(Eos { mut rx, state }) = body_done else {
+            // Legacy: the whole request, body included, is under one timeout.
+            return tokio::time::sleep(upstream_timeout).await;
         };
-        if started_ok {
-            tokio::time::sleep(upstream_timeout).await;
-        } else {
-            std::future::pending::<()>().await;
+        let mut total = Box::pin(tokio::time::sleep(body_timeout));
+        let mut total_armed = true;
+        loop {
+            tokio::select! {
+                r = &mut rx => {
+                    // Sender dropped without EOS (body failed): the request
+                    // future reports that; never time out the upstream for it.
+                    if r.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    break;
+                }
+                // hyper stopped reading the body (upstream not draining it)
+                // for a whole window while not waiting on the client: that is
+                // the upstream's doing. A client that is merely slow is left
+                // to the body's own idle/total deadlines (408).
+                () = tokio::time::sleep(upstream_timeout) => {
+                    if !state.polled.swap(false, Ordering::Relaxed)
+                        && !state.waiting_on_client.load(Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                }
+                () = &mut total, if total_armed => {
+                    if !state.waiting_on_client.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    total_armed = false;
+                }
+            }
         }
+        tokio::time::sleep(upstream_timeout).await;
     };
     let result = tokio::select! {
         r = client.request(fwd) => Some(r),

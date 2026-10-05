@@ -54,9 +54,13 @@ accept ── set TCP_NODELAY
        7. strip hop-by-hop from the response, stream the body back
 ```
 
-Bodies are never buffered: the inbound `Incoming` is handed to the hyper
-client and the upstream's `Incoming` is returned boxed. Metrics are
-recorded at step 6, measuring time to response headers.
+Bodies are never buffered: the inbound `Incoming` is wrapped in `RequestBody` (idle and total
+deadlines, end-of-body signal) and handed to the hyper
+client, and the upstream's `Incoming` is returned boxed. Metrics are
+recorded at step 6, measuring time from request start (so including the upload) to response
+headers. If hyper stops reading the body for a whole `upstream_timeout` window
+while not waiting on the client (upstream not draining it), the request is a 504
+and a breaker failure.
 
 ## Routing
 

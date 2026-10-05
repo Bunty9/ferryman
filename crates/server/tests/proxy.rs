@@ -509,6 +509,75 @@ async fn trickled_upload_hits_total_cap_with_408() {
 }
 
 #[tokio::test]
+async fn chunked_upload_to_slow_upstream_is_504() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = spawn_stub(|req| async move {
+        let _ = req.into_body().collect().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        ok("too-slow")
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "upstream_timeout_secs = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /svc-a HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let st = read_status_line(&mut s).await;
+    assert!(st.starts_with("HTTP/1.1 504"), "{st}");
+}
+
+#[tokio::test]
+async fn upstream_that_stops_reading_upload_is_504_and_counts_against_breaker() {
+    use tokio::io::AsyncWriteExt;
+
+    // Accepts and never reads: the proxy's write buffer fills and hyper stops
+    // polling the request body.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let table = shared_table(parse_cfg(&format!(
+        "upstream_timeout_secs = 1\nrequest_body_idle_timeout_secs = 1\nfailure_threshold = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let (mut r, mut w) = s.into_split();
+    tokio::spawn(async move {
+        let _ = w
+            .write_all(b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 33554432\r\n\r\n")
+            .await;
+        let chunk = vec![0u8; 64 * 1024];
+        for _ in 0..512 {
+            if w.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+    });
+    let start = std::time::Instant::now();
+    let st = read_status_line(&mut r).await;
+    assert!(st.starts_with("HTTP/1.1 504"), "{st}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
+    );
+
+    let resp = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
+    assert_eq!(resp.status(), 503, "breaker must count the stuck upload");
+}
+
+#[tokio::test]
 async fn slow_upstream_after_body_is_504_and_counts_against_breaker() {
     let upstream = spawn_stub(|req| async move {
         let _ = req.into_body().collect().await;

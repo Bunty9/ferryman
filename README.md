@@ -263,7 +263,7 @@ Surface:
 | Metric                              | Labels                                          | Description                                                  |
 | ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ |
 | `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404) | Counter of inbound requests.                                 |
-| `ferryman_request_duration_seconds` | `route`, `upstream`                             | Histogram (buckets `le`), time to upstream response headers. |
+| `ferryman_request_duration_seconds` | `route`, `upstream`                             | Histogram (buckets `le`), time from request start (includes the upload) to upstream response headers. |
 | `ferryman_upstream_alive`           | `upstream`                                      | Gauge: 1 = circuit closed, 0 otherwise.                      |
 | `ferryman_circuit_state`            | `upstream`                                      | Gauge: 0 closed / 1 open / 2 half-open.                      |
 

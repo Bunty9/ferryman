@@ -511,14 +511,21 @@ fn apply_forwarded_headers(
     let xfp = HeaderName::from_static("x-forwarded-proto");
     let peer_trusted = trusted.contains(peer);
     if peer_trusted {
-        let first = headers
-            .get(&xfp)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
+        // Rightmost non-empty value across all lines (the hop closest to us
+        // wrote it); anything that isn't a scheme token falls back to the
+        // connection's proto.
+        let scheme = headers
+            .get_all(&xfp)
+            .iter()
+            .flat_map(|v| v.to_str().unwrap_or("!").split(','))
             .map(str::trim)
-            .filter(|v| !v.is_empty())
+            .rfind(|v| !v.is_empty())
+            .filter(|v| {
+                v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+            })
             .and_then(|v| HeaderValue::from_str(v).ok());
-        headers.insert(&xfp, first.unwrap_or(HeaderValue::from_static(proto)));
+        headers.insert(&xfp, scheme.unwrap_or(HeaderValue::from_static(proto)));
         // Always derived, never taken from the client: cloud LBs pass a
         // client's X-Real-IP through untouched.
         // A header line that isn't visible ASCII counts as one garbage entry.
@@ -698,14 +705,27 @@ mod tests {
     }
 
     #[test]
-    fn trusted_xfp_takes_first_value() {
-        let m = run(
-            &["10.0.0.0/8"],
-            "10.1.2.3",
-            "http",
-            &[("x-forwarded-proto", "https, http")],
-        );
+    fn trusted_xfp_takes_rightmost_value() {
+        let t = ["10.0.0.0/8"];
+        let x = |h: &[(&str, &str)]| run(&t, "10.1.2.3", "http", h);
+        let m = x(&[("x-forwarded-proto", "https, http")]);
+        assert_eq!(get(&m, "x-forwarded-proto"), Some("http"));
+        let m = x(&[
+            ("x-forwarded-proto", "http"),
+            ("x-forwarded-proto", "https"),
+        ]);
         assert_eq!(get(&m, "x-forwarded-proto"), Some("https"));
+        let m = x(&[
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-proto", "http"),
+        ]);
+        assert_eq!(get(&m, "x-forwarded-proto"), Some("http"));
+        let m = x(&[("x-forwarded-proto", "http, https, ")]);
+        assert_eq!(get(&m, "x-forwarded-proto"), Some("https"));
+        for bad in ["", " , ", "ht tp", "https, ja:va", "https, <x>"] {
+            let m = run(&t, "10.1.2.3", "https", &[("x-forwarded-proto", bad)]);
+            assert_eq!(get(&m, "x-forwarded-proto"), Some("https"), "{bad:?}");
+        }
     }
 
     #[test]

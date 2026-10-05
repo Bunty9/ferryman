@@ -232,7 +232,7 @@ What the upstream sees depends on whether the connecting peer is in
 
 | Header              | Untrusted peer                       | Trusted peer                                                                                   |
 | ------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `X-Forwarded-Proto` | set from the connection              | incoming (first value) kept; set from the connection if absent                                 |
+| `X-Forwarded-Proto` | set from the connection              | incoming kept (rightmost value); set from the connection if absent                                 |
 | `X-Forwarded-For`   | peer IP appended                     | peer IP appended                                                                               |
 | `X-Real-IP`         | overwritten with the peer IP         | always overwritten: the rightmost `X-Forwarded-For` entry that is not a trusted proxy (`ip:port` / `[v6]:port` tolerated; an unparsable entry stops the walk), else the peer |
 | `Forwarded`         | stripped                             | kept                                                                                           |

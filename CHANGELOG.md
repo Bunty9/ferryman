@@ -49,8 +49,8 @@ and `ferryman` are released together with the same version.
   the peer IP and `Forwarded` / `X-Forwarded-Host` are stripped;
   `X-Forwarded-Proto` is still set from the connection and `X-Forwarded-For`
   still appended. Peers in `trusted_proxies` keep their incoming
-  `X-Forwarded-Proto`, `X-Forwarded-Host` and `Forwarded`, but `X-Real-IP` is
-  always derived (rightmost `X-Forwarded-For` entry that is not a trusted
+  `X-Forwarded-Proto` (rightmost value), `X-Forwarded-Host` and
+  `Forwarded`, but `X-Real-IP` is always derived (rightmost `X-Forwarded-For` entry that is not a trusted
   proxy, else the peer) because cloud LBs pass a client's `X-Real-IP`
   through (see README "Forwarded headers").
   **Migration:** if ferryman runs behind nginx or a load balancer that sets

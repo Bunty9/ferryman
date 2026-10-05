@@ -9,10 +9,27 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- New optional config keys `keepalive_timeout_secs` (default 10),
+  `request_body_idle_timeout_secs` (default 30) and `trusted_proxies`
+  (default empty), validated at load and exposed on `RouteTable`
+  (`keepalive_timeout()`, `request_body_idle_timeout()`, `trusted_proxies()`,
+  `with_*` builders) plus the `TrustedProxies` CIDR type. Defaults keep
+  today's behaviour.
+
 - Release archives carry GitHub build provenance attestations
   (`gh attestation verify <archive> --repo Bunty9/ferryman`); tier-1
   binaries are built with `cargo auditable`.
 - `SECURITY.md` (private vulnerability reporting).
+
+### Fixed
+
+- An upstream with an empty host (`http://:80`) is now rejected at load
+  instead of producing a permanently failing route. Migration: fix the
+  `upstream` value.
+- Duration keys (`health_interval_secs`, `upstream_timeout_secs`,
+  `default_cooldown_secs`, per-route `cooldown_secs`) are bounded to
+  <= 86400; a huge `health_interval_secs` used to panic at boot. Migration:
+  lower any value above one day.
 
 ### Changed
 

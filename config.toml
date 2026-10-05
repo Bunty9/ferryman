@@ -18,6 +18,24 @@ default_cooldown_secs = 30
 # Timeout for a forwarded request to an upstream, in seconds.
 # upstream_timeout_secs = 30
 
+# HTTP/1 keep-alive idle timeout, in seconds (1..=86400). Default 10.
+# Behind a load balancer set it above the LB's idle timeout: AWS ALB (60 s
+# default) -> 75; GCLB (fixed 600 s) -> 620; direct exposure -> keep 10.
+# The first request on a new connection stays bounded at 10 s regardless,
+# but a large value also widens the header-read window on reused connections.
+# (Parsed and validated; applied to connections in a later release step.)
+# keepalive_timeout_secs = 10
+
+# Longest gap between request-body frames before a stalled upload is given
+# up on, in seconds (1..=86400). Default 30.
+# request_body_idle_timeout_secs = 30
+
+# Peers (CIDR ranges or bare IPs, IPv4 and IPv6) whose forwarding headers
+# (X-Forwarded-Proto etc.) are believed. Default empty = trust nobody.
+# trusted_proxies = ["10.0.0.0/8", "fd00::/8"]
+
+# Every *_secs key above (and per-route cooldown_secs) must be <= 86400.
+
 [[routes]]
 prefix = "/svc-a"
 upstream = "http://localhost:8001"

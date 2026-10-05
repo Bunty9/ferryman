@@ -162,9 +162,15 @@ fail loudly instead of silently falling back to defaults.
 | `default_cooldown_secs`     | 30      | How long an open circuit refuses traffic before one probe.   |
 | `failure_threshold`         | 3       | Consecutive failures that open a closed circuit.             |
 | `upstream_timeout_secs`     | 30      | Time allowed for an upstream to send response headers.       |
+| `keepalive_timeout_secs`    | 10      | HTTP/1 keep-alive idle timeout, 1-86400 (ALB: 75, GCLB: 620). |
+| `request_body_idle_timeout_secs` | 30 | Longest gap between request-body frames, 1-86400.            |
+| `trusted_proxies`           | `[]`    | CIDRs/IPs (v4, v6) whose forwarding headers are trusted.     |
 | `[[routes]] prefix`         | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`).   |
 | `[[routes]] upstream`       | —       | `http://host:port` — no path, no query, no https.            |
 | `[[routes]] cooldown_secs`  | default | Per-route cooldown override.                                 |
+
+All `*_secs` values must be between 1 and 86400 (one day). An upstream
+with an empty host (`http://:80`) is rejected.
 
 Routes pointing at the same `host:port` share one circuit breaker. A hot
 reload keeps each surviving upstream's breaker, so an open circuit stays

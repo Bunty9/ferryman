@@ -12,7 +12,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -90,11 +89,38 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Resolves on SIGINT or SIGTERM, for graceful shutdown.
+#[cfg(unix)]
 async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
         _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
     }
+}
+
+/// Resolves on Ctrl-C, console close or system shutdown.
+#[cfg(windows)]
+async fn shutdown_signal() {
+    use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
+    let mut close = ctrl_close().expect("install CTRL_CLOSE handler");
+    let mut shutdown = ctrl_shutdown().expect("install CTRL_SHUTDOWN handler");
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => {
+            r.expect("install Ctrl-C handler");
+            tracing::info!("received Ctrl-C, shutting down");
+        }
+        _ = close.recv() => tracing::info!("received console close, shutting down"),
+        _ = shutdown.recv() => tracing::info!("received system shutdown, shutting down"),
+    }
+}
+
+/// Resolves on Ctrl-C (other non-unix platforms).
+#[cfg(not(any(unix, windows)))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("install Ctrl-C handler");
+    tracing::info!("received Ctrl-C, shutting down");
 }

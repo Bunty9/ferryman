@@ -83,7 +83,7 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 ## Step 4 — automate later releases
 
 `.github/workflows/release.yml` exists in the repo already. On a `v*` tag
-push it runs three jobs, each with only the permissions and checkout it
+push it runs four jobs, each with only the permissions and checkout it
 needs (see "why three jobs" below):
 
 1. **`verify`** (`permissions: contents: read`, checkout with
@@ -107,6 +107,31 @@ needs (see "why three jobs" below):
    `gh release create` (skipping if a release for the tag already
    exists). This job runs no `cargo` command and no dependency code, by
    design.
+
+4. **`binaries`** (needs `verify`; `contents: read`, no credentials;
+   runs in parallel with `publish`) — matrix that builds `ferryman` with
+   `--locked --release` and packages
+   `ferryman-v<version>-<target>.tar.gz` (`.zip` on Windows; top-level
+   dir with binary, README, CHANGELOG, licenses, `config.toml`) plus a
+   `.sha256`. Tier 1 (Linux musl x86_64/aarch64, macOS x86_64/aarch64,
+   Windows x86_64 MSVC) is required; tier 2 (ARM/i686/riscv64 musl via
+   `cross`, FreeBSD, Windows aarch64) is `continue-on-error` and may be
+   absent. `release` then needs `verify`, `publish` and `binaries`
+   (`if: always()`), fails if any tier-1 archive is missing, writes
+   `SHA256SUMS` and creates the release with every archive attached
+   (`--prerelease` for `-` tags; if the release exists, `gh release upload
+   --clobber`). Prerelease tags (`vX.Y.Z-rc.1`) must equal the workspace
+   version like any other.
+
+**Dry run.** Actions tab, *release*, *Run workflow* (`workflow_dispatch`)
+runs only the `binaries` matrix (verify/publish/release are skipped);
+download the `bin-*` artifacts to inspect the archives. Do this before
+the first tagged release that ships binaries, and after changing the
+matrix.
+
+`cargo binstall` finds the archives through
+`[package.metadata.binstall]` in `crates/server/Cargo.toml`; keep that
+URL template in step with the archive naming in `release.yml`.
 
 **Why three jobs, not one.** A single job would run `cargo test` and
 `cargo publish` — both of which execute arbitrary third-party code

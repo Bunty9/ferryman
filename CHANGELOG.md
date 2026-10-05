@@ -7,6 +7,25 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Added
+
+- Prebuilt binaries attached to GitHub releases (`.tar.gz`, `.zip` on
+  Windows) with a combined `SHA256SUMS` and per-archive `.sha256` files.
+  Required: Linux musl x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64
+  (MSVC). Best effort: ARM/i686/riscv64 musl, FreeBSD, Windows aarch64.
+- `cargo binstall ferryman` metadata (`[package.metadata.binstall]`).
+- Windows support: the binary shuts down gracefully on Ctrl-C, console
+  close and system shutdown (previously Unix-only signal handling).
+- `release.yml` accepts prerelease tags (`vX.Y.Z-rc.1`, marked as
+  prerelease) and a manual `workflow_dispatch` dry run of the binary
+  builds.
+- CI builds `ferryman` on Windows and macOS, and lints workflows with
+  zizmor.
+
+### Changed
+
+- GitHub Actions are pinned by commit SHA.
+
 ## [0.2.1] - 2026-09-29
 
 No API or behaviour changes to the `ferryman` binary or either library.

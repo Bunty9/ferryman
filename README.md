@@ -70,11 +70,40 @@ Routing rules: TOML, hot-reloaded via `notify` filesystem watch + arc-swap.
 Full pinned versions live in [`Cargo.toml`](./Cargo.toml). Default routing
 rules: [`config.toml`](./config.toml).
 
+## Install
+
+**Prebuilt binaries** are attached to every
+[GitHub release](https://github.com/Bunty9/ferryman/releases) as
+`ferryman-v<version>-<target>.tar.gz` (`.zip` on Windows), each holding
+the binary, README, CHANGELOG, both licenses and an example `config.toml`.
+Required targets: `x86_64`/`aarch64-unknown-linux-musl` (static),
+`x86_64`/`aarch64-apple-darwin`, `x86_64-pc-windows-msvc`. Best effort
+(may be missing from a release): `armv7`/`arm-unknown-linux-musleabihf`,
+`i686-unknown-linux-musl`, `riscv64gc-unknown-linux-musl`,
+`aarch64-pc-windows-msvc`, `x86_64-unknown-freebsd`.
+
+```bash
+v=0.2.1; t=x86_64-unknown-linux-musl
+base=https://github.com/Bunty9/ferryman/releases/download/v$v
+curl -fsSLO $base/ferryman-v$v-$t.tar.gz -O $base/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS      # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+tar xzf ferryman-v$v-$t.tar.gz
+./ferryman-v$v-$t/ferryman --version
+```
+
+Each archive also has a standalone `<archive>.sha256` file.
+
+```bash
+cargo binstall ferryman          # downloads the release archive above
+cargo install --locked ferryman  # builds from crates.io (Rust 1.88+)
+docker build -t ferryman .       # static musl binary in a scratch image
+```
+
+On Windows, `Ctrl-C` (or closing the console) shuts down gracefully.
+
 ## Quick start
 
 ```bash
-# Install the binary from crates.io:
-cargo install --locked ferryman
 ferryman --config config.toml
 
 # Build and run against the example config (2 upstreams, 5s health interval).

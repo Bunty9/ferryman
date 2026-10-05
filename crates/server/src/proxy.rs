@@ -260,13 +260,18 @@ fn apply_forwarded_headers(
         headers.insert(&xfp, first.unwrap_or(HeaderValue::from_static(proto)));
         // Always derived, never taken from the client: cloud LBs pass a
         // client's X-Real-IP through untouched.
-        let client = headers
+        // A header line that isn't visible ASCII counts as one garbage entry.
+        let entries: Vec<Option<IpAddr>> = headers
             .get_all("x-forwarded-for")
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
+            .flat_map(|v| match v.to_str() {
+                Ok(v) => v.split(',').map(|e| parse_xff_entry(e.trim())).collect(),
+                Err(_) => vec![None],
+            })
+            .collect();
+        let client = entries
+            .into_iter()
             .rev()
-            .map(|e| parse_xff_entry(e.trim()))
             .find(|e| !matches!(e, Some(ip) if trusted.contains(*ip)))
             .flatten()
             .unwrap_or(peer);
@@ -457,6 +462,34 @@ mod tests {
         ];
         let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
         assert_eq!(get(&m, "x-real-ip"), Some("6.6.6.6"));
+    }
+
+    #[test]
+    fn non_ascii_xff_line_stops_the_walk() {
+        let mut m = HeaderMap::new();
+        m.append("x-forwarded-for", "5.5.5.5".parse().unwrap());
+        m.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"6.6.6.\x80").unwrap(),
+        );
+        apply_forwarded_headers(
+            &mut m,
+            "10.1.2.3".parse().unwrap(),
+            "http",
+            &tp(&["10.0.0.0/8"]),
+        );
+        assert_eq!(get(&m, "x-real-ip"), Some("10.1.2.3"));
+        // a bad line left of a good untrusted entry is never reached
+        let mut m = HeaderMap::new();
+        m.append("x-forwarded-for", HeaderValue::from_bytes(b"\x80").unwrap());
+        m.append("x-forwarded-for", "5.5.5.5".parse().unwrap());
+        apply_forwarded_headers(
+            &mut m,
+            "10.1.2.3".parse().unwrap(),
+            "http",
+            &tp(&["10.0.0.0/8"]),
+        );
+        assert_eq!(get(&m, "x-real-ip"), Some("5.5.5.5"));
     }
 
     #[test]

@@ -38,10 +38,11 @@ and `ferryman` are released together with the same version.
 
 - New optional config keys `keepalive_timeout_secs` (default 10),
   `request_body_idle_timeout_secs` (default 30) and `trusted_proxies`
-  (default empty; see Security below for its effect), validated at load and exposed on `RouteTable`
-  (`keepalive_timeout()`, `request_body_idle_timeout()`, `trusted_proxies()`,
-  `with_*` builders) plus the `TrustedProxies` CIDR type. Defaults keep
-  today's behaviour apart from the forwarded-header fix under Security.
+  (default empty; see Security above for its effect), validated at load and
+  exposed on `RouteTable` (`keepalive_timeout()`,
+  `request_body_idle_timeout()`, `trusted_proxies()`, `with_*` builders) plus
+  the `TrustedProxies` CIDR type. Defaults keep today's behaviour apart from
+  the forwarded-header fix under Security.
 
 - Release archives carry GitHub build provenance attestations
   (`gh attestation verify <archive> --repo Bunty9/ferryman`); tier-1

@@ -32,9 +32,13 @@ default_cooldown_secs = 30
 # request_body_idle_timeout_secs = 30
 
 # Peers (CIDR ranges or bare IPs, IPv4 and IPv6) whose forwarding headers
-# (X-Forwarded-Proto/Host, X-Real-IP, Forwarded) are passed through. For any
-# other peer ferryman overwrites X-Real-IP and strips Forwarded and
-# X-Forwarded-Host. Hot-reloads (applied per request). Default empty = trust nobody. Add your nginx/LB here.
+# are passed through: X-Forwarded-Proto, X-Forwarded-Host and Forwarded are
+# kept. X-Real-IP is always set by ferryman (the rightmost X-Forwarded-For
+# entry that is not a trusted proxy, else the peer). For any other peer
+# ferryman also strips Forwarded and X-Forwarded-Host and sets
+# X-Forwarded-Proto from the connection. Only trust hops that overwrite or
+# strip Forwarded / X-Forwarded-Host (cloud LBs often pass them through).
+# Hot-reloads (applied per request). Default empty = trust nobody.
 # IPv4 clients (also IPv4-mapped IPv6 peers) match only IPv4 ranges, so
 # "::/0" does not trust them; host bits are ignored (10.0.0.1/8 = 10.0.0.0/8).
 # trusted_proxies = ["10.0.0.0/8", "fd00::/8"]

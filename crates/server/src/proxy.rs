@@ -35,7 +35,7 @@ pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 /// The client's request body, streamed to the upstream with two additions:
 /// it enforces `request_body_idle_timeout_secs` between frames and
 /// `request_body_timeout_secs` overall (an over-slow upload errors, which
-/// `handle` turns into 408), and it reports end-of-stream so `handle` can
+/// `handle_streaming` turns into 408), and it reports end-of-stream so `handle_streaming` can
 /// start the upstream timeout only once the whole body is sent. Never buffers.
 pub struct RequestBody {
     inner: Incoming,
@@ -47,6 +47,12 @@ pub struct RequestBody {
     total_sleep: Option<Pin<Box<Sleep>>>,
     eos: Option<oneshot::Sender<()>>,
     state: Arc<BodyState>,
+}
+
+impl std::fmt::Debug for RequestBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestBody").finish_non_exhaustive()
+    }
 }
 
 /// What `handle`'s timer can see of the body: whether hyper polled it, and
@@ -196,7 +202,8 @@ const HOP_BY_HOP_HEADERS: [HeaderName; 8] = [
 /// TLS-terminated, and is forwarded as `x-forwarded-proto`.
 ///
 /// This is the streaming handler: `upstream_timeout_secs` starts once the
-/// request body is complete, and `request_body_idle_timeout_secs` applies.
+/// request body is complete, `request_body_idle_timeout_secs` applies between
+/// body frames, and `request_body_timeout_secs` caps the whole upload.
 pub async fn handle_streaming(
     table: SharedTable,
     client: StreamingClient,
@@ -213,7 +220,9 @@ pub async fn handle_streaming(
 
 /// The 0.2.2 handler, kept for compatibility: `upstream_timeout_secs` covers
 /// the whole request including the body upload, no body idle timeout, and a
-/// timeout counts against the breaker only for bodyless requests.
+/// timeout counts against the breaker only for bodyless requests. It shares
+/// the core with `handle_streaming`, so it still gets the forwarded-header and
+/// bad-path fixes.
 #[deprecated(
     since = "0.2.3",
     note = "long uploads can 504; use `handle_streaming` with a `StreamingClient`"
@@ -501,7 +510,7 @@ fn join_cookies(headers: &mut HeaderMap) {
 /// `x-real-ip` is overwritten with the peer, and client `forwarded` /
 /// `x-forwarded-host` are stripped.
 ///
-/// Trusted peer: incoming `x-forwarded-proto` (first value), `x-forwarded-host`
+/// Trusted peer: incoming `x-forwarded-proto` (rightmost value), `x-forwarded-host`
 /// and `forwarded` are kept; missing `x-forwarded-proto` comes from the
 /// connection. `x-real-ip` is always overwritten with the rightmost
 /// `x-forwarded-for` entry that is not a trusted proxy (`:port` suffixes
@@ -606,7 +615,7 @@ fn record(started: Instant, route: &str, upstream: &str, status: u16) {
     .record(started.elapsed().as_secs_f64());
 }
 
-/// F5: true if `path` could be read as a dot segment by a normalising
+/// True if `path` could be read as a dot segment by a normalising
 /// upstream. `/`, `\`, `%2f` and `%5c` all count as separators, a `;param`
 /// suffix is ignored per piece (Tomcat), and a piece that is `.` or `..`
 /// (also `%2e`-encoded, any case) is rejected. Encoded separators inside an
@@ -790,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_v4_keeps_incoming() {
+    fn trusted_v4_keeps_incoming_headers_but_derives_real_ip() {
         let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &FORGED);
         assert_eq!(get(&m, "x-real-ip"), Some("10.1.2.3"));
         assert_eq!(get(&m, "forwarded"), Some("for=6.6.6.6"));

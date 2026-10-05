@@ -83,7 +83,7 @@ Required targets: `x86_64`/`aarch64-unknown-linux-musl` (static),
 `aarch64-pc-windows-msvc`, `x86_64-unknown-freebsd`.
 
 ```bash
-v=0.2.2   # or the latest release (binaries ship from 0.2.2 on)
+v=0.2.3   # or the latest release (binaries ship from 0.2.2 on)
 t=x86_64-unknown-linux-musl
 base=https://github.com/Bunty9/ferryman/releases/download/v$v
 curl -fsSLO $base/ferryman-v$v-$t.tar.gz -O $base/SHA256SUMS
@@ -300,7 +300,7 @@ Surface:
 
 | Metric                              | Labels                                          | Description                                                  |
 | ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ |
-| `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404) | Counter of inbound requests.                                 |
+| `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404 and 400 bad path) | Counter of inbound requests.                                 |
 | `ferryman_request_duration_seconds` | `route`, `upstream`                             | Histogram (buckets `le`), time from request start (includes the upload) to upstream response headers. |
 | `ferryman_upstream_alive`           | `upstream`                                      | Gauge: 1 = circuit closed, 0 otherwise.                      |
 | `ferryman_circuit_state`            | `upstream`                                      | Gauge: 0 closed / 1 open / 2 half-open.                      |

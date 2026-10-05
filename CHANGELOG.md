@@ -7,10 +7,12 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-05
+
 ### Security
 
 - Requests whose path contains a dot segment now get 400 `bad path` before
-  routing and are never forwarded (F5). Previously `/api/../admin` was
+  routing and are never forwarded. Previously `/api/../admin` was
   forwarded verbatim and an upstream that normalises it could serve paths
   outside the routed prefix. Rejected: `.`/`..` segments, including
   `%2e`-encoded and `..;` forms, and including after an encoded or literal
@@ -20,42 +22,7 @@ and `ferryman` are released together with the same version.
   `group%2Fproject`) remain allowed. **Behaviour change:** clients relying on
   `..` passthrough now get 400. The forwarded path is never rewritten; the
   query string is not inspected.
-
-### Fixed
-
-- Long uploads no longer fail with 504: `upstream_timeout_secs` used to cover
-  the whole request including streaming the client's body. It now starts when
-  the request body is complete (immediately for bodyless requests).
-  `request_body_idle_timeout_secs` is now applied: a client that stalls its
-  upload longer than that gets 408, with no breaker effect. Uploads are now
-  bounded by the new `request_body_timeout_secs` (default 300) instead of
-  `upstream_timeout_secs`; exceeding it also gets 408.
-  An upstream that stops reading the upload for a whole `upstream_timeout_secs`
-  window gets 504 and counts toward the breaker.
-  **Behaviour change:** an upstream timeout after the body completed now
-  counts as a breaker failure for requests with bodies too (previously only
-  bodyless requests counted).
-  `ferryman::serve` uses the new streaming path.
-
-### Added
-
-- Circuit breaker state changes are logged with `upstream`, `from` and `to`
-  fields (`warn` when opening, `info` otherwise), only on an actual change.
-- Config key `request_body_timeout_secs` (default 300, 1..=86400) and
-  `RouteTable::request_body_timeout()` / `with_request_body_timeout()`:
-  total cap on receiving a request body (streaming path only).
-- `ferryman::StreamingClient`, `ferryman::proxy::handle_streaming` and
-  `ferryman::proxy::RequestBody` (idle-timeout and end-of-body-signalling
-  request body) for embedders.
-
-### Deprecated
-
-- `ferryman::ProxyClient` and `ferryman::proxy::handle` keep their 0.2.2
-  signature and old timeout semantics (whole-request timeout; a timeout on a
-  request with a body does not count against the breaker). Use
-  `StreamingClient` / `handle_streaming`.
-
-### Security
+  **Migration:** normalise paths client-side before sending.
 
 - Forwarded-header spoofing: a client could send `X-Real-IP`, `Forwarded`,
   `X-Forwarded-Host` (and `X-Forwarded-Proto` where it was not overwritten)
@@ -76,7 +43,21 @@ and `ferryman` are released together with the same version.
   non-spoofable setting is `IP_HEADER=none` (all clients share ferryman's IP
   for rate limiting).
 
+### Changed
+
+- `fly.toml`: removed the public port-9090 service; added a `[metrics]`
+  section for Fly's managed Prometheus.
+
 ### Added
+
+- Circuit breaker state changes are logged with `upstream`, `from` and `to`
+  fields (`warn` when opening, `info` otherwise), only on an actual change.
+- Config key `request_body_timeout_secs` (default 300, 1..=86400) and
+  `RouteTable::request_body_timeout()` / `with_request_body_timeout()`:
+  total cap on receiving a request body (streaming path only).
+- `ferryman::StreamingClient`, `ferryman::proxy::handle_streaming` and
+  `ferryman::proxy::RequestBody` (idle-timeout and end-of-body-signalling
+  request body) for embedders.
 
 - `keepalive_timeout_secs` is now applied: it is the HTTP/1 keep-alive idle
   timeout (hyper `header_read_timeout`), read per connection so hot reload
@@ -99,6 +80,21 @@ and `ferryman` are released together with the same version.
 
 ### Fixed
 
+- Long uploads no longer fail with 504: `upstream_timeout_secs` used to cover
+  the whole request including streaming the client's body. It now starts when
+  the request body is complete (immediately for bodyless requests).
+  `request_body_idle_timeout_secs` is now applied: a client that stalls its
+  upload longer than that gets 408, with no breaker effect. Uploads are now
+  bounded by the new `request_body_timeout_secs` (default 300) instead of
+  `upstream_timeout_secs`; exceeding it also gets 408.
+  An upstream that stops reading the upload for a whole `upstream_timeout_secs`
+  window gets 504 and counts toward the breaker.
+  **Behaviour change:** an upstream timeout after the body completed now
+  counts as a breaker failure for requests with bodies too (previously only
+  bodyless requests counted).
+  `ferryman::serve` uses the new streaming path.
+  **Migration:** if you raised `upstream_timeout_secs` to work around slow or long uploads, set `request_body_timeout_secs` (and `request_body_idle_timeout_secs`) instead.
+
 - An upstream with an empty host (`http://:80`) is now rejected at load
   instead of producing a permanently failing route. Migration: fix the
   `upstream` value.
@@ -107,10 +103,12 @@ and `ferryman` are released together with the same version.
   <= 86400; a huge `health_interval_secs` used to panic at boot. Migration:
   lower any value above one day.
 
-### Changed
+### Deprecated
 
-- `fly.toml`: removed the public port-9090 service; added a `[metrics]`
-  section for Fly's managed Prometheus.
+- `ferryman::ProxyClient` and `ferryman::proxy::handle` keep their 0.2.2
+  signature and old timeout semantics (whole-request timeout; a timeout on a
+  request with a body does not count against the breaker). Use
+  `StreamingClient` / `handle_streaming`.
 
 ## [0.2.2] - 2026-10-05
 
@@ -212,7 +210,8 @@ First public release.
 - Prometheus metrics on a separate listener.
 - `echo_upstream` example for local benchmarking.
 
-[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/Bunty9/ferryman/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Bunty9/ferryman/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Bunty9/ferryman/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Bunty9/ferryman/compare/v0.1.0...v0.2.0

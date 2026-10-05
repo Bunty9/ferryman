@@ -33,7 +33,7 @@ accept ── set TCP_NODELAY
   │    first request must arrive within 10s; later h1 heads within
   │    `keepalive_timeout_secs` (default 10)
   │
-  └─ proxy::handle
+  └─ proxy::handle_streaming
        1. table.load_full()             one Arc for the whole request
        2. bad_path(path)                dot segments, NUL, %u, double-encoded -> 400
        2b. lookup(path)                 none -> 404
@@ -42,7 +42,10 @@ accept ── set TCP_NODELAY
        5. rewrite request:
             strip hop-by-hop, join h2 cookies, Host from authority,
             URI = upstream scheme+authority + original path+query,
-            version = HTTP/1.1, x-forwarded-for / -proto
+            version = HTTP/1.1, x-forwarded-for / -proto;
+            forwarded headers per trusted_proxies: x-real-ip always set by
+            ferryman; forwarded / x-forwarded-host stripped for untrusted
+            peers; x-forwarded-proto from the connection unless trusted
        6. client.request(); body wrapped in RequestBody (idle timeout
           between frames, signals EOS). upstream_timeout (to response
           headers) starts at body EOS, or immediately if bodyless

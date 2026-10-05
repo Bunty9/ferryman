@@ -115,12 +115,3 @@ async fn shutdown_signal() {
         _ = shutdown.recv() => tracing::info!("received system shutdown, shutting down"),
     }
 }
-
-/// Resolves on Ctrl-C (other non-unix platforms).
-#[cfg(not(any(unix, windows)))]
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("install Ctrl-C handler");
-    tracing::info!("received Ctrl-C, shutting down");
-}

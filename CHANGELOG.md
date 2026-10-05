@@ -12,10 +12,11 @@ and `ferryman` are released together with the same version.
 - Prebuilt binaries attached to GitHub releases (`.tar.gz`, `.zip` on
   Windows) with a combined `SHA256SUMS` and per-archive `.sha256` files.
   Required: Linux musl x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64
-  (MSVC). Best effort: ARM/i686/riscv64 musl, FreeBSD, Windows aarch64.
-- `cargo binstall ferryman` metadata (`[package.metadata.binstall]`).
-- Windows support: the binary shuts down gracefully on Ctrl-C, console
-  close and system shutdown (previously Unix-only signal handling).
+  (MSVC). Best effort: ARM/i686 musl, riscv64 gnu, FreeBSD, Windows aarch64.
+- `cargo binstall ferryman` metadata (applies from the first release that ships it) (`[package.metadata.binstall]`).
+- Windows support: Ctrl-C drains gracefully; console close / system
+  shutdown starts the drain, but Windows terminates the process after
+  about 5 s (previously Unix-only signal handling).
 - `release.yml` accepts prerelease tags (`vX.Y.Z-rc.1`, marked as
   prerelease) and a manual `workflow_dispatch` dry run of the binary
   builds.

@@ -82,9 +82,11 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 
 ## Step 4 — automate later releases
 
-`.github/workflows/release.yml` exists in the repo already. On a `v*` tag
-push it runs four jobs, each with only the permissions and checkout it
-needs (see "why three jobs" below):
+`.github/workflows/release.yml` exists in the repo already. On a tag push
+(`v[0-9]+.[0-9]+.[0-9]+` or prerelease `v[0-9]+.[0-9]+.[0-9]+-*`) it
+runs five jobs, each with only the permissions and checkout it needs
+(see "why separate jobs" below). Graph: `verify` -> `binaries` ->
+`publish` -> `release`, with `binaries-extra` (best effort) alongside:
 
 1. **`verify`** (`permissions: contents: read`, checkout with
    `persist-credentials: false`) — checks the tag points at a commit on
@@ -93,7 +95,8 @@ needs (see "why three jobs" below):
    `[workspace.dependencies]` agrees, extracts the matching
    `CHANGELOG.md` section into `release-notes.md` and uploads it as a
    build artifact, then runs `cargo test --workspace --locked`.
-2. **`publish`** (needs `verify`; `permissions: id-token: write,
+2. **`publish`** (needs `verify` and `binaries`, so nothing irreversible
+   happens unless every tier-1 archive built; `permissions: id-token: write,
    contents: read`, checkout with `persist-credentials: false`) —
    authenticates via `rust-lang/crates-io-auth-action@v1` (Trusted
    Publishing, no long-lived token), then publishes `ferryman-core` and
@@ -102,29 +105,28 @@ needs (see "why three jobs" below):
    and skips it if so, otherwise runs `cargo publish -p <name> --locked`.
    This makes the job idempotent — see "recovering from a half-published
    release" below.
-3. **`release`** (needs `publish`; `permissions: contents: write`, no
-   checkout at all) — downloads the `release-notes` artifact and runs
-   `gh release create` (skipping if a release for the tag already
-   exists). This job runs no `cargo` command and no dependency code, by
+3. **`release`** (needs `verify`, `publish`, `binaries`, `binaries-extra`;
+   runs under `!cancelled()` when verify, publish and `binaries` all
+   succeeded, ignoring `binaries-extra`; `permissions: contents: write`,
+   no checkout) — downloads `release-notes` and every `bin-*` artifact,
+   fails if a tier-1 archive is missing, writes `SHA256SUMS`, and runs
+   `gh release create` with all archives attached (or `gh release upload
+   --clobber` if the release exists). No `cargo`, no dependency code, by
    design.
 
-4. **`binaries`** (needs `verify`; `contents: read`, no credentials;
-   runs in parallel with `publish`) — matrix that builds `ferryman` with
+4. **`binaries`** (tier 1) and **`binaries-extra`** (tier 2, `continue-on-error`)
+   (need `verify`; `contents: read`, no credentials, no OIDC) — matrices that builds `ferryman` with
    `--locked --release` and packages
    `ferryman-v<version>-<target>.tar.gz` (`.zip` on Windows; top-level
    dir with binary, README, CHANGELOG, licenses, `config.toml`) plus a
    `.sha256`. Tier 1 (Linux musl x86_64/aarch64, macOS x86_64/aarch64,
-   Windows x86_64 MSVC) is required; tier 2 (ARM/i686/riscv64 musl via
-   `cross`, FreeBSD, Windows aarch64) is `continue-on-error` and may be
-   absent. `release` then needs `verify`, `publish` and `binaries`
-   (`if: always()`), fails if any tier-1 archive is missing, writes
-   `SHA256SUMS` and creates the release with every archive attached
-   (`--prerelease` for `-` tags; if the release exists, `gh release upload
-   --clobber`). Prerelease tags (`vX.Y.Z-rc.1`) must equal the workspace
+   Windows x86_64 MSVC) gates `publish` and `release`; tier 2 (ARM/i686
+   musl and riscv64 gnu via `cross`, FreeBSD, Windows aarch64) may be
+   absent. `--prerelease` is set for `-` tags. Prerelease tags (`vX.Y.Z-rc.1`) must equal the workspace
    version like any other.
 
 **Dry run.** Actions tab, *release*, *Run workflow* (`workflow_dispatch`)
-runs only the `binaries` matrix (verify/publish/release are skipped);
+runs only `binaries` and `binaries-extra` (verify/publish/release are skipped);
 download the `bin-*` artifacts to inspect the archives. Do this before
 the first tagged release that ships binaries, and after changing the
 matrix.
@@ -133,7 +135,7 @@ matrix.
 `[package.metadata.binstall]` in `crates/server/Cargo.toml`; keep that
 URL template in step with the archive naming in `release.yml`.
 
-**Why three jobs, not one.** A single job would run `cargo test` and
+**Why separate jobs.** A single job would run `cargo test` and
 `cargo publish` — both of which execute arbitrary third-party code
 (`build.rs`, proc macros, test binaries) — in the same process context as
 the `id-token: write` OIDC token (used to mint the crates.io publish
@@ -166,13 +168,17 @@ fallback in the meantime but isn't used by the workflow.
 `ferryman` then fails (network blip, crates.io hiccup, a transient CI
 issue), crates.io now has the new `ferryman-core` but not `ferryman`, and
 no GitHub release was created (the `release` job needs `publish` to
-succeed first).
+succeed first). Because `publish` needs the tier-1 `binaries` job, a
+deterministic build failure on a required target now stops the release
+before anything reaches crates.io, so it cannot leave a half-published
+release; only transient failures after publish starts can.
 
 Because each crate's publish step checks crates.io for that exact
 `name/version` before publishing, **re-running the failed jobs** from the
 Actions UI (don't re-push the tag) picks up where it left off: `ferryman-core`
 is found to already exist and is skipped, `ferryman` gets published, and
-the `release` job then creates the GitHub release. No manual crates.io
+the `release` job then creates the GitHub release (it still requires
+every tier-1 archive; re-run `binaries` jobs too if they expired). No manual crates.io
 intervention needed for this case.
 
 If the workflow can't be re-run (e.g. the tag itself was wrong), publish

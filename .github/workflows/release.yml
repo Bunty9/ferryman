@@ -96,7 +96,7 @@ jobs:
   # ("recovering from a half-published release").
   publish:
     name: publish
-    needs: verify
+    needs: [verify, binaries]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -132,35 +132,109 @@ jobs:
             fi
           done
 
-  # Release binaries. Tier 1 targets are required (the `release` job
-  # refuses to run without them); tier 2 are best effort (`continue-on-error`
-  # keeps a failing tier-2 leg from failing this job or skipping the
-  # release). Runs in parallel with `publish`, only `contents: read`, and
-  # in a workflow_dispatch dry run it runs alone (verify is skipped then).
+  # Release binaries, tier 1: required. `publish` needs this job, so
+  # nothing irreversible (crates.io) happens unless every tier-1 archive
+  # built. `contents: read` only, no OIDC. In a workflow_dispatch dry run
+  # verify is skipped and only the two binaries jobs run.
   binaries:
     name: binary (${{ matrix.target }})
     needs: verify
-    if: always() && (needs.verify.result == 'success' || github.event_name == 'workflow_dispatch')
+    if: "!cancelled() && (needs.verify.result == 'success' || github.event_name == 'workflow_dispatch')"
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.tier == 2 }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Tier 1: required.
           - { tier: 1, os: ubuntu-latest, target: x86_64-unknown-linux-musl, builder: cargo }
           - { tier: 1, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, builder: cargo }
           - { tier: 1, os: macos-latest, target: x86_64-apple-darwin, builder: cargo }
           - { tier: 1, os: macos-latest, target: aarch64-apple-darwin, builder: cargo }
           - { tier: 1, os: windows-latest, target: x86_64-pc-windows-msvc, builder: cargo }
-          # Tier 2: best effort. ring 0.17 supports all of these; none was
-          # exercised before the first release run, hence tier 2.
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins stable; the target is added via rustup for
+      # native builds. `cross` builds in a container, so no target there.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.builder == 'cargo' && matrix.target || '' }}
+
+      - name: Install musl-tools
+        if: matrix.builder == 'cargo' && contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cross
+
+      - name: Build
+        shell: bash
+        env:
+          BUILDER: ${{ matrix.builder }}
+        run: |
+          set -euo pipefail
+          "$BUILDER" build --locked --release -p ferryman --target "$TARGET"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="ferryman") | .version')
+          name="ferryman-v${version}-${TARGET}"
+          exe=ferryman
+          case "$TARGET" in *-windows-*) exe=ferryman.exe ;; esac
+          mkdir -p "dist/$name"
+          cp "target/${TARGET}/release/${exe}" README.md CHANGELOG.md \
+            LICENSE-MIT LICENSE-APACHE config.toml "dist/$name/"
+          cd dist
+          case "$TARGET" in
+            *-windows-*) archive="$name.zip"; 7z a -tzip "$archive" "$name" >/dev/null ;;
+            *) archive="$name.tar.gz"; tar -czf "$archive" "$name" ;;
+          esac
+          rm -rf "$name"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+
+  # Release binaries, tier 2: best effort (`continue-on-error`). Nothing
+  # depends on it succeeding; `release` attaches whatever artifacts exist.
+  binaries-extra:
+    name: binary, best effort (${{ matrix.target }})
+    needs: verify
+    if: "!cancelled() && (needs.verify.result == 'success' || github.event_name == 'workflow_dispatch')"
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - { tier: 2, os: ubuntu-latest, target: armv7-unknown-linux-musleabihf, builder: cross }
           - { tier: 2, os: ubuntu-latest, target: arm-unknown-linux-musleabihf, builder: cross }
           - { tier: 2, os: ubuntu-latest, target: i686-unknown-linux-musl, builder: cross }
-          - { tier: 2, os: ubuntu-latest, target: riscv64gc-unknown-linux-musl, builder: cross }
+          - { tier: 2, os: ubuntu-latest, target: riscv64gc-unknown-linux-gnu, builder: cross }
           - { tier: 2, os: ubuntu-latest, target: x86_64-unknown-freebsd, builder: cross }
           - { tier: 2, os: windows-latest, target: aarch64-pc-windows-msvc, builder: cargo }
     env:
@@ -230,16 +304,17 @@ jobs:
   # Creates (or, on a re-run, updates) the GitHub release from the notes
   # `verify` extracted and the archives `binaries` built. No checkout, no
   # cargo, no dependency code runs here; it is the only job that holds
-  # `contents: write`. `always()` so a failed tier-2 binary can't skip the
-  # release; the explicit checks below demand verify/publish success and
-  # every tier-1 archive.
+  # `contents: write`. `!cancelled()` plus explicit result checks so a
+  # failed tier-2 (`binaries-extra`) job can't skip the release, while
+  # verify, publish and tier-1 `binaries` must all have succeeded.
   release:
     name: release
-    needs: [verify, publish, binaries]
+    needs: [verify, publish, binaries, binaries-extra]
     if: >-
-      always() && github.event_name == 'push'
+      !cancelled() && github.event_name == 'push'
       && needs.verify.result == 'success'
       && needs.publish.result == 'success'
+      && needs.binaries.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

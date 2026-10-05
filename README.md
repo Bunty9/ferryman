@@ -166,7 +166,7 @@ fail loudly instead of silently falling back to defaults.
 | `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
 | `request_body_timeout_secs`      | 300     | Total time to receive a request body, 1-86400 (408 when exceeded).               |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
-| `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`).                       |
+| `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the raw, undecoded, case-sensitive request path (see "Routing and access control"). |
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
 | `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
 
@@ -177,6 +177,38 @@ Routes pointing at the same `host:port` share one circuit breaker. A hot
 reload keeps each surviving upstream's breaker, so an open circuit stays
 open across a config edit. An invalid config on reload is logged and the
 old table stays live.
+
+### Routing and access control
+
+Prefixes match the raw, undecoded, case-sensitive request path on a
+segment boundary. A less specific route (especially `/`) can therefore
+receive paths that its upstream decodes or merges into a more specific
+prefix, e.g. `/%61pi/x` or `//api/x` reaching an upstream that treats
+them as `/api/x`. Routes are not access control: don't rely on a route to
+hide paths of an upstream that another route also reaches.
+
+### Health-driven recovery
+
+Every `health_interval_secs` each upstream's `/health` is probed (any
+answer below 500 is healthy; transport errors, timeouts and 5xx are not).
+Health results are authoritative, like the half-open probe:
+
+- A passing check closes an open or half-open circuit immediately; it does
+  not wait for the cooldown. Passing while already closed is a no-op and
+  does not reset the request failure count.
+- A failing check while open re-stamps the cooldown, so the cooldown
+  restarts every tick and the request-path half-open probe never gets a
+  slot while the upstream stays unhealthy. Recovery therefore comes from
+  the first passing health check, not from cooldown expiry.
+- With the defaults (5 s interval, 30 s cooldown) an upstream that comes
+  back is routable again within about one interval (up to ~5 s, plus the
+  2 s probe timeout in the worst case). If health checks can't reach the
+  upstream at all, recovery falls back to cooldown expiry (30 s) and one
+  successful half-open probe request.
+
+State changes are logged with `upstream`, `from` and `to` fields: `warn`
+when a circuit opens, `info` otherwise. Re-stamps while open are not
+logged.
 
 CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
 (`FERRYMAN_BIND`, `0.0.0.0:8080`), `--metrics-bind`

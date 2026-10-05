@@ -76,6 +76,12 @@ Lookup deliberately ignores health. If `/api/v1` is down, falling back to
 `/api` would send the request to a different service, so the answer is a
 503.
 
+Prefixes match the raw, undecoded, case-sensitive request path on a
+segment boundary. A less specific route (especially `/`) can receive paths
+that its upstream decodes or merges into a more specific prefix (e.g.
+`/%61pi/x`, `//api/x`). Routes are not access control: don't rely on a
+route to hide paths of an upstream that another route also reaches.
+
 ## Circuit breaker
 
 One breaker per upstream `host:port` (lowercased), shared by every route

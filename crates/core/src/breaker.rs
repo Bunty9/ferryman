@@ -140,11 +140,12 @@ impl Breaker {
                     return;
                 }
                 self.consecutive_failures.store(0, Ordering::Relaxed);
-                if self
-                    .state
-                    .swap(CircuitState::Closed as u8, Ordering::AcqRel)
-                    != CircuitState::Closed as u8
-                {
+                let prev = CircuitState::from_u8(
+                    self.state
+                        .swap(CircuitState::Closed as u8, Ordering::AcqRel),
+                );
+                if prev != CircuitState::Closed {
+                    self.log_transition(prev, CircuitState::Closed);
                     self.set_gauges();
                 }
             }
@@ -184,9 +185,19 @@ impl Breaker {
             .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if ok {
+            self.log_transition(from, to);
             self.set_gauges();
         }
         ok
+    }
+
+    /// Only called after a state-changing CAS/swap, never on the hot path.
+    fn log_transition(&self, from: CircuitState, to: CircuitState) {
+        if to == CircuitState::Open {
+            tracing::warn!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+        } else {
+            tracing::info!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+        }
     }
 
     /// Publish the *current* state (not a transition target), so racing
@@ -209,6 +220,44 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transitions_log_once_and_noops_do_not() {
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            let b = breaker(200, 1);
+            b.record_failure(N); // closed -> open
+            b.record_failure(N); // late normal result: no change
+            b.record_failure(P); // probe failure while open: re-stamp only
+            b.record_success(N); // no change
+            b.record_success(P); // open -> closed
+            b.record_success(P); // closed probe success: no-op
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].contains("WARN") && lines[0].contains("upstream=test:1"));
+        assert!(lines[0].contains("from=Closed") && lines[0].contains("to=Open"));
+        assert!(lines[1].contains("INFO") && lines[1].contains("from=Open"));
+        assert!(lines[1].contains("to=Closed"));
+    }
 
     const N: Admission = Admission::Normal;
     const P: Admission = Admission::Probe;

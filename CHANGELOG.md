@@ -39,6 +39,8 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Circuit breaker state changes are logged with `upstream`, `from` and `to`
+  fields (`warn` when opening, `info` otherwise), only on an actual change.
 - Config key `request_body_timeout_secs` (default 300, 1..=86400) and
   `RouteTable::request_body_timeout()` / `with_request_body_timeout()`:
   total cap on receiving a request body (streaming path only).

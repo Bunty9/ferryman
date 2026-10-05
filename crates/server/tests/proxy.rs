@@ -250,9 +250,13 @@ async fn forged_headers_echo(extra_cfg: &str) -> String {
     reqwest::Client::new()
         .get(format!("http://{proxy}/svc-a/x"))
         .header("x-real-ip", "6.6.6.6")
+        .header("X-Real-IP", "7.7.7.7")
         .header("forwarded", "for=6.6.6.6;proto=https")
+        .header("Forwarded", "for=7.7.7.7")
         .header("x-forwarded-host", "evil.example")
+        .header("X-Forwarded-Host", "evil2.example")
         .header("x-forwarded-proto", "https")
+        .header("X-Forwarded-Proto", "https")
         .header("x-forwarded-for", "6.6.6.6")
         .send()
         .await
@@ -268,6 +272,11 @@ async fn untrusted_peer_cannot_forge_forwarded_headers() {
     for cfg in ["", "trusted_proxies = [\"10.0.0.0/8\"]"] {
         let body = forged_headers_echo(cfg).await;
         assert!(body.contains("x-real-ip: 127.0.0.1"), "{body}");
+        assert_eq!(body.matches("x-real-ip:").count(), 1, "{body}");
+        assert!(!body.contains("x-real-ip: 6.6.6.6"), "{body}");
+        assert!(!body.contains("x-real-ip: 7.7.7.7"), "{body}");
+        assert!(!body.contains("x-forwarded-proto: https"), "{body}");
+        assert_eq!(body.matches("x-forwarded-proto:").count(), 1, "{body}");
         assert!(!body.contains("6.6.6.6;"), "{body}");
         assert!(!body.contains("forwarded:"), "{body}");
         assert!(!body.contains("x-forwarded-host"), "{body}");
@@ -286,7 +295,10 @@ async fn trusted_peer_forwarded_headers_are_preserved() {
     let body = forged_headers_echo("trusted_proxies = [\"127.0.0.1/32\"]").await;
     assert!(body.contains("x-forwarded-proto: https\n"), "{body}");
     assert!(body.contains("x-forwarded-host: evil.example"), "{body}");
+    // Derived from XFF (rightmost untrusted = 6.6.6.6), never the forged header.
     assert!(body.contains("x-real-ip: 6.6.6.6"), "{body}");
+    assert!(!body.contains("x-real-ip: 7.7.7.7"), "{body}");
+    assert_eq!(body.matches("x-real-ip:").count(), 1, "{body}");
     assert!(
         body.contains("forwarded: for=6.6.6.6;proto=https"),
         "{body}"

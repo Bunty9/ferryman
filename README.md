@@ -164,7 +164,7 @@ fail loudly instead of silently falling back to defaults.
 | `upstream_timeout_secs`          | 30      | Time allowed for an upstream to send response headers.                           |
 | `keepalive_timeout_secs`         | 10      | HTTP/1 keep-alive idle timeout, 1-86400 (ALB: 75, GCLB: 620).                    |
 | `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
-| `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. |
+| `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
 | `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`).                       |
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
 | `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
@@ -231,7 +231,7 @@ What the upstream sees depends on whether the connecting peer is in
 | ------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
 | `X-Forwarded-Proto` | set from the connection              | incoming (first value) kept; set from the connection if absent                                 |
 | `X-Forwarded-For`   | peer IP appended                     | peer IP appended                                                                               |
-| `X-Real-IP`         | overwritten with the peer IP         | incoming kept; if absent, the rightmost `X-Forwarded-For` entry that is not a trusted proxy, else the peer |
+| `X-Real-IP`         | overwritten with the peer IP         | always overwritten: the rightmost `X-Forwarded-For` entry that is not a trusted proxy (`ip:port` / `[v6]:port` tolerated; an unparsable entry stops the walk), else the peer |
 | `Forwarded`         | stripped                             | kept                                                                                           |
 | `X-Forwarded-Host`  | stripped                             | kept                                                                                           |
 
@@ -241,9 +241,17 @@ unchanged. Before 0.2.3 clients could forge `X-Real-IP`, `Forwarded` and
 hop's address range to `trusted_proxies`, otherwise its values are replaced or
 stripped.
 
-**Vaultwarden:** it trusts `X-Real-IP` by default. On 0.2.2 set
-`IP_HEADER=X-Forwarded-For` (X-Real-IP was client-controlled); from 0.2.3
-ferryman sets `X-Real-IP` itself, so the default works.
+**Only trust a hop that overwrites or strips `Forwarded` and
+`X-Forwarded-Host`.** AWS ALB and most cloud load balancers pass
+client-supplied values of these through, so downstream apps should not trust
+those headers behind such a load balancer. (`X-Real-IP` is safe either way:
+ferryman derives it itself.)
+
+**Vaultwarden:** upgrade to 0.2.3. ferryman then sets `X-Real-IP` from the TCP
+peer (or, behind a trusted proxy, from `X-Forwarded-For`), so Vaultwarden's
+default `IP_HEADER=X-Real-IP` is correct. On 0.2.2 the only non-spoofable
+setting is `IP_HEADER=none`, which makes all clients share ferryman's IP for
+rate limiting.
 
 ## Metrics endpoints
 

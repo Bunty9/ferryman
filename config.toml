@@ -34,7 +34,7 @@ default_cooldown_secs = 30
 # Peers (CIDR ranges or bare IPs, IPv4 and IPv6) whose forwarding headers
 # (X-Forwarded-Proto/Host, X-Real-IP, Forwarded) are passed through. For any
 # other peer ferryman overwrites X-Real-IP and strips Forwarded and
-# X-Forwarded-Host. Default empty = trust nobody. Add your nginx/LB here.
+# X-Forwarded-Host. Hot-reloads (applied per request). Default empty = trust nobody. Add your nginx/LB here.
 # IPv4 clients (also IPv4-mapped IPv6 peers) match only IPv4 ranges, so
 # "::/0" does not trust them; host bits are ignored (10.0.0.1/8 = 10.0.0.0/8).
 # trusted_proxies = ["10.0.0.0/8", "fd00::/8"]

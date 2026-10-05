@@ -16,12 +16,17 @@ and `ferryman` are released together with the same version.
   peers when the list is empty, the default), `X-Real-IP` is overwritten with
   the peer IP and `Forwarded` / `X-Forwarded-Host` are stripped;
   `X-Forwarded-Proto` is still set from the connection and `X-Forwarded-For`
-  still appended. Peers in `trusted_proxies` keep their incoming values (see
-  README "Forwarded headers").
+  still appended. Peers in `trusted_proxies` keep their incoming
+  `X-Forwarded-Proto`, `X-Forwarded-Host` and `Forwarded`, but `X-Real-IP` is
+  always derived (rightmost `X-Forwarded-For` entry that is not a trusted
+  proxy, else the peer) because cloud LBs pass a client's `X-Real-IP`
+  through (see README "Forwarded headers").
   **Migration:** if ferryman runs behind nginx or a load balancer that sets
   these headers, add its address range to `trusted_proxies`, otherwise they
-  are replaced or stripped. Vaultwarden users on 0.2.2: set
-  `IP_HEADER=X-Forwarded-For`; from this release `X-Real-IP` is trustworthy.
+  are replaced or stripped. Vaultwarden: upgrade to this release
+  (default `IP_HEADER=X-Real-IP` is then correct); on 0.2.2 the only
+  non-spoofable setting is `IP_HEADER=none` (all clients share ferryman's IP
+  for rate limiting).
 
 ### Added
 
@@ -33,10 +38,10 @@ and `ferryman` are released together with the same version.
 
 - New optional config keys `keepalive_timeout_secs` (default 10),
   `request_body_idle_timeout_secs` (default 30) and `trusted_proxies`
-  (default empty), validated at load and exposed on `RouteTable`
+  (default empty; see Security below for its effect), validated at load and exposed on `RouteTable`
   (`keepalive_timeout()`, `request_body_idle_timeout()`, `trusted_proxies()`,
   `with_*` builders) plus the `TrustedProxies` CIDR type. Defaults keep
-  today's behaviour.
+  today's behaviour apart from the forwarded-header fix under Security.
 
 - Release archives carry GitHub build provenance attestations
   (`gh attestation verify <archive> --repo Bunty9/ferryman`); tier-1

@@ -235,11 +235,12 @@ fn join_cookies(headers: &mut HeaderMap) {
 /// `x-real-ip` is overwritten with the peer, and client `forwarded` /
 /// `x-forwarded-host` are stripped.
 ///
-/// Trusted peer: incoming `x-forwarded-proto` (first value), `x-forwarded-host`,
-/// `x-real-ip` and `forwarded` are kept; missing `x-forwarded-proto` comes from
-/// the connection; missing `x-real-ip` is the rightmost `x-forwarded-for` entry
-/// that is not a trusted proxy (an unparsable entry stops the walk), else the
-/// peer. `x-forwarded-for` always gets the peer appended.
+/// Trusted peer: incoming `x-forwarded-proto` (first value), `x-forwarded-host`
+/// and `forwarded` are kept; missing `x-forwarded-proto` comes from the
+/// connection. `x-real-ip` is always overwritten with the rightmost
+/// `x-forwarded-for` entry that is not a trusted proxy (`:port` suffixes
+/// tolerated; an unparsable entry stops the walk), else the peer.
+/// `x-forwarded-for` always gets the peer appended.
 fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     peer: IpAddr,
@@ -247,7 +248,6 @@ fn apply_forwarded_headers(
     trusted: &TrustedProxies,
 ) {
     let xfp = HeaderName::from_static("x-forwarded-proto");
-    let xri = HeaderName::from_static("x-real-ip");
     let peer_trusted = trusted.contains(peer);
     if peer_trusted {
         let first = headers
@@ -258,30 +258,41 @@ fn apply_forwarded_headers(
             .filter(|v| !v.is_empty())
             .and_then(|v| HeaderValue::from_str(v).ok());
         headers.insert(&xfp, first.unwrap_or(HeaderValue::from_static(proto)));
-        if !headers.contains_key(&xri) {
-            let client = headers
-                .get_all("x-forwarded-for")
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .flat_map(|v| v.split(','))
-                .rev()
-                .map(|e| e.trim().parse::<IpAddr>())
-                .find(|e| !matches!(e, Ok(ip) if trusted.contains(*ip)))
-                .and_then(Result::ok)
-                .unwrap_or(peer);
-            if let Ok(v) = HeaderValue::from_str(&client.to_string()) {
-                headers.insert(&xri, v);
-            }
-        }
+        // Always derived, never taken from the client: cloud LBs pass a
+        // client's X-Real-IP through untouched.
+        let client = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .rev()
+            .map(|e| parse_xff_entry(e.trim()))
+            .find(|e| !matches!(e, Some(ip) if trusted.contains(*ip)))
+            .flatten()
+            .unwrap_or(peer);
+        set_real_ip(headers, client);
     } else {
         headers.insert(&xfp, HeaderValue::from_static(proto));
         headers.remove(header::FORWARDED);
         headers.remove("x-forwarded-host");
-        if let Ok(v) = HeaderValue::from_str(&peer.to_string()) {
-            headers.insert(&xri, v);
-        }
+        set_real_ip(headers, peer);
     }
     append_forwarded_for(headers, peer);
+}
+
+/// Overwrite `x-real-ip` (all instances) with `ip`, v4-mapped shown as v4.
+fn set_real_ip(headers: &mut HeaderMap, ip: IpAddr) {
+    if let Ok(v) = HeaderValue::from_str(&ip.to_canonical().to_string()) {
+        headers.insert("x-real-ip", v);
+    }
+}
+
+/// One `X-Forwarded-For` entry: `ip`, `ip:port` (v4) or `[v6]` / `[v6]:port`.
+fn parse_xff_entry(e: &str) -> Option<IpAddr> {
+    e.parse::<IpAddr>()
+        .ok()
+        .or_else(|| e.parse::<SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| e.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 fn append_forwarded_for(headers: &mut HeaderMap, ip: IpAddr) {
@@ -387,7 +398,7 @@ mod tests {
     #[test]
     fn trusted_v4_keeps_incoming() {
         let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &FORGED);
-        assert_eq!(get(&m, "x-real-ip"), Some("6.6.6.6"));
+        assert_eq!(get(&m, "x-real-ip"), Some("10.1.2.3"));
         assert_eq!(get(&m, "forwarded"), Some("for=6.6.6.6"));
         assert_eq!(get(&m, "x-forwarded-host"), Some("evil.example"));
         assert_eq!(get(&m, "x-forwarded-proto"), Some("https"));
@@ -396,7 +407,7 @@ mod tests {
     #[test]
     fn trusted_v6_keeps_incoming() {
         let m = run(&["fd00::/8"], "fd00::1", "http", &FORGED);
-        assert_eq!(get(&m, "x-real-ip"), Some("6.6.6.6"));
+        assert_eq!(get(&m, "x-real-ip"), Some("fd00::1"));
         assert_eq!(get(&m, "x-forwarded-proto"), Some("https"));
         let m = run(&["fd00::/8"], "fe80::1", "http", &FORGED);
         assert_eq!(get(&m, "x-real-ip"), Some("fe80::1"));
@@ -404,10 +415,12 @@ mod tests {
 
     #[test]
     fn v4_mapped_peer_matches_v4_cidr() {
-        let m = run(&["10.0.0.0/8"], "::ffff:10.1.2.3", "http", &FORGED);
+        let h = [("x-forwarded-for", "6.6.6.6")];
+        let m = run(&["10.0.0.0/8"], "::ffff:10.1.2.3", "http", &h);
         assert_eq!(get(&m, "x-real-ip"), Some("6.6.6.6"));
+        // untrusted v4-mapped peer: canonical dotted form
         let m = run(&["10.0.0.0/8"], "::ffff:11.1.2.3", "http", &FORGED);
-        assert_eq!(get(&m, "x-real-ip"), Some("::ffff:11.1.2.3"));
+        assert_eq!(get(&m, "x-real-ip"), Some("11.1.2.3"));
     }
 
     #[test]
@@ -427,6 +440,36 @@ mod tests {
             &[("x-forwarded-proto", "https, http")],
         );
         assert_eq!(get(&m, "x-forwarded-proto"), Some("https"));
+    }
+
+    #[test]
+    fn trusted_forged_real_ip_is_ignored() {
+        let h = [
+            ("x-real-ip", "7.7.7.7"),
+            ("x-forwarded-for", "1.1.1.1, 6.6.6.6"),
+        ];
+        let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
+        assert_eq!(get(&m, "x-real-ip"), Some("6.6.6.6"));
+        assert_eq!(m.get_all("x-real-ip").iter().count(), 1);
+        let h = [
+            ("x-real-ip", "7.7.7.7"),
+            ("x-forwarded-for", "6.6.6.6, 10.0.0.5"),
+        ];
+        let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
+        assert_eq!(get(&m, "x-real-ip"), Some("6.6.6.6"));
+    }
+
+    #[test]
+    fn xff_ports_and_brackets_are_parsed() {
+        let h = [("x-forwarded-for", "9.9.9.9, 5.5.5.5:4711")];
+        let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
+        assert_eq!(get(&m, "x-real-ip"), Some("5.5.5.5"));
+        let h = [("x-forwarded-for", "9.9.9.9, [2001:db8::1]:443, 10.0.0.7:80")];
+        let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
+        assert_eq!(get(&m, "x-real-ip"), Some("2001:db8::1"));
+        let h = [("x-forwarded-for", "9.9.9.9, [2001:db8::2]")];
+        let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
+        assert_eq!(get(&m, "x-real-ip"), Some("2001:db8::2"));
     }
 
     #[test]

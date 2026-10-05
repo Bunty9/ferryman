@@ -334,15 +334,12 @@ where
     let fwd = Request::from_parts(parts, body);
 
     let upstream_timeout = table.upstream_timeout;
-    let body_timeout = table.request_body_timeout();
     // Completes when the request must be failed as an upstream timeout (504).
     let timer = async move {
         let Some(Eos { mut rx, state }) = body_done else {
             // Legacy: the whole request, body included, is under one timeout.
             return tokio::time::sleep(upstream_timeout).await;
         };
-        let mut total = Box::pin(tokio::time::sleep(body_timeout));
-        let mut total_armed = true;
         loop {
             tokio::select! {
                 r = &mut rx => {
@@ -363,12 +360,6 @@ where
                     {
                         return;
                     }
-                }
-                () = &mut total, if total_armed => {
-                    if !state.waiting_on_client.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    total_armed = false;
                 }
             }
         }

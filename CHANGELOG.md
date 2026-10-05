@@ -16,6 +16,8 @@ and `ferryman` are released together with the same version.
   upload longer than that gets 408, with no breaker effect. Uploads are now
   bounded by the new `request_body_timeout_secs` (default 300) instead of
   `upstream_timeout_secs`; exceeding it also gets 408.
+  An upstream that stops reading the upload for a whole `upstream_timeout_secs`
+  window gets 504 and counts toward the breaker.
   **Behaviour change:** an upstream timeout after the body completed now
   counts as a breaker failure for requests with bodies too (previously only
   bodyless requests counted).

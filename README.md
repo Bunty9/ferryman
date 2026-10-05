@@ -212,6 +212,7 @@ hot reload.
 | No response headers within `upstream_timeout_secs` of the request body completing (of the request start if bodyless) | 504 | yes |
 | Client's request body fails mid-upload                 | 400      | no                     |
 | Client stalls its upload for `request_body_idle_timeout_secs`, or exceeds `request_body_timeout_secs` in total | 408 | no |
+| Upstream stops reading the upload for a whole `upstream_timeout_secs` window | 504 | yes |
 | Upstream answers 502/503/504                           | passed through | yes              |
 | Anything else from upstream                            | passed through | success          |
 

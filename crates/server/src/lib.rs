@@ -33,7 +33,7 @@ use tokio_rustls::TlsAcceptor;
 pub type ProxyClient = Client<HttpConnector, Incoming>;
 
 /// Shared hyper client used by [`serve`] to forward requests to upstreams.
-/// Bodies are streamed straight through, no buffering; the request body is the request body is
+/// Bodies are streamed straight through, no buffering; the request body is
 /// wrapped in [`proxy::RequestBody`] (idle timeout, end-of-body signal).
 pub type StreamingClient = Client<HttpConnector, proxy::RequestBody>;
 

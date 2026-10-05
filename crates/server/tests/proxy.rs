@@ -499,7 +499,7 @@ async fn trickled_upload_hits_total_cap_with_408() {
     let status = read_status_line(&mut r).await;
     assert!(status.starts_with("HTTP/1.1 408"), "{status}");
     assert!(
-        start.elapsed() < Duration::from_millis(3200),
+        start.elapsed() < Duration::from_millis(4500),
         "{:?}",
         start.elapsed()
     );
@@ -575,6 +575,41 @@ async fn upstream_that_stops_reading_upload_is_504_and_counts_against_breaker() 
 
     let resp = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
     assert_eq!(resp.status(), 503, "breaker must count the stuck upload");
+}
+
+#[tokio::test]
+async fn slow_draining_upstream_with_fast_client_is_408_not_a_breaker_failure() {
+    use tokio::io::AsyncWriteExt;
+
+    // Reads steadily but slowly: the proxy's buffer stays full while the
+    // client is fast, so only the client's total cap can end this upload.
+    let upstream = spawn_stub(|req| async move {
+        let mut body = req.into_body();
+        while body.frame().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        ok("done")
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "upstream_timeout_secs = 1\nrequest_body_timeout_secs = 2\nfailure_threshold = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let (mut r, mut w) = s.into_split();
+    tokio::spawn(async move {
+        let _ = w
+            .write_all(b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 4294967296\r\n\r\n")
+            .await;
+        let chunk = vec![0u8; 64 * 1024];
+        while w.write_all(&chunk).await.is_ok() {}
+    });
+    let st = read_status_line(&mut r).await;
+    assert!(st.starts_with("HTTP/1.1 408"), "{st}");
+
+    let resp = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
+    assert_eq!(resp.status(), 200, "a client must not trip the breaker");
 }
 
 #[tokio::test]

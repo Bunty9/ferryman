@@ -250,6 +250,11 @@ where
     // sections only.
     let table = table.load_full();
 
+    if bad_path(req.uri().path()) {
+        record(started, "none", "none", 400);
+        return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
+    }
+
     let Some(route) = table.lookup(req.uri().path()) else {
         record(started, "none", "none", 404);
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
@@ -601,6 +606,34 @@ fn record(started: Instant, route: &str, upstream: &str, status: u16) {
     .record(started.elapsed().as_secs_f64());
 }
 
+/// F5: true if `path` could be read as a dot segment (`.`/`..`, also
+/// `%2e`-encoded, or with a `;param` suffix as Tomcat does) or hides an
+/// encoded or literal slash/backslash. Detection only; the forwarded path is
+/// never rewritten. Not covered: double encoding (`%252e`), which only a
+/// decoding upstream would act on twice.
+fn bad_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    if b.contains(&b'\\')
+        || b.windows(3)
+            .any(|w| w[0] == b'%' && matches!(&w[1..], b"2f" | b"2F" | b"5c" | b"5C"))
+    {
+        return true;
+    }
+    path.split('/').any(|seg| {
+        let b = seg.split(';').next().unwrap_or("").as_bytes();
+        let (mut i, mut dots) = (0, 0);
+        while i < b.len() {
+            match b[i..] {
+                [b'.', ..] => i += 1,
+                [b'%', b'2', b'e' | b'E', ..] => i += 3,
+                _ => return false,
+            }
+            dots += 1;
+        }
+        matches!(dots, 1 | 2)
+    })
+}
+
 fn error_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
@@ -617,6 +650,50 @@ fn full_body(body: impl Into<Bytes>) -> ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dot_segments_are_rejected() {
+        for p in [
+            "/api/../admin",
+            "/api/%2e%2e/admin",
+            "/api/..%2fadmin",
+            "/api/./../admin",
+            "/api/..",
+            "/api/%2E%2E/x",
+            "/api/a%2Fb",
+            "/api/%2e%2E/x",
+            "/api/.%2e/x",
+            "/api/..;/admin",
+            "/api/.;x/y",
+            "/api/%2e%2e;/x",
+            "/api/a%5cb",
+            "/api/a%5Cb",
+            "/api/a\\b",
+            "/api/%2e/x",
+            "/..",
+        ] {
+            assert!(bad_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn legitimate_paths_are_allowed() {
+        for p in [
+            "/a..b/",
+            "/.well-known/acme",
+            "/file.tar.gz",
+            "/api/v1.2/x",
+            "/",
+            "/api/...",
+            "/api/a;..",
+            "/api/%2e%2e%2e/x",
+            "/api/%41/x",
+            "/api/.a/x",
+            "/api/a%2/",
+        ] {
+            assert!(!bad_path(p), "{p}");
+        }
+    }
 
     fn tp(c: &[&str]) -> TrustedProxies {
         TrustedProxies::parse(c).unwrap()

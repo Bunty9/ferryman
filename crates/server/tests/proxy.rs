@@ -873,3 +873,58 @@ async fn legacy_handle_and_proxy_client_still_work() {
     let resp = reqwest::get(format!("http://{addr}/svc-a")).await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "legacy");
 }
+
+#[tokio::test]
+async fn dot_segments_get_400_and_never_reach_upstream() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |req| {
+        h.fetch_add(1, Ordering::SeqCst);
+        echo(req)
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let get = |path: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    };
+
+    for p in [
+        "/api/../admin",
+        "/api/%2e%2E/admin",
+        "/api/..%2fadmin",
+        "/api/..;/admin",
+        "/api/a%5cb",
+        "/api/x?q=/../ok-in-query-only/../",
+    ] {
+        let out = get(p).await;
+        if p.contains('?') {
+            assert!(out.starts_with("HTTP/1.1 200"), "{p}: {out}");
+            continue;
+        }
+        assert!(out.starts_with("HTTP/1.1 400"), "{p}: {out}");
+        assert!(out.ends_with("bad path\n"), "{p}: {out}");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "only the query-only request"
+    );
+
+    for p in ["/api/.well-known/x", "/api/a..b/"] {
+        let out = get(p).await;
+        assert!(out.starts_with("HTTP/1.1 200"), "{p}: {out}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}

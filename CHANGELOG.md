@@ -7,6 +7,17 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Security
+
+- Requests whose path contains a dot segment (`.` or `..`, including
+  percent-encoded `%2e` forms and `..;` path-parameter forms), an encoded
+  slash or backslash (`%2f`, `%5c`), or a literal backslash now get 400
+  `bad path` before routing and are never forwarded (F5). Previously
+  `/api/../admin` was forwarded verbatim and an upstream that normalises it
+  could serve paths outside the routed prefix. **Behaviour change:** clients
+  relying on `..` passthrough now get 400. The forwarded path is never
+  rewritten; the query string is not inspected.
+
 ### Fixed
 
 - Long uploads no longer fail with 504: `upstream_timeout_secs` used to cover

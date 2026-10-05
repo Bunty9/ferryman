@@ -206,6 +206,7 @@ hot reload.
 | Situation                                              | Response | Counts against breaker |
 | ------------------------------------------------------ | -------- | ---------------------- |
 | No route matches                                       | 404      | —                      |
+| Path has a `.`/`..` segment (also `%2e`, `..;`), an encoded or literal `\\`, or an encoded `/` | 400 (`bad path`) | no |
 | Circuit open                                           | 503      | —                      |
 | `Upgrade` / `CONNECT` (e.g. WebSocket)                 | 501      | —                      |
 | Connect / transport error                              | 502      | yes                    |

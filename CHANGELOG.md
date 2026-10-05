@@ -7,13 +7,17 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-05
+
+Prebuilt binaries. No API or proxy-behaviour changes on Unix.
+
 ### Added
 
 - Prebuilt binaries attached to GitHub releases (`.tar.gz`, `.zip` on
   Windows) with a combined `SHA256SUMS` and per-archive `.sha256` files.
   Required: Linux musl x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64
   (MSVC). Best effort: ARM/i686 musl, riscv64 gnu, FreeBSD, Windows aarch64.
-- `cargo binstall ferryman` metadata (applies from the first release that ships it) (`[package.metadata.binstall]`).
+- `cargo binstall ferryman` metadata (`[package.metadata.binstall]`), used from 0.2.2 on.
 - Windows support: Ctrl-C drains gracefully; console close / system
   shutdown starts the drain, but Windows terminates the process after
   about 5 s (previously Unix-only signal handling).
@@ -103,7 +107,8 @@ First public release.
 - Prometheus metrics on a separate listener.
 - `echo_upstream` example for local benchmarking.
 
-[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Bunty9/ferryman/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Bunty9/ferryman/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Bunty9/ferryman/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Bunty9/ferryman/releases/tag/v0.1.0

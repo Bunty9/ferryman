@@ -4,8 +4,13 @@ use std::net::IpAddr;
 
 /// A set of CIDR ranges (`10.0.0.0/8`, `fd00::/8`, a bare address means a
 /// single host) naming peers whose forwarding headers may be believed.
-/// An IPv4 peer seen as IPv4-mapped IPv6 (`::ffff:a.b.c.d`) matches IPv4
-/// ranges.
+///
+/// IPv4 clients, including IPv4-mapped IPv6 peers (`::ffff:a.b.c.d`), are
+/// matched only by IPv4 ranges, so `::/0` does not trust IPv4 clients (use
+/// `0.0.0.0/0` for those). Host bits are ignored (`10.0.0.1/8` equals
+/// `10.0.0.0/8`). An IPv4-mapped IPv6 range is only accepted with a prefix
+/// of at least 96 (`::ffff:10.0.0.0/104` means `10.0.0.0/8`); shorter
+/// prefixes are rejected as ambiguous.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedProxies {
     nets: Vec<(IpAddr, u8)>,
@@ -27,11 +32,11 @@ fn bits(ip: IpAddr) -> (u128, u8) {
 
 impl TrustedProxies {
     /// Parse CIDR strings. Errors name the offending entry.
-    pub fn parse<S: AsRef<str>>(cidrs: &[S]) -> Result<Self, String> {
+    pub fn parse<S: AsRef<str>>(cidrs: &[S]) -> anyhow::Result<Self> {
         let mut nets = Vec::with_capacity(cidrs.len());
         for raw in cidrs {
             let raw = raw.as_ref();
-            let bad = |why: &str| format!("trusted_proxies entry {raw:?}: {why}");
+            let bad = |why: &str| anyhow::anyhow!("trusted_proxies entry {raw:?}: {why}");
             let (addr, prefix) = match raw.split_once('/') {
                 Some((a, p)) => (a, Some(p)),
                 None => (raw, None),
@@ -40,15 +45,18 @@ impl TrustedProxies {
             let max = if ip.is_ipv4() { 32 } else { 128 };
             let len = match prefix {
                 None => max,
-                Some(p) => p
-                    .parse::<u8>()
-                    .ok()
+                Some(p) => Some(p)
+                    .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|p| p.parse::<u8>().ok())
                     .filter(|l| *l <= max)
                     .ok_or_else(|| bad(&format!("prefix length must be 0..={max}")))?,
             };
             // `::ffff:a.b.c.d/N` (N >= 96) is the IPv4 range a.b.c.d/(N-96).
             let net = match (normalise(ip), ip) {
                 (IpAddr::V4(v4), IpAddr::V6(_)) if len >= 96 => (IpAddr::V4(v4), len - 96),
+                (IpAddr::V4(_), IpAddr::V6(_)) => {
+                    return Err(bad("IPv4-mapped IPv6 range needs prefix length >= 96"))
+                }
                 _ => (ip, len),
             };
             nets.push(net);
@@ -137,6 +145,12 @@ mod tests {
     }
 
     #[test]
+    fn host_bits_ignored_and_v6_zero_excludes_v4() {
+        assert!(tp(&["10.0.0.1/8"]).contains(ip("10.9.9.9")));
+        assert!(!tp(&["::/0"]).contains(ip("::ffff:8.8.8.8")));
+    }
+
+    #[test]
     fn empty_trusts_nobody() {
         let t = TrustedProxies::default();
         assert!(t.is_empty());
@@ -158,7 +172,7 @@ mod tests {
             "10.0.0.0/8/8",
             "example.com",
         ] {
-            let err = TrustedProxies::parse(&[bad]).unwrap_err();
+            let err = TrustedProxies::parse(&[bad]).unwrap_err().to_string();
             assert!(
                 err.contains("trusted_proxies") && err.contains(bad),
                 "{err}"

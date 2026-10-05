@@ -23,15 +23,19 @@ default_cooldown_secs = 30
 # default) -> 75; GCLB (fixed 600 s) -> 620; direct exposure -> keep 10.
 # The first request on a new connection stays bounded at 10 s regardless,
 # but a large value also widens the header-read window on reused connections.
-# (Parsed and validated; applied to connections in a later release step.)
+# (Parsed and validated; not yet applied by the server.)
 # keepalive_timeout_secs = 10
 
 # Longest gap between request-body frames before a stalled upload is given
 # up on, in seconds (1..=86400). Default 30.
+# (Parsed and validated; not yet applied by the server.)
 # request_body_idle_timeout_secs = 30
 
 # Peers (CIDR ranges or bare IPs, IPv4 and IPv6) whose forwarding headers
 # (X-Forwarded-Proto etc.) are believed. Default empty = trust nobody.
+# IPv4 clients (also IPv4-mapped IPv6 peers) match only IPv4 ranges, so
+# "::/0" does not trust them; host bits are ignored (10.0.0.1/8 = 10.0.0.0/8).
+# (Parsed and validated; not yet applied by the server.)
 # trusted_proxies = ["10.0.0.0/8", "fd00::/8"]
 
 # Every *_secs key above (and per-route cooldown_secs) must be <= 86400.

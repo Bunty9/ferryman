@@ -95,8 +95,8 @@ impl RouteTable {
         Self {
             routes,
             upstream_timeout,
-            keepalive_timeout: Duration::from_secs(10),
-            request_body_idle_timeout: Duration::from_secs(30),
+            keepalive_timeout: Duration::from_secs(crate::config::DEFAULT_KEEPALIVE_SECS),
+            request_body_idle_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_IDLE_SECS),
             trusted_proxies: TrustedProxies::default(),
         }
     }

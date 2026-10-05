@@ -54,11 +54,13 @@ fn default_failure_threshold() -> u32 {
 fn default_upstream_timeout() -> u64 {
     30
 }
+pub(crate) const DEFAULT_KEEPALIVE_SECS: u64 = 10;
+pub(crate) const DEFAULT_BODY_IDLE_SECS: u64 = 30;
 fn default_keepalive_timeout() -> u64 {
-    10
+    DEFAULT_KEEPALIVE_SECS
 }
 fn default_body_idle_timeout() -> u64 {
-    30
+    DEFAULT_BODY_IDLE_SECS
 }
 
 /// Upper bound for every duration key, so `Duration` arithmetic can't overflow.
@@ -115,8 +117,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
             bail!("{key} must be <= {MAX_SECS}, got {v}");
         }
     }
-    let trusted_proxies =
-        TrustedProxies::parse(&cfg.trusted_proxies).map_err(anyhow::Error::msg)?;
+    let trusted_proxies = TrustedProxies::parse(&cfg.trusted_proxies)?;
 
     let default_cooldown = Duration::from_secs(cfg.default_cooldown_secs);
     let upstream_timeout = Duration::from_secs(cfg.upstream_timeout_secs);
@@ -160,7 +161,11 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
                 r.upstream
             ),
         }
-        if uri.host().is_none_or(str::is_empty) {
+        // Also catches an empty IPv6 literal (`http://[]:80`).
+        if uri
+            .host()
+            .is_none_or(|h| h.trim_matches(['[', ']']).is_empty())
+        {
             bail!(
                 "route {:?}: upstream {:?} has no host",
                 r.prefix,
@@ -401,7 +406,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_upstream_host() {
-        for up in ["http://:80", "http://"] {
+        for up in ["http://:80", "http://", "http://[]:80", "http://@:80"] {
             let err = build_table(cfg(vec![route("/a", up)]), None)
                 .err()
                 .expect(up);

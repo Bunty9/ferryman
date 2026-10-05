@@ -30,7 +30,8 @@ accept ── set TCP_NODELAY
   ├─ TLS? handshake (10s deadline)
   │
   ├─ hyper-util auto builder (HTTP/1.1 or HTTP/2)
-  │    first request must arrive within 10s, each h1 head within 10s
+  │    first request must arrive within 10s; later h1 heads within
+  │    `keepalive_timeout_secs` (default 10)
   │
   └─ proxy::handle
        1. table.load_full()             one Arc for the whole request
@@ -137,8 +138,9 @@ swap) are not seen by the watcher.
 
 - TLS handshake: 10s. First request on a connection: 10s (covers the
   auto builder's h1/h2 sniff, which has no deadline of its own, and
-  clients idling after a handshake). HTTP/1 header read, including idle
-  keep-alive: 10s. HTTP/2: keep-alive ping every 30s.
+  clients idling after a handshake). Later HTTP/1 request heads, including
+  idle keep-alive: `keepalive_timeout_secs` (default 10; also caps the
+  first request's head when below 10s). HTTP/2: keep-alive ping every 30s.
 - Accept errors (e.g. `EMFILE`) are logged; the loop sleeps 100ms and
   continues.
 - On SIGINT/SIGTERM the listener closes, `GracefulShutdown` asks open

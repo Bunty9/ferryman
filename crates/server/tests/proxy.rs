@@ -443,8 +443,28 @@ async fn keepalive_timeout_is_configurable() {
         if s.write_all(req).await.is_err() {
             return false;
         }
+        // Read the whole response (head + Content-Length body) so a split
+        // write can't leave a stray byte that makes a closed socket look open.
+        let mut data = Vec::new();
         let mut buf = [0u8; 1024];
-        matches!(s.read(&mut buf).await, Ok(n) if n > 0)
+        loop {
+            match s.read(&mut buf).await {
+                Ok(n) if n > 0 => data.extend_from_slice(&buf[..n]),
+                _ => return false,
+            }
+            let text = String::from_utf8_lossy(&data).to_lowercase();
+            if let Some(i) = text.find("\r\n\r\n") {
+                let len = text[..i]
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|r| r.lines().next())
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if data.len() >= i + 4 + len {
+                    return true;
+                }
+            }
+        }
     }
 
     for (keepalive, expect_open) in [(2, false), (5, true)] {

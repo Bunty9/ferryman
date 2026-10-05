@@ -195,8 +195,10 @@ the socket and return 502. Set `keepalive_timeout_secs` accordingly:
 | Direct clients | keep the default `10`. |
 
 The first request on a new connection is always bounded at 10 s. A larger
-value also widens the header-read window on reused connections. Changes
-apply to new connections on hot reload.
+value also widens the header-read window on reused connections: a client
+can send one request and then hold the connection for up to this value, so
+raise it only behind a load balancer. Changes apply to new connections on
+hot reload.
 
 ## Behaviour
 
@@ -214,8 +216,9 @@ apply to new connections on hot reload.
 Request and response bodies are streamed, never buffered. Hop-by-hop
 headers are stripped both ways; `x-forwarded-for` and `x-forwarded-proto`
 are set; the client's `Host` is kept (HTTP/2 `:authority` becomes `Host`).
-Upstreams always get HTTP/1.1. Slow clients are cut off after 10s of
-header reading or TLS handshake. SIGINT/SIGTERM stop accepting and drain
+Upstreams always get HTTP/1.1. The TLS handshake and the first request on a
+connection must complete within 10s; later HTTP/1 request heads are bounded
+by `keepalive_timeout_secs` (default 10). SIGINT/SIGTERM stop accepting and drain
 in-flight connections for up to 25s.
 
 ## Metrics endpoints

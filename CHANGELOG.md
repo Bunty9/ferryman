@@ -9,14 +9,17 @@ and `ferryman` are released together with the same version.
 
 ### Security
 
-- Requests whose path contains a dot segment (`.` or `..`, including
-  percent-encoded `%2e` forms and `..;` path-parameter forms), an encoded
-  slash or backslash (`%2f`, `%5c`), or a literal backslash now get 400
-  `bad path` before routing and are never forwarded (F5). Previously
-  `/api/../admin` was forwarded verbatim and an upstream that normalises it
-  could serve paths outside the routed prefix. **Behaviour change:** clients
-  relying on `..` passthrough now get 400. The forwarded path is never
-  rewritten; the query string is not inspected.
+- Requests whose path contains a dot segment now get 400 `bad path` before
+  routing and are never forwarded (F5). Previously `/api/../admin` was
+  forwarded verbatim and an upstream that normalises it could serve paths
+  outside the routed prefix. Rejected: `.`/`..` segments, including
+  `%2e`-encoded and `..;` forms, and including after an encoded or literal
+  separator (`..%2f`, `a%2f..`, `..%5c`, `a\..\b`); plus `%00`, `%u`
+  escapes, and double-encoded dot or slash (`%252e`, `%252f`, `%255c`).
+  Encoded slashes inside an otherwise ordinary segment (e.g. GitLab
+  `group%2Fproject`) remain allowed. **Behaviour change:** clients relying on
+  `..` passthrough now get 400. The forwarded path is never rewritten; the
+  query string is not inspected.
 
 ### Fixed
 

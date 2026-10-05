@@ -905,7 +905,9 @@ async fn dot_segments_get_400_and_never_reach_upstream() {
         "/api/%2e%2E/admin",
         "/api/..%2fadmin",
         "/api/..;/admin",
-        "/api/a%5cb",
+        "/api/a%5c..",
+        "/api/..%2f",
+        "/api/%252e",
         "/api/x?q=/../ok-in-query-only/../",
     ] {
         let out = get(p).await;
@@ -922,9 +924,12 @@ async fn dot_segments_get_400_and_never_reach_upstream() {
         "only the query-only request"
     );
 
-    for p in ["/api/.well-known/x", "/api/a..b/"] {
+    for p in ["/api/.well-known/x", "/api/a..b/", "/api/group%2Fproject"] {
         let out = get(p).await;
         assert!(out.starts_with("HTTP/1.1 200"), "{p}: {out}");
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert!(get("/api/group%2Fproject")
+        .await
+        .contains("GET /api/group%2Fproject"));
+    assert_eq!(hits.load(Ordering::SeqCst), 5);
 }

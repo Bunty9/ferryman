@@ -35,7 +35,8 @@ accept ── set TCP_NODELAY
   │
   └─ proxy::handle
        1. table.load_full()             one Arc for the whole request
-       2. lookup(path)                  none -> 404
+       2. bad_path(path)                dot segments, NUL, %u, double-encoded -> 400
+       2b. lookup(path)                 none -> 404
        3. Upgrade (not h2c) / CONNECT   -> 501
        4. upstream.try_acquire()        None -> 503, else Admission
        5. rewrite request:

@@ -606,32 +606,56 @@ fn record(started: Instant, route: &str, upstream: &str, status: u16) {
     .record(started.elapsed().as_secs_f64());
 }
 
-/// F5: true if `path` could be read as a dot segment (`.`/`..`, also
-/// `%2e`-encoded, or with a `;param` suffix as Tomcat does) or hides an
-/// encoded or literal slash/backslash. Detection only; the forwarded path is
-/// never rewritten. Not covered: double encoding (`%252e`), which only a
-/// decoding upstream would act on twice.
+/// F5: true if `path` could be read as a dot segment by a normalising
+/// upstream. `/`, `\`, `%2f` and `%5c` all count as separators, a `;param`
+/// suffix is ignored per piece (Tomcat), and a piece that is `.` or `..`
+/// (also `%2e`-encoded, any case) is rejected. Encoded separators inside an
+/// otherwise ordinary segment (`group%2Fproject`) are allowed. Also rejected:
+/// `%00`, `%u`/`%U` (non-standard) and double-encoded dot/slash (`%252e`,
+/// `%252f`, `%255c`). Detection only; the forwarded path is never rewritten.
+/// Not covered: overlong UTF-8 (`%c0%ae`) and Windows trailing-dot/space
+/// trimming.
 fn bad_path(path: &str) -> bool {
     let b = path.as_bytes();
-    if b.contains(&b'\\')
-        || b.windows(3)
-            .any(|w| w[0] == b'%' && matches!(&w[1..], b"2f" | b"2F" | b"5c" | b"5C"))
-    {
-        return true;
-    }
-    path.split('/').any(|seg| {
-        let b = seg.split(';').next().unwrap_or("").as_bytes();
-        let (mut i, mut dots) = (0, 0);
-        while i < b.len() {
-            match b[i..] {
-                [b'.', ..] => i += 1,
-                [b'%', b'2', b'e' | b'E', ..] => i += 3,
-                _ => return false,
+    let (mut start, mut i) = (0, 0);
+    while i <= b.len() {
+        let sep = match b[i..] {
+            [] => Some(0),
+            [b'/' | b'\\', ..] => Some(1),
+            [b'%', b'2', b'f' | b'F', ..] | [b'%', b'5', b'c' | b'C', ..] => Some(3),
+            [b'%', b'0', b'0', ..] | [b'%', b'u' | b'U', ..] => return true,
+            [b'%', b'2', b'5', b'2', b'e' | b'E' | b'f' | b'F', ..]
+            | [b'%', b'2', b'5', b'5', b'c' | b'C', ..] => return true,
+            _ => None,
+        };
+        match sep {
+            Some(n) => {
+                if dot_piece(&b[start..i]) {
+                    return true;
+                }
+                i += n.max(1);
+                start = i;
             }
-            dots += 1;
+            None => i += 1,
         }
-        matches!(dots, 1 | 2)
-    })
+    }
+    false
+}
+
+/// `.` or `..` after dropping a `;...` suffix and decoding `%2e`.
+fn dot_piece(piece: &[u8]) -> bool {
+    let end = piece.iter().position(|&c| c == b';').unwrap_or(piece.len());
+    let b = &piece[..end];
+    let (mut i, mut dots) = (0, 0);
+    while i < b.len() {
+        match b[i..] {
+            [b'.', ..] => i += 1,
+            [b'%', b'2', b'e' | b'E', ..] => i += 3,
+            _ => return false,
+        }
+        dots += 1;
+    }
+    matches!(dots, 1 | 2)
 }
 
 fn error_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ResponseBody> {
@@ -660,17 +684,30 @@ mod tests {
             "/api/./../admin",
             "/api/..",
             "/api/%2E%2E/x",
-            "/api/a%2Fb",
             "/api/%2e%2E/x",
             "/api/.%2e/x",
             "/api/..;/admin",
             "/api/.;x/y",
             "/api/%2e%2e;/x",
-            "/api/a%5cb",
-            "/api/a%5Cb",
-            "/api/a\\b",
+            "/api/..%5cx",
+            "/api/..%5Cx",
+            "/api/a\\..\\b",
             "/api/%2e/x",
             "/..",
+            "/api/a%2f..",
+            "/api/%2e%2e%2f",
+            "/api/..%00",
+            "/api/.%00.",
+            "/api/%u002e%u002e",
+            "/api/%U002e",
+            "/api/%252e%252e",
+            "/api/%252E",
+            "/api/%252f",
+            "/api/%252F",
+            "/api/%255c",
+            "/api/a%00b",
+            "/api/a%5c..",
+            "/api/a%5C..%5Cb",
         ] {
             assert!(bad_path(p), "{p}");
         }
@@ -690,6 +727,13 @@ mod tests {
             "/api/%41/x",
             "/api/.a/x",
             "/api/a%2/",
+            "/api/v4/projects/group%2Fproject",
+            "/api/queues/%2F/q",
+            "/@scope%2fpkg",
+            "/%2F",
+            "/api/%25",
+            "/api/100%25",
+            "/api/%c0%ae",
         ] {
             assert!(!bad_path(p), "{p}");
         }

@@ -32,6 +32,12 @@ default_cooldown_secs = 30
 # upstream_timeout_secs only starts once the request body is fully sent.
 # request_body_idle_timeout_secs = 30
 
+# Total time a client may take to send a request body, in seconds
+# (1..=86400). Default 300. Bounds slow-trickle uploads that keep resetting
+# the idle timeout; exceeding it gets 408 (no breaker effect). Not required
+# to be >= the idle timeout: whichever fires first wins.
+# request_body_timeout_secs = 300
+
 # Peers (CIDR ranges or bare IPs, IPv4 and IPv6) whose forwarding headers
 # are passed through: X-Forwarded-Proto, X-Forwarded-Host and Forwarded are
 # kept. X-Real-IP is always set by ferryman (the rightmost X-Forwarded-For

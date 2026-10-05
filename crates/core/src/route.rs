@@ -86,6 +86,7 @@ pub struct RouteTable {
     pub upstream_timeout: Duration,
     keepalive_timeout: Duration,
     request_body_idle_timeout: Duration,
+    request_body_timeout: Duration,
     trusted_proxies: TrustedProxies,
 }
 
@@ -97,6 +98,7 @@ impl RouteTable {
             upstream_timeout,
             keepalive_timeout: Duration::from_secs(crate::config::DEFAULT_KEEPALIVE_SECS),
             request_body_idle_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_IDLE_SECS),
+            request_body_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_TOTAL_SECS),
             trusted_proxies: TrustedProxies::default(),
         }
     }
@@ -115,6 +117,13 @@ impl RouteTable {
         self
     }
 
+    /// Set the total time allowed to receive a request body (config
+    /// `request_body_timeout_secs`; default 300 s).
+    pub fn with_request_body_timeout(mut self, d: Duration) -> Self {
+        self.request_body_timeout = d;
+        self
+    }
+
     /// Set the trusted proxy ranges (config `trusted_proxies`; default empty).
     pub fn with_trusted_proxies(mut self, t: TrustedProxies) -> Self {
         self.trusted_proxies = t;
@@ -129,6 +138,11 @@ impl RouteTable {
     /// Longest gap between request-body frames before a stalled upload is dropped.
     pub fn request_body_idle_timeout(&self) -> Duration {
         self.request_body_idle_timeout
+    }
+
+    /// Total time a client may take to send its request body.
+    pub fn request_body_timeout(&self) -> Duration {
+        self.request_body_timeout
     }
 
     /// Peers whose forwarding headers may be trusted.

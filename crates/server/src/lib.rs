@@ -10,6 +10,7 @@ pub mod reload;
 pub mod tls;
 
 use ferryman_core::SharedTable;
+use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -24,9 +25,17 @@ use tls::MaybeTlsStream;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// Shared hyper client used to forward requests to upstreams. Bodies are
-/// streamed straight through (`RequestBody` wraps the inbound `Incoming`), no buffering.
-pub type ProxyClient = Client<HttpConnector, proxy::RequestBody>;
+/// The 0.2.2 client type, kept for compatibility with [`proxy::handle`].
+#[deprecated(
+    since = "0.2.3",
+    note = "use `StreamingClient` with `proxy::handle_streaming`"
+)]
+pub type ProxyClient = Client<HttpConnector, Incoming>;
+
+/// Shared hyper client used by [`serve`] to forward requests to upstreams.
+/// Bodies are streamed straight through, no buffering; the request body is the request body is
+/// wrapped in [`proxy::RequestBody`] (idle timeout, end-of-body signal).
+pub type StreamingClient = Client<HttpConnector, proxy::RequestBody>;
 
 /// Latency buckets (seconds) for `ferryman_request_duration_seconds`,
 /// spanning sub-millisecond proxy hops up to `upstream_timeout_secs`'s
@@ -66,7 +75,7 @@ pub async fn serve(
     // Streamed bodies are many small writes; Nagle + delayed ACK would add
     // ~40ms stalls.
     connector.set_nodelay(true);
-    let client: ProxyClient = Client::builder(TokioExecutor::new()).build(connector);
+    let client: StreamingClient = Client::builder(TokioExecutor::new()).build(connector);
     let mut builder = HttpAutoBuilder::new(TokioExecutor::new());
     builder.http1().timer(TokioTimer::new());
     builder
@@ -129,7 +138,7 @@ pub async fn serve(
                     let seen = seen_request.clone();
                     let svc = service_fn(move |req| {
                         seen.store(true, Ordering::Relaxed);
-                        proxy::handle(table.clone(), client.clone(), peer, proto, req)
+                        proxy::handle_streaming(table.clone(), client.clone(), peer, proto, req)
                     });
                     let conn = watcher.watch(builder.serve_connection(io, svc));
                     tokio::pin!(conn);

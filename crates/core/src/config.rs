@@ -39,6 +39,10 @@ pub struct ConfigToml {
     /// Longest gap between request-body frames, in seconds (1..=86400).
     #[serde(default = "default_body_idle_timeout")]
     pub request_body_idle_timeout_secs: u64,
+    /// Total time allowed to receive a request body, in seconds (1..=86400).
+    /// Not required to be >= the idle timeout; whichever fires first wins.
+    #[serde(default = "default_body_timeout")]
+    pub request_body_timeout_secs: u64,
     pub routes: Vec<RouteToml>,
 }
 
@@ -56,6 +60,10 @@ fn default_upstream_timeout() -> u64 {
 }
 pub(crate) const DEFAULT_KEEPALIVE_SECS: u64 = 10;
 pub(crate) const DEFAULT_BODY_IDLE_SECS: u64 = 30;
+pub(crate) const DEFAULT_BODY_TOTAL_SECS: u64 = 300;
+fn default_body_timeout() -> u64 {
+    DEFAULT_BODY_TOTAL_SECS
+}
 fn default_keepalive_timeout() -> u64 {
     DEFAULT_KEEPALIVE_SECS
 }
@@ -109,6 +117,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
             "request_body_idle_timeout_secs",
             cfg.request_body_idle_timeout_secs,
         ),
+        ("request_body_timeout_secs", cfg.request_body_timeout_secs),
     ] {
         if v == 0 {
             bail!("{key} must be >= 1");
@@ -236,6 +245,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
     Ok(RouteTable::new(routes, upstream_timeout)
         .with_keepalive_timeout(Duration::from_secs(cfg.keepalive_timeout_secs))
         .with_request_body_idle_timeout(Duration::from_secs(cfg.request_body_idle_timeout_secs))
+        .with_request_body_timeout(Duration::from_secs(cfg.request_body_timeout_secs))
         .with_trusted_proxies(trusted_proxies))
 }
 
@@ -253,6 +263,7 @@ mod tests {
             keepalive_timeout_secs: 10,
             trusted_proxies: Vec::new(),
             request_body_idle_timeout_secs: 30,
+            request_body_timeout_secs: 300,
             routes,
         }
     }
@@ -429,6 +440,7 @@ mod tests {
             "default_cooldown_secs",
             "keepalive_timeout_secs",
             "request_body_idle_timeout_secs",
+            "request_body_timeout_secs",
         ] {
             assert!(parse(&format!("{key} = 86400")).is_ok(), "{key} at bound");
             let err = parse(&format!("{key} = 86401")).err().expect(key);
@@ -446,6 +458,7 @@ mod tests {
         let t = parse("").unwrap();
         assert_eq!(t.keepalive_timeout(), Duration::from_secs(10));
         assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(30));
+        assert_eq!(t.request_body_timeout(), Duration::from_secs(300));
         assert!(t.trusted_proxies().is_empty());
 
         let t = parse(
@@ -462,7 +475,11 @@ mod tests {
 
     #[test]
     fn rejects_zero_new_keys_and_bad_cidr() {
-        for key in ["keepalive_timeout_secs", "request_body_idle_timeout_secs"] {
+        for key in [
+            "keepalive_timeout_secs",
+            "request_body_idle_timeout_secs",
+            "request_body_timeout_secs",
+        ] {
             assert!(parse(&format!("{key} = 0")).is_err());
         }
         let err = parse("trusted_proxies = [\"10.0.0.0/33\"]").err().unwrap();

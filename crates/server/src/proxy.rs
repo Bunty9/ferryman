@@ -19,7 +19,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::time::Sleep;
 
+#[allow(deprecated)]
 use crate::ProxyClient;
+use crate::StreamingClient;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
 
 /// One response body type for both streamed upstream responses and locally
 /// generated ones (404/502/503/504), so `handle`'s return type doesn't leak
@@ -35,6 +39,7 @@ pub struct RequestBody {
     inner: Incoming,
     idle: Duration,
     sleep: Pin<Box<Sleep>>,
+    total: Pin<Box<Sleep>>,
     eos: Option<oneshot::Sender<()>>,
 }
 
@@ -49,13 +54,25 @@ impl std::fmt::Display for BodyIdleTimeout {
 }
 impl std::error::Error for BodyIdleTimeout {}
 
+/// The client took longer than `request_body_timeout_secs` to send its body.
+#[derive(Debug)]
+pub struct BodyTotalTimeout;
+
+impl std::fmt::Display for BodyTotalTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body total timeout")
+    }
+}
+impl std::error::Error for BodyTotalTimeout {}
+
 impl RequestBody {
-    fn new(inner: Incoming, idle: Duration) -> (Self, oneshot::Receiver<()>) {
+    fn new(inner: Incoming, idle: Duration, total: Duration) -> (Self, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
         let mut b = Self {
             inner,
             idle,
             sleep: Box::pin(tokio::time::sleep(idle)),
+            total: Box::pin(tokio::time::sleep(total)),
             eos: Some(tx),
         };
         b.signal_if_done();
@@ -80,6 +97,11 @@ impl Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
+        // Polled on every call (not just when Pending) so a trickling client
+        // can't keep resetting the idle timer past the total cap.
+        if this.total.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
+        }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 this.sleep
@@ -136,6 +158,31 @@ const HOP_BY_HOP_HEADERS: [HeaderName; 8] = [
 ///
 /// `proto` is `"http"` or `"https"`, reflecting whether this connection was
 /// TLS-terminated, and is forwarded as `x-forwarded-proto`.
+///
+/// This is the streaming handler: `upstream_timeout_secs` starts once the
+/// request body is complete, and `request_body_idle_timeout_secs` applies.
+pub async fn handle_streaming(
+    table: SharedTable,
+    client: StreamingClient,
+    peer: SocketAddr,
+    proto: &'static str,
+    req: Request<Incoming>,
+) -> Result<Response<ResponseBody>, Infallible> {
+    let wrap = |body, idle, total| {
+        let (b, rx) = RequestBody::new(body, idle, total);
+        (b, Some(rx))
+    };
+    handle_inner(table, client, peer, proto, req, wrap).await
+}
+
+/// The 0.2.2 handler, kept for compatibility: `upstream_timeout_secs` covers
+/// the whole request including the body upload, no body idle timeout, and a
+/// timeout counts against the breaker only for bodyless requests.
+#[deprecated(
+    since = "0.2.3",
+    note = "long uploads can 504; use `handle_streaming` with a `StreamingClient`"
+)]
+#[allow(deprecated)]
 pub async fn handle(
     table: SharedTable,
     client: ProxyClient,
@@ -143,6 +190,24 @@ pub async fn handle(
     proto: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    handle_inner(table, client, peer, proto, req, |b, _, _| (b, None)).await
+}
+
+/// Shared core. `wrap` turns the inbound body into the client's body type and
+/// optionally returns an end-of-body signal; without one (legacy), the
+/// upstream timeout starts immediately and only counts for bodyless requests.
+async fn handle_inner<B>(
+    table: SharedTable,
+    client: Client<HttpConnector, B>,
+    peer: SocketAddr,
+    proto: &'static str,
+    req: Request<Incoming>,
+    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<oneshot::Receiver<()>>),
+) -> Result<Response<ResponseBody>, Infallible>
+where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let started = Instant::now();
     // `load_full` (not `load`) because the returned `Arc` is held across
     // `.await` points below; `load`'s guard is meant for short critical
@@ -183,7 +248,13 @@ pub async fn handle(
     let (mut parts, body) = req.into_parts();
     // `upstream_timeout` starts at end-of-request-body (immediately when
     // bodyless), so a slow upload can't be mistaken for a slow upstream.
-    let (body, body_done) = RequestBody::new(body, table.request_body_idle_timeout());
+    let bodyless = body.is_end_stream();
+    let (body, body_done) = wrap(
+        body,
+        table.request_body_idle_timeout(),
+        table.request_body_timeout(),
+    );
+    let counts_timeout = bodyless || body_done.is_some();
     strip_hop_by_hop(&mut parts.headers);
     if parts.version == http::Version::HTTP_2 {
         join_cookies(&mut parts.headers);
@@ -230,7 +301,11 @@ pub async fn handle(
     let timer = async move {
         // Sender dropped without EOS (body failed): the request future
         // reports that; never time out the upstream for it.
-        if body_done.await.is_ok() {
+        let started_ok = match body_done {
+            Some(rx) => rx.await.is_ok(),
+            None => true,
+        };
+        if started_ok {
             tokio::time::sleep(upstream_timeout).await;
         } else {
             std::future::pending::<()>().await;
@@ -242,8 +317,11 @@ pub async fn handle(
     };
     match result {
         None => {
-            // The body is fully sent, so this is the upstream's fault.
-            upstream.record_failure(admission);
+            // With EOS tracking the body is fully sent, so this is the
+            // upstream's fault; the legacy path can't tell for bodies.
+            if counts_timeout {
+                upstream.record_failure(admission);
+            }
             record(started, &route_label, &upstream.name, 504);
             Ok(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -251,7 +329,7 @@ pub async fn handle(
             ))
         }
         Some(Err(e)) if is_body_idle_timeout(&e) => {
-            // The client stalled its upload: 408, no breaker effect.
+            // The client stalled or over-ran its upload: 408, no breaker effect.
             tracing::debug!("client request body idle timeout");
             record(started, &route_label, &upstream.name, 408);
             Ok(error_response(
@@ -316,7 +394,7 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 fn is_body_idle_timeout(e: &hyper_util::client::legacy::Error) -> bool {
     let mut source = std::error::Error::source(e);
     while let Some(err) = source {
-        if err.is::<BodyIdleTimeout>() {
+        if err.is::<BodyIdleTimeout>() || err.is::<BodyTotalTimeout>() {
             return true;
         }
         source = err.source();

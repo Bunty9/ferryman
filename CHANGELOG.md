@@ -13,11 +13,29 @@ and `ferryman` are released together with the same version.
   the whole request including streaming the client's body. It now starts when
   the request body is complete (immediately for bodyless requests).
   `request_body_idle_timeout_secs` is now applied: a client that stalls its
-  upload longer than that gets 408, with no breaker effect.
+  upload longer than that gets 408, with no breaker effect. Uploads are now
+  bounded by the new `request_body_timeout_secs` (default 300) instead of
+  `upstream_timeout_secs`; exceeding it also gets 408.
   **Behaviour change:** an upstream timeout after the body completed now
   counts as a breaker failure for requests with bodies too (previously only
   bodyless requests counted).
-  `ferryman::ProxyClient` is now `Client<HttpConnector, proxy::RequestBody>`.
+  `ferryman::serve` uses the new streaming path.
+
+### Added
+
+- Config key `request_body_timeout_secs` (default 300, 1..=86400) and
+  `RouteTable::request_body_timeout()` / `with_request_body_timeout()`:
+  total cap on receiving a request body (streaming path only).
+- `ferryman::StreamingClient`, `ferryman::proxy::handle_streaming` and
+  `ferryman::proxy::RequestBody` (idle-timeout and end-of-body-signalling
+  request body) for embedders.
+
+### Deprecated
+
+- `ferryman::ProxyClient` and `ferryman::proxy::handle` keep their 0.2.2
+  signature and old timeout semantics (whole-request timeout; a timeout on a
+  request with a body does not count against the breaker). Use
+  `StreamingClient` / `handle_streaming`.
 
 ### Security
 

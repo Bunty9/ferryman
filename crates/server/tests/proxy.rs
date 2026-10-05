@@ -403,7 +403,7 @@ async fn client_abort_mid_body_does_not_trip_breaker() {
     assert_eq!(resp.status(), 200, "breaker must not open on client aborts");
 }
 
-async fn read_status_line(s: &mut tokio::net::TcpStream) -> String {
+async fn read_status_line(s: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -466,6 +466,43 @@ async fn stalled_upload_is_408_and_does_not_trip_breaker() {
         .unwrap();
     let status = read_status_line(&mut s).await;
     assert!(status.starts_with("HTTP/1.1 408"), "{status}");
+
+    let resp = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
+    assert_eq!(resp.status(), 200, "breaker must stay closed");
+}
+
+#[tokio::test]
+async fn trickled_upload_hits_total_cap_with_408() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "request_body_timeout_secs = 2\nrequest_body_idle_timeout_secs = 1\nfailure_threshold = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+
+    let s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let (mut r, mut w) = s.into_split();
+    w.write_all(b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\n")
+        .await
+        .unwrap();
+    // One byte every 0.5 s (inside the idle timeout) for 4 s.
+    tokio::spawn(async move {
+        for _ in 0..8 {
+            if w.write_all(b"x").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+    let start = std::time::Instant::now();
+    let status = read_status_line(&mut r).await;
+    assert!(status.starts_with("HTTP/1.1 408"), "{status}");
+    assert!(
+        start.elapsed() < Duration::from_millis(3200),
+        "{:?}",
+        start.elapsed()
+    );
 
     let resp = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
     assert_eq!(resp.status(), 200, "breaker must stay closed");
@@ -703,4 +740,32 @@ async fn hot_reload_picks_up_new_routes_via_rename_replace() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 0.2.2-style embedding (old client type + `proxy::handle`) must keep compiling
+/// and working.
+#[tokio::test]
+#[allow(deprecated)]
+async fn legacy_handle_and_proxy_client_still_work() {
+    use hyper_util::rt::TokioExecutor;
+
+    let upstream = spawn_stub(|_req| async { ok("legacy") }).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let client: ferryman::ProxyClient =
+        hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let svc = service_fn(move |req| {
+            ferryman::proxy::handle(table.clone(), client.clone(), peer, "http", req)
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), svc)
+            .await;
+    });
+    let resp = reqwest::get(format!("http://{addr}/svc-a")).await.unwrap();
+    assert_eq!(resp.text().await.unwrap(), "legacy");
 }

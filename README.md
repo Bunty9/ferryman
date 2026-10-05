@@ -164,6 +164,7 @@ fail loudly instead of silently falling back to defaults.
 | `upstream_timeout_secs`          | 30      | Time allowed for an upstream to send response headers.                           |
 | `keepalive_timeout_secs`         | 10      | HTTP/1 keep-alive idle timeout, 1-86400 (ALB: 75, GCLB: 620).                    |
 | `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
+| `request_body_timeout_secs`      | 300     | Total time to receive a request body, 1-86400 (408 when exceeded).               |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
 | `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`).                       |
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
@@ -210,7 +211,7 @@ hot reload.
 | Connect / transport error                              | 502      | yes                    |
 | No response headers within `upstream_timeout_secs` of the request body completing (of the request start if bodyless) | 504 | yes |
 | Client's request body fails mid-upload                 | 400      | no                     |
-| Client stalls its upload for `request_body_idle_timeout_secs` | 408 | no                |
+| Client stalls its upload for `request_body_idle_timeout_secs`, or exceeds `request_body_timeout_secs` in total | 408 | no |
 | Upstream answers 502/503/504                           | passed through | yes              |
 | Anything else from upstream                            | passed through | success          |
 

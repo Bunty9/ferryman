@@ -9,6 +9,12 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- `keepalive_timeout_secs` is now applied: it is the HTTP/1 keep-alive idle
+  timeout (hyper `header_read_timeout`), read per connection so hot reload
+  affects new connections. Default stays 10 s; the first request on a
+  connection is still bounded at 10 s. See README "Running behind a load
+  balancer" for ALB/GCLB values.
+
 - New optional config keys `keepalive_timeout_secs` (default 10),
   `request_body_idle_timeout_secs` (default 30) and `trusted_proxies`
   (default empty), validated at load and exposed on `RouteTable`

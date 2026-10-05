@@ -23,7 +23,7 @@ default_cooldown_secs = 30
 # default) -> 75; GCLB (fixed 600 s) -> 620; direct exposure -> keep 10.
 # The first request on a new connection stays bounded at 10 s regardless,
 # but a large value also widens the header-read window on reused connections.
-# (Parsed and validated; not yet applied by the server.)
+# Hot reload applies it to new connections only.
 # keepalive_timeout_secs = 10
 
 # Longest gap between request-body frames before a stalled upload is given

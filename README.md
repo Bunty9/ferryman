@@ -182,6 +182,22 @@ CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
 (`FERRYMAN_METRICS_BIND`, `0.0.0.0:9090`), `--tls-cert` / `--tls-key`
 (`FERRYMAN_TLS_CERT` / `FERRYMAN_TLS_KEY`).
 
+## Running behind a load balancer
+
+An LB that reuses backend connections needs ferryman to keep them open
+longer than the LB does, or it may send a request just as ferryman closes
+the socket and return 502. Set `keepalive_timeout_secs` accordingly:
+
+| Load balancer | Setting |
+| ------------- | ------- |
+| AWS ALB       | ALB idle timeout + 15 s: `75` at the default 60 s. (Or set the ALB idle timeout to 9 s or less and keep the default 10.) |
+| Google Cloud LB | `620` (GCLB holds backend connections 600 s). |
+| Direct clients | keep the default `10`. |
+
+The first request on a new connection is always bounded at 10 s. A larger
+value also widens the header-read window on reused connections. Changes
+apply to new connections on hot reload.
+
 ## Behaviour
 
 | Situation                                              | Response | Counts against breaker |

@@ -42,9 +42,9 @@ pub const LATENCY_BUCKETS: &[f64] = &[
 /// `kill_timeout` so the drain finishes before a SIGKILL.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// Deadline for a client to finish the TLS handshake, to send its first
-/// request, and (HTTP/1) to send each complete request head. Stops idle sockets from pinning file
-/// descriptors (slowloris).
+/// Deadline for a client to finish the TLS handshake and to send its first
+/// request. Stops idle sockets from pinning file descriptors (slowloris).
+/// Later HTTP/1 requests are bounded by `keepalive_timeout_secs` instead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// HTTP/2 keep-alive ping interval; a peer that doesn't answer within
@@ -69,10 +69,7 @@ pub async fn serve(
     connector.set_nodelay(true);
     let client: ProxyClient = Client::builder(TokioExecutor::new()).build(connector);
     let mut builder = HttpAutoBuilder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(HANDSHAKE_TIMEOUT);
+    builder.http1().timer(TokioTimer::new());
     builder
         .http2()
         .timer(TokioTimer::new())
@@ -98,7 +95,15 @@ pub async fn serve(
                 let table = table.clone();
                 let client = client.clone();
                 let tls = tls.clone();
-                let builder = builder.clone();
+                // Read per connection: a hot-reloaded `keepalive_timeout_secs`
+                // applies to new connections only. hyper re-arms this timer
+                // when a keep-alive connection goes idle, so it is the idle
+                // timeout; the first request is still capped at
+                // HANDSHAKE_TIMEOUT by `first_request_deadline` below.
+                let mut builder = builder.clone();
+                builder
+                    .http1()
+                    .header_read_timeout(table.load().keepalive_timeout());
                 // Taken before the handshake so a connection accepted just
                 // before shutdown is still drained, but the handshake itself
                 // is bounded so it can't hold the drain open.

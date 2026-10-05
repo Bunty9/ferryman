@@ -431,6 +431,35 @@ async fn idle_connection_is_dropped_after_deadline() {
     assert_eq!(n, 0);
 }
 
+/// Keep-alive idle timeout is configurable: after one request, a connection
+/// idle for 3 s is closed when `keepalive_timeout_secs = 2` and still
+/// reusable when it is 5.
+#[tokio::test]
+async fn keepalive_timeout_is_configurable() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn get(s: &mut tokio::net::TcpStream) -> bool {
+        let req = b"GET /svc-a/x HTTP/1.1\r\nHost: t\r\n\r\n";
+        if s.write_all(req).await.is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 1024];
+        matches!(s.read(&mut buf).await, Ok(n) if n > 0)
+    }
+
+    for (keepalive, expect_open) in [(2, false), (5, true)] {
+        let upstream = spawn_stub(|_req| async { ok("a") }).await;
+        let table = shared_table(parse_cfg(&format!(
+            "keepalive_timeout_secs = {keepalive}\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+        )));
+        let proxy = start_proxy(table).await;
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        assert!(get(&mut s).await, "first request");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(get(&mut s).await, expect_open, "keepalive {keepalive}s");
+    }
+}
+
 #[tokio::test]
 async fn hot_reload_picks_up_new_routes_via_rename_replace() {
     let upstream_a = spawn_stub(|_req| async { ok("a") }).await;

@@ -221,6 +221,17 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    const N: Admission = Admission::Normal;
+    const P: Admission = Admission::Probe;
+
+    fn breaker(cooldown_ms: u64, threshold: u32) -> Breaker {
+        Breaker::new(
+            "test:1".to_string(),
+            Duration::from_millis(cooldown_ms),
+            threshold,
+        )
+    }
+
     #[derive(Clone, Default)]
     struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for Buf {
@@ -240,34 +251,33 @@ mod tests {
         let sub = tracing_subscriber::fmt()
             .with_writer(move || w.clone())
             .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
             .finish();
         tracing::subscriber::with_default(sub, || {
+            // Other tests may have cached "no subscriber" for these callsites.
+            tracing::callsite::rebuild_interest_cache();
             let b = breaker(200, 1);
             b.record_failure(N); // closed -> open
             b.record_failure(N); // late normal result: no change
             b.record_failure(P); // probe failure while open: re-stamp only
             b.record_success(N); // no change
+            thread::sleep(Duration::from_millis(250));
+            tracing::callsite::rebuild_interest_cache();
+            assert_eq!(b.try_acquire(), Some(P)); // open -> half-open
+            b.record_failure(P); // half-open -> open
             b.record_success(P); // open -> closed
             b.record_success(P); // closed probe success: no-op
         });
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<_> = out.lines().collect();
-        assert_eq!(lines.len(), 2, "{out}");
+        assert_eq!(lines.len(), 4, "{out}");
         assert!(lines[0].contains("WARN") && lines[0].contains("upstream=test:1"));
         assert!(lines[0].contains("from=Closed") && lines[0].contains("to=Open"));
         assert!(lines[1].contains("INFO") && lines[1].contains("from=Open"));
-        assert!(lines[1].contains("to=Closed"));
-    }
-
-    const N: Admission = Admission::Normal;
-    const P: Admission = Admission::Probe;
-
-    fn breaker(cooldown_ms: u64, threshold: u32) -> Breaker {
-        Breaker::new(
-            "test:1".to_string(),
-            Duration::from_millis(cooldown_ms),
-            threshold,
-        )
+        assert!(lines[1].contains("to=HalfOpen"));
+        assert!(lines[2].contains("WARN") && lines[2].contains("from=HalfOpen"));
+        assert!(lines[2].contains("to=Open"));
+        assert!(lines[3].contains("INFO") && lines[3].contains("to=Closed"));
     }
 
     /// Open the breaker, wait out the cooldown, and take the probe.

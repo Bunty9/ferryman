@@ -189,22 +189,26 @@ hide paths of an upstream that another route also reaches.
 
 ### Health-driven recovery
 
-Every `health_interval_secs` each upstream's `/health` is probed (any
-answer below 500 is healthy; transport errors, timeouts and 5xx are not).
-Health results are authoritative, like the half-open probe:
+The `ferryman` binary runs a health loop: every `health_interval_secs` it
+probes each upstream's `/health` (any answer below 500 is healthy;
+transport errors, timeouts and 5xx are not). An embedder calling
+`ferryman::serve` alone has no health loop unless it spawns `health_loop`
+itself. Health results are authoritative, like the half-open probe:
 
 - A passing check closes an open or half-open circuit immediately; it does
   not wait for the cooldown. Passing while already closed is a no-op and
-  does not reset the request failure count.
-- A failing check while open re-stamps the cooldown, so the cooldown
-  restarts every tick and the request-path half-open probe never gets a
-  slot while the upstream stays unhealthy. Recovery therefore comes from
-  the first passing health check, not from cooldown expiry.
-- With the defaults (5 s interval, 30 s cooldown) an upstream that comes
-  back is routable again within about one interval (up to ~5 s, plus the
-  2 s probe timeout in the worst case). If health checks can't reach the
-  upstream at all, recovery falls back to cooldown expiry (30 s) and one
-  successful half-open probe request.
+  does not reset the request failure count. A recovered upstream is
+  routable again within about one `health_interval_secs`.
+- A failing check while open re-stamps the cooldown. When the cooldown is
+  longer than `health_interval_secs` (as with the defaults, 30 s vs 5 s),
+  the request-path half-open probe never gets a slot while `/health` keeps
+  failing, so recovery comes from the first passing health check, not from
+  cooldown expiry. With a shorter cooldown, requests can claim the probe
+  slot between ticks (open -> half-open -> open each window, each logged).
+- An upstream whose `/health` keeps failing (5xx, timeout, unreachable)
+  stays open even if real requests would succeed: fix the health endpoint.
+  Without a running health loop, recovery is cooldown expiry plus one
+  successful half-open request.
 
 State changes are logged with `upstream`, `from` and `to` fields: `warn`
 when a circuit opens, `info` otherwise. Re-stamps while open are not

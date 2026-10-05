@@ -42,10 +42,46 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo nextest
         run: cargo nextest run --workspace --no-fail-fast --locked
+      # nextest does not run doctests.
+      - name: cargo test --doc
+        run: cargo test --doc --workspace --locked
       - name: example crates are not publishable
         run: |
           cargo metadata --no-deps --format-version 1 \
             | jq -e '[.packages[] | select(.manifest_path | contains("/examples/")) | .publish] | all(. == [])'
+
+  # Blocking: public API must stay semver-compatible with the last release
+  # on crates.io (action default baseline = registry). Checks both crates.
+  semver:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+
+  # Blocking: the declared rust-version (1.88) must really build.
+  # rust-toolchain.toml pins stable, hence RUSTUP_TOOLCHAIN.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.88"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo check
+        run: cargo check --workspace --locked
 
   deny:
     name: cargo-deny

@@ -176,13 +176,18 @@ jobs:
         with:
           tool: cross
 
+      # Tier 1 only: embeds the dependency list (cargo-audit / trivy can read
+      # it from the binary). Tier 2 (`cross`, containers) stays a plain build.
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-auditable
+
       - name: Build
         shell: bash
-        env:
-          BUILDER: ${{ matrix.builder }}
         run: |
           set -euo pipefail
-          "$BUILDER" build --locked --release -p ferryman --target "$TARGET"
+          cargo auditable build --locked --release -p ferryman --target "$TARGET"
 
       - name: Package
         shell: bash
@@ -301,6 +306,37 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Build provenance for every archive. Deliberately separate from the build
+  # jobs: this is the only job with `id-token: write` + `attestations: write`,
+  # and it checks out nothing and runs no cargo or repo code, only downloads
+  # the archives and hands them to the attest action. Skipped in
+  # workflow_dispatch dry runs so a dry run never mints real attestations.
+  # Tier-2 failures don't block it: it attests whatever archives exist.
+  attest:
+    name: attest
+    needs: [verify, binaries, binaries-extra]
+    if: >-
+      !cancelled() && github.event_name == 'push'
+      && needs.verify.result == 'success'
+      && needs.binaries.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
   # Creates (or, on a re-run, updates) the GitHub release from the notes
   # `verify` extracted and the archives `binaries` built. No checkout, no
   # cargo, no dependency code runs here; it is the only job that holds
@@ -309,12 +345,13 @@ jobs:
   # verify, publish and tier-1 `binaries` must all have succeeded.
   release:
     name: release
-    needs: [verify, publish, binaries, binaries-extra]
+    needs: [verify, publish, binaries, binaries-extra, attest]
     if: >-
       !cancelled() && github.event_name == 'push'
       && needs.verify.result == 'success'
       && needs.publish.result == 'success'
       && needs.binaries.result == 'success'
+      && needs.attest.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

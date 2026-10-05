@@ -92,7 +92,15 @@ tar xzf ferryman-v$v-$t.tar.gz
 ./ferryman-v$v-$t/ferryman --version
 ```
 
-Each archive also has a standalone `<archive>.sha256` file.
+Each archive also has a standalone `<archive>.sha256` file. Releases from
+0.2.3 on also carry build provenance attestations; verify an archive with:
+
+```bash
+gh attestation verify ferryman-v$v-$t.tar.gz --repo Bunty9/ferryman
+```
+
+Tier-1 binaries embed their dependency list (`cargo auditable`), so
+`cargo audit bin ./ferryman` works on them.
 
 ```bash
 cargo binstall ferryman          # downloads the release archive above (releases after 0.2.1)
@@ -271,6 +279,10 @@ How it works inside: [`docs/architecture.md`](./docs/architecture.md).
 Phases and bench numbers are tracked in [`PROGRESS.md`](./PROGRESS.md).
 P4 (ferryman-edge) layers mTLS + JWT + cert hot-reload on top of this
 base; see `projects-l3-l4.md` § P4.
+
+## Security
+
+Report vulnerabilities privately, see [SECURITY.md](./SECURITY.md).
 
 ## License <a id="license"></a>
 

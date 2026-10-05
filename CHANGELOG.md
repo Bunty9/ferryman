@@ -7,6 +7,18 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Added
+
+- Release archives carry GitHub build provenance attestations
+  (`gh attestation verify <archive> --repo Bunty9/ferryman`); tier-1
+  binaries are built with `cargo auditable`.
+- `SECURITY.md` (private vulnerability reporting).
+
+### Changed
+
+- `fly.toml`: removed the public port-9090 service; added a `[metrics]`
+  section for Fly's managed Prometheus.
+
 ## [0.2.2] - 2026-10-05
 
 Prebuilt binaries. No API or proxy-behaviour changes on Unix.

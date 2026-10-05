@@ -16,6 +16,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `cargo test -p ferryman-embedded-example` - embedded-library reference example's tests
 - `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` - no intra-doc links to private items
+- CI jobs beyond test/deny: `semver` (cargo-semver-checks vs the latest crates.io release, blocking; additive-only public API), `msrv` (`cargo check` on 1.88 via `RUSTUP_TOOLCHAIN`), doctests run in the `test` job (`cargo test --doc`, nextest skips them)
 - `gh run list -L 3` / `gh run view <id> --log` - CI status and smoke-bench numbers
 
 ## Invariants (don't regress)
@@ -45,7 +46,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Version lives in `[workspace.package]` AND the `ferryman-core` entry of `[workspace.dependencies]`; bump both together. On a minor/major bump also update the `version = "0.x"` reqs on both crates in `examples/embedded/Cargo.toml`, and commit the refreshed `Cargo.lock` (`release.yml` builds `--locked`).
 - `crates/*/LICENSE-*` are symlinks to the root files; keep them (they ship the license texts in each `.crate`).
 - `ConfigToml`/`RouteToml` are `#[non_exhaustive]`: construct via TOML parsing outside the core crate.
-- Release binaries: `binaries` job in `release.yml` (`binaries` tier 1 gates publish; `binaries-extra` tier 2 best effort); naming `ferryman-v<ver>-<target>.tar.gz|zip` is mirrored in `[package.metadata.binstall]`. Dry run: run the workflow via `workflow_dispatch` (builds only, no publish). Actions are SHA-pinned; zizmor runs in CI.
+- Release binaries: `binaries` job in `release.yml` (`binaries` tier 1 gates publish; `binaries-extra` tier 2 best effort); naming `ferryman-v<ver>-<target>.tar.gz|zip` is mirrored in `[package.metadata.binstall]`. Tier 1 builds with `cargo auditable` (tier 2 `cross` stays plain). `attest` job (only one with `id-token`/`attestations: write`; no checkout, no cargo; skipped on dry runs) sits between the binaries jobs and `release`. Dry run: run the workflow via `workflow_dispatch` (builds only, no publish). Actions are SHA-pinned; zizmor runs in CI.
 - `.github/workflows/release.yml` publishes on a `v[0-9]+.[0-9]+.[0-9]+` or prerelease `v…-*` tag push (Trusted Publishing; jobs verify, binaries (tier 1) -> publish -> release, plus best-effort binaries-extra; idempotent per-crate publish); see `docs/plans/2026-09-28-publishing.md` for the one remaining manual step, the release procedure, and half-published-release recovery.
 
 ## Testing patterns

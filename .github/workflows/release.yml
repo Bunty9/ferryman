@@ -2,7 +2,12 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  # Dry run: builds and packages the binaries matrix only; nothing is
+  # verified, published or released.
+  workflow_dispatch:
 
 permissions: {}
 
@@ -15,16 +20,19 @@ jobs:
   # .git/config, where a build script could read it.
   verify:
     name: verify
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
 
       - name: Verify tag points at a commit on main
         run: |
@@ -70,7 +78,7 @@ jobs:
       # Produced here (before publish) and reused by the `release` job,
       # since the actual publish must fail-fast on a bad tag/version/empty
       # changelog *before* anything irreversible happens, not after.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-notes
           path: release-notes.md
@@ -89,18 +97,21 @@ jobs:
   publish:
     name: publish
     needs: verify
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
 
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
 
       - name: Publish crates (idempotent, dependency order)
@@ -121,32 +132,165 @@ jobs:
             fi
           done
 
-  # Creates the GitHub release from the notes `verify` already extracted.
-  # No checkout, no cargo, no dependency code runs in this job — it's the
-  # only one that holds `contents: write`, and `--repo` lets `gh` operate
-  # without a local git repository at all.
+  # Release binaries. Tier 1 targets are required (the `release` job
+  # refuses to run without them); tier 2 are best effort (`continue-on-error`
+  # keeps a failing tier-2 leg from failing this job or skipping the
+  # release). Runs in parallel with `publish`, only `contents: read`, and
+  # in a workflow_dispatch dry run it runs alone (verify is skipped then).
+  binaries:
+    name: binary (${{ matrix.target }})
+    needs: verify
+    if: always() && (needs.verify.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.tier == 2 }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Tier 1: required.
+          - { tier: 1, os: ubuntu-latest, target: x86_64-unknown-linux-musl, builder: cargo }
+          - { tier: 1, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, builder: cargo }
+          - { tier: 1, os: macos-latest, target: x86_64-apple-darwin, builder: cargo }
+          - { tier: 1, os: macos-latest, target: aarch64-apple-darwin, builder: cargo }
+          - { tier: 1, os: windows-latest, target: x86_64-pc-windows-msvc, builder: cargo }
+          # Tier 2: best effort. ring 0.17 supports all of these; none was
+          # exercised before the first release run, hence tier 2.
+          - { tier: 2, os: ubuntu-latest, target: armv7-unknown-linux-musleabihf, builder: cross }
+          - { tier: 2, os: ubuntu-latest, target: arm-unknown-linux-musleabihf, builder: cross }
+          - { tier: 2, os: ubuntu-latest, target: i686-unknown-linux-musl, builder: cross }
+          - { tier: 2, os: ubuntu-latest, target: riscv64gc-unknown-linux-musl, builder: cross }
+          - { tier: 2, os: ubuntu-latest, target: x86_64-unknown-freebsd, builder: cross }
+          - { tier: 2, os: windows-latest, target: aarch64-pc-windows-msvc, builder: cargo }
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins stable; the target is added via rustup for
+      # native builds. `cross` builds in a container, so no target there.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.builder == 'cargo' && matrix.target || '' }}
+
+      - name: Install musl-tools
+        if: matrix.builder == 'cargo' && contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cross
+
+      - name: Build
+        shell: bash
+        env:
+          BUILDER: ${{ matrix.builder }}
+        run: |
+          set -euo pipefail
+          "$BUILDER" build --locked --release -p ferryman --target "$TARGET"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="ferryman") | .version')
+          name="ferryman-v${version}-${TARGET}"
+          exe=ferryman
+          case "$TARGET" in *-windows-*) exe=ferryman.exe ;; esac
+          mkdir -p "dist/$name"
+          cp "target/${TARGET}/release/${exe}" README.md CHANGELOG.md \
+            LICENSE-MIT LICENSE-APACHE config.toml "dist/$name/"
+          cd dist
+          case "$TARGET" in
+            *-windows-*) archive="$name.zip"; 7z a -tzip "$archive" "$name" >/dev/null ;;
+            *) archive="$name.tar.gz"; tar -czf "$archive" "$name" ;;
+          esac
+          rm -rf "$name"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Creates (or, on a re-run, updates) the GitHub release from the notes
+  # `verify` extracted and the archives `binaries` built. No checkout, no
+  # cargo, no dependency code runs here; it is the only job that holds
+  # `contents: write`. `always()` so a failed tier-2 binary can't skip the
+  # release; the explicit checks below demand verify/publish success and
+  # every tier-1 archive.
   release:
     name: release
-    needs: publish
+    needs: [verify, publish, binaries]
+    if: >-
+      always() && github.event_name == 'push'
+      && needs.verify.result == 'success'
+      && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-notes
 
-      - name: Create GitHub release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check for required builds
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          missing=0
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+                   x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            case "$t" in *-windows-*) ext=zip ;; *) ext=tar.gz ;; esac
+            f="dist/ferryman-v${version}-${t}.${ext}"
+            if [ ! -f "$f" ] || [ ! -f "$f.sha256" ]; then
+              echo "::error::required tier-1 build missing: $f"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+          ls -l dist
+
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          cd dist
+          sha256sum ferryman-v*.tar.gz ferryman-v*.zip > SHA256SUMS
+          cd ..
+          files=(dist/ferryman-v*.tar.gz dist/ferryman-v*.zip dist/*.sha256 dist/SHA256SUMS)
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists, skipping"
+            echo "release $GITHUB_REF_NAME exists, uploading assets"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
             exit 0
           fi
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
           version="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "ferryman $version" \
-            --notes-file release-notes.md
+            --notes-file release-notes.md \
+            "${flags[@]}" \
+            "${files[@]}"

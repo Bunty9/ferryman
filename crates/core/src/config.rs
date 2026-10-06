@@ -5,6 +5,7 @@
 //! events, calls [`build_table`], and atomically swaps the result into the
 //! `SharedTable`.
 
+use crate::proxies::TrustedProxies;
 use crate::route::{Route, RouteTable, Upstream};
 use anyhow::{bail, Context};
 use serde::Deserialize;
@@ -29,6 +30,19 @@ pub struct ConfigToml {
     /// Timeout for a forwarded request to an upstream, in seconds.
     #[serde(default = "default_upstream_timeout")]
     pub upstream_timeout_secs: u64,
+    /// HTTP/1 keep-alive idle timeout in seconds (1..=86400).
+    #[serde(default = "default_keepalive_timeout")]
+    pub keepalive_timeout_secs: u64,
+    /// CIDR ranges (or bare IPs) of proxies whose forwarding headers are trusted.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// Longest gap between request-body frames, in seconds (1..=86400).
+    #[serde(default = "default_body_idle_timeout")]
+    pub request_body_idle_timeout_secs: u64,
+    /// Total time allowed to receive a request body, in seconds (1..=86400).
+    /// Not required to be >= the idle timeout; whichever fires first wins.
+    #[serde(default = "default_body_timeout")]
+    pub request_body_timeout_secs: u64,
     pub routes: Vec<RouteToml>,
 }
 
@@ -44,6 +58,21 @@ fn default_failure_threshold() -> u32 {
 fn default_upstream_timeout() -> u64 {
     30
 }
+pub(crate) const DEFAULT_KEEPALIVE_SECS: u64 = 10;
+pub(crate) const DEFAULT_BODY_IDLE_SECS: u64 = 30;
+pub(crate) const DEFAULT_BODY_TOTAL_SECS: u64 = 300;
+fn default_body_timeout() -> u64 {
+    DEFAULT_BODY_TOTAL_SECS
+}
+fn default_keepalive_timeout() -> u64 {
+    DEFAULT_KEEPALIVE_SECS
+}
+fn default_body_idle_timeout() -> u64 {
+    DEFAULT_BODY_IDLE_SECS
+}
+
+/// Upper bound for every duration key, so `Duration` arithmetic can't overflow.
+const MAX_SECS: u64 = 86_400;
 
 /// One routing rule.
 #[derive(Debug, Clone, Deserialize)]
@@ -83,11 +112,21 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
         ("health_interval_secs", cfg.health_interval_secs),
         ("upstream_timeout_secs", cfg.upstream_timeout_secs),
         ("default_cooldown_secs", cfg.default_cooldown_secs),
+        ("keepalive_timeout_secs", cfg.keepalive_timeout_secs),
+        (
+            "request_body_idle_timeout_secs",
+            cfg.request_body_idle_timeout_secs,
+        ),
+        ("request_body_timeout_secs", cfg.request_body_timeout_secs),
     ] {
         if v == 0 {
             bail!("{key} must be >= 1");
         }
+        if v > MAX_SECS {
+            bail!("{key} must be <= {MAX_SECS}, got {v}");
+        }
     }
+    let trusted_proxies = TrustedProxies::parse(&cfg.trusted_proxies)?;
 
     let default_cooldown = Duration::from_secs(cfg.default_cooldown_secs);
     let upstream_timeout = Duration::from_secs(cfg.upstream_timeout_secs);
@@ -131,7 +170,11 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
                 r.upstream
             ),
         }
-        if uri.authority().is_none() {
+        // Also catches an empty IPv6 literal (`http://[]:80`).
+        if uri
+            .host()
+            .is_none_or(|h| h.trim_matches(['[', ']']).is_empty())
+        {
             bail!(
                 "route {:?}: upstream {:?} has no host",
                 r.prefix,
@@ -164,6 +207,13 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
         if cooldown.is_zero() {
             bail!("route {:?}: cooldown_secs must be >= 1", r.prefix);
         }
+        if cooldown.as_secs() > MAX_SECS {
+            bail!(
+                "route {:?}: cooldown_secs must be <= {MAX_SECS}, got {}",
+                r.prefix,
+                cooldown.as_secs()
+            );
+        }
         let first = *cooldown_by_name.entry(name.clone()).or_insert(cooldown);
         if first != cooldown {
             bail!(
@@ -192,7 +242,11 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
         })
         .collect();
 
-    Ok(RouteTable::new(routes, upstream_timeout))
+    Ok(RouteTable::new(routes, upstream_timeout)
+        .with_keepalive_timeout(Duration::from_secs(cfg.keepalive_timeout_secs))
+        .with_request_body_idle_timeout(Duration::from_secs(cfg.request_body_idle_timeout_secs))
+        .with_request_body_timeout(Duration::from_secs(cfg.request_body_timeout_secs))
+        .with_trusted_proxies(trusted_proxies))
 }
 
 #[cfg(test)]
@@ -206,6 +260,10 @@ mod tests {
             default_cooldown_secs: 30,
             failure_threshold: 3,
             upstream_timeout_secs: 30,
+            keepalive_timeout_secs: 10,
+            trusted_proxies: Vec::new(),
+            request_body_idle_timeout_secs: 30,
+            request_body_timeout_secs: 300,
             routes,
         }
     }
@@ -350,5 +408,81 @@ mod tests {
         ]);
         let t = build_table(c, None).unwrap();
         assert_eq!(t.upstreams().count(), 1);
+    }
+
+    fn parse(extra: &str) -> anyhow::Result<RouteTable> {
+        let raw = format!("{extra}\n[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n");
+        build_table(toml::from_str(&raw).unwrap(), None)
+    }
+
+    #[test]
+    fn rejects_empty_upstream_host() {
+        for up in ["http://:80", "http://", "http://[]:80", "http://@:80"] {
+            let err = build_table(cfg(vec![route("/a", up)]), None)
+                .err()
+                .expect(up);
+            assert!(
+                err.to_string().contains("no host") || err.to_string().contains("invalid"),
+                "{err}"
+            );
+        }
+        let err = build_table(cfg(vec![route("/a", "http://:80")]), None)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("has no host"), "{err}");
+    }
+
+    #[test]
+    fn rejects_durations_above_one_day() {
+        for key in [
+            "health_interval_secs",
+            "upstream_timeout_secs",
+            "default_cooldown_secs",
+            "keepalive_timeout_secs",
+            "request_body_idle_timeout_secs",
+            "request_body_timeout_secs",
+        ] {
+            assert!(parse(&format!("{key} = 86400")).is_ok(), "{key} at bound");
+            let err = parse(&format!("{key} = 86401")).err().expect(key);
+            assert!(err.to_string().contains(key), "{err}");
+            assert!(parse(&format!("{key} = 9223372036854775807")).is_err());
+        }
+        let mut r = route("/a", "http://h:1");
+        r.cooldown_secs = Some(86_401);
+        let err = build_table(cfg(vec![r]), None).err().unwrap();
+        assert!(err.to_string().contains("cooldown_secs"), "{err}");
+    }
+
+    #[test]
+    fn new_keys_default_and_parse() {
+        let t = parse("").unwrap();
+        assert_eq!(t.keepalive_timeout(), Duration::from_secs(10));
+        assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(30));
+        assert_eq!(t.request_body_timeout(), Duration::from_secs(300));
+        assert!(t.trusted_proxies().is_empty());
+
+        let t = parse(
+            "keepalive_timeout_secs = 75\nrequest_body_idle_timeout_secs = 5\n\
+             trusted_proxies = [\"10.0.0.0/8\", \"fd00::/8\"]",
+        )
+        .unwrap();
+        assert_eq!(t.keepalive_timeout(), Duration::from_secs(75));
+        assert_eq!(t.request_body_idle_timeout(), Duration::from_secs(5));
+        assert!(t
+            .trusted_proxies()
+            .contains("::ffff:10.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_zero_new_keys_and_bad_cidr() {
+        for key in [
+            "keepalive_timeout_secs",
+            "request_body_idle_timeout_secs",
+            "request_body_timeout_secs",
+        ] {
+            assert!(parse(&format!("{key} = 0")).is_err());
+        }
+        let err = parse("trusted_proxies = [\"10.0.0.0/33\"]").err().unwrap();
+        assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
     }
 }

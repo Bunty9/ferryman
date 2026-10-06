@@ -86,7 +86,7 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 (`v[0-9]+.[0-9]+.[0-9]+` or prerelease `v[0-9]+.[0-9]+.[0-9]+-*`) it
 runs five jobs, each with only the permissions and checkout it needs
 (see "why separate jobs" below). Graph: `verify` -> `binaries` ->
-`publish` -> `release`, with `binaries-extra` (best effort) alongside:
+`attest` -> `publish` -> `release`, with `binaries-extra` (best effort) alongside:
 
 1. **`verify`** (`permissions: contents: read`, checkout with
    `persist-credentials: false`) — checks the tag points at a commit on
@@ -95,7 +95,13 @@ runs five jobs, each with only the permissions and checkout it needs
    `[workspace.dependencies]` agrees, extracts the matching
    `CHANGELOG.md` section into `release-notes.md` and uploads it as a
    build artifact, then runs `cargo test --workspace --locked`.
-2. **`publish`** (needs `verify` and `binaries`, so nothing irreversible
+2. **`attest`** (needs `verify` and `binaries`; `id-token: write`,
+   `attestations: write`, `contents: read`; no checkout, no cargo) —
+   downloads the tier-1 `bin-t1-*` archives and runs
+   `actions/attest-build-provenance` on them. Tier-2 archives are not
+   attested (so best-effort builds never delay publish). Skipped on dry
+   runs.
+3. **`publish`** (needs `verify`, `binaries` and `attest`, so nothing irreversible
    happens unless every tier-1 archive built; `permissions: id-token: write,
    contents: read`, checkout with `persist-credentials: false`) —
    authenticates via `rust-lang/crates-io-auth-action@v1` (Trusted
@@ -105,29 +111,29 @@ runs five jobs, each with only the permissions and checkout it needs
    and skips it if so, otherwise runs `cargo publish -p <name> --locked`.
    This makes the job idempotent — see "recovering from a half-published
    release" below.
-3. **`release`** (needs `verify`, `publish`, `binaries`, `binaries-extra`;
-   runs under `!cancelled()` when verify, publish and `binaries` all
-   succeeded, ignoring `binaries-extra`; `permissions: contents: write`,
+4. **`release`** (needs `verify`, `publish`, `binaries`, `binaries-extra`,
+   `attest`; runs under `!cancelled()` when verify, publish, `binaries`
+   and `attest` all succeeded, ignoring `binaries-extra`; `permissions: contents: write`,
    no checkout) — downloads `release-notes` and every `bin-*` artifact,
    fails if a tier-1 archive is missing, writes `SHA256SUMS`, and runs
    `gh release create` with all archives attached (or `gh release upload
    --clobber` if the release exists). No `cargo`, no dependency code, by
    design.
 
-4. **`binaries`** (tier 1) and **`binaries-extra`** (tier 2, `continue-on-error`)
+5. **`binaries`** (tier 1) and **`binaries-extra`** (tier 2, `continue-on-error`)
    (need `verify`; `contents: read`, no credentials, no OIDC) — matrices that builds `ferryman` with
    `--locked --release` and packages
    `ferryman-v<version>-<target>.tar.gz` (`.zip` on Windows; top-level
    dir with binary, README, CHANGELOG, licenses, `config.toml`) plus a
    `.sha256`. Tier 1 (Linux musl x86_64/aarch64, macOS x86_64/aarch64,
-   Windows x86_64 MSVC) gates `publish` and `release`; tier 2 (ARM/i686
+   Windows x86_64 MSVC) gates `attest`, `publish` and `release`; tier 2 (ARM/i686
    musl and riscv64 gnu via `cross`, FreeBSD, Windows aarch64) may be
    absent. `--prerelease` is set for `-` tags. Prerelease tags (`vX.Y.Z-rc.1`) must equal the workspace
    version like any other.
 
 **Dry run.** Actions tab, *release*, *Run workflow* (`workflow_dispatch`)
-runs only `binaries` and `binaries-extra` (verify/publish/release are skipped);
-download the `bin-*` artifacts to inspect the archives. Do this before
+runs only `binaries` and `binaries-extra` (verify/attest/publish/release are skipped);
+download the `bin-t1-*`/`bin-t2-*` artifacts to inspect the archives. Do this before
 the first tagged release that ships binaries, and after changing the
 matrix.
 
@@ -168,9 +174,10 @@ fallback in the meantime but isn't used by the workflow.
 `ferryman` then fails (network blip, crates.io hiccup, a transient CI
 issue), crates.io now has the new `ferryman-core` but not `ferryman`, and
 no GitHub release was created (the `release` job needs `publish` to
-succeed first). Because `publish` needs the tier-1 `binaries` job, a
-deterministic build failure on a required target now stops the release
-before anything reaches crates.io, so it cannot leave a half-published
+succeed first). Because `publish` needs the tier-1 `binaries` and `attest` jobs, a
+deterministic build or attestation failure now stops the release
+before anything reaches crates.io (re-run the failed job and the rest
+follows), so it cannot leave a half-published
 release; only transient failures after publish starts can.
 
 Because each crate's publish step checks crates.io for that exact

@@ -18,6 +18,40 @@ default_cooldown_secs = 30
 # Timeout for a forwarded request to an upstream, in seconds.
 # upstream_timeout_secs = 30
 
+# HTTP/1 keep-alive idle timeout, in seconds (1..=86400). Default 10.
+# Behind a load balancer set it above the LB's idle timeout: AWS ALB (60 s
+# default) -> 75; GCLB (fixed 600 s) -> 620; direct exposure -> keep 10.
+# The first request on a new connection stays bounded at 10 s regardless,
+# but a large value also widens the header-read window on reused connections.
+# Hot reload applies it to new connections only.
+# keepalive_timeout_secs = 10
+
+# Longest gap between request-body frames before a stalled upload is given
+# up on, in seconds (1..=86400). Default 30.
+# A stalled upload gets 408 and never counts against the breaker.
+# upstream_timeout_secs only starts once the request body is fully sent.
+# request_body_idle_timeout_secs = 30
+
+# Total time a client may take to send a request body, in seconds
+# (1..=86400). Default 300. Bounds slow-trickle uploads that keep resetting
+# the idle timeout; exceeding it gets 408 (no breaker effect). Not required
+# to be >= the idle timeout: whichever fires first wins.
+# request_body_timeout_secs = 300
+
+# Peers (CIDR ranges or bare IPs, IPv4 and IPv6) whose forwarding headers
+# are passed through: X-Forwarded-Proto, X-Forwarded-Host and Forwarded are
+# kept. X-Real-IP is always set by ferryman (the rightmost X-Forwarded-For
+# entry that is not a trusted proxy, else the peer). For any other peer
+# ferryman also strips Forwarded and X-Forwarded-Host and sets
+# X-Forwarded-Proto from the connection. Only trust hops that overwrite or
+# strip Forwarded / X-Forwarded-Host (cloud LBs often pass them through).
+# Hot-reloads (applied per request). Default empty = trust nobody.
+# IPv4 clients (also IPv4-mapped IPv6 peers) match only IPv4 ranges, so
+# "::/0" does not trust them; host bits are ignored (10.0.0.1/8 = 10.0.0.0/8).
+# trusted_proxies = ["10.0.0.0/8", "fd00::/8"]
+
+# Every *_secs key above (and per-route cooldown_secs) must be <= 86400.
+
 [[routes]]
 prefix = "/svc-a"
 upstream = "http://localhost:8001"

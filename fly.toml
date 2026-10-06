@@ -20,7 +20,8 @@ kill_timeout = "30s"
   RUST_LOG = "info"
   FERRYMAN_CONFIG = "/app/config.toml"
   FERRYMAN_BIND = "0.0.0.0:8080"
-  FERRYMAN_METRICS_BIND = "0.0.0.0:9090"
+  # Dual-stack: Fly's private network (where metrics are scraped) is IPv6.
+  FERRYMAN_METRICS_BIND = "[::]:9090"
 
 [http_service]
   internal_port = 8080
@@ -29,13 +30,11 @@ kill_timeout = "30s"
   auto_start_machines = true
   min_machines_running = 1
 
-[[services]]
-  internal_port = 9090
-  protocol = "tcp"
-
-  [[services.ports]]
-    port = 9090
-    handlers = ["http"]
+# Metrics (9090) are not exposed publicly; Fly's managed Prometheus scrapes
+# the private port.
+[metrics]
+  port = 9090
+  path = "/metrics"
 
 [[regions]]
   code = "sin"

@@ -140,11 +140,12 @@ impl Breaker {
                     return;
                 }
                 self.consecutive_failures.store(0, Ordering::Relaxed);
-                if self
-                    .state
-                    .swap(CircuitState::Closed as u8, Ordering::AcqRel)
-                    != CircuitState::Closed as u8
-                {
+                let prev = CircuitState::from_u8(
+                    self.state
+                        .swap(CircuitState::Closed as u8, Ordering::AcqRel),
+                );
+                if prev != CircuitState::Closed {
+                    self.log_transition(prev, CircuitState::Closed);
                     self.set_gauges();
                 }
             }
@@ -184,9 +185,19 @@ impl Breaker {
             .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if ok {
+            self.log_transition(from, to);
             self.set_gauges();
         }
         ok
+    }
+
+    /// Only called after a state-changing CAS/swap, never on the hot path.
+    fn log_transition(&self, from: CircuitState, to: CircuitState) {
+        if to == CircuitState::Open {
+            tracing::warn!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+        } else {
+            tracing::info!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+        }
     }
 
     /// Publish the *current* state (not a transition target), so racing

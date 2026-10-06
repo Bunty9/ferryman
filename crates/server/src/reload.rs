@@ -13,8 +13,9 @@
 //! `DEBOUNCE` (200ms).
 //!
 //! Limits: `health_interval_secs` changes need a restart (the health loop's
-//! ticker is fixed at startup). Kubernetes ConfigMap mounts swap a `..data`
-//! symlink rather than touching `config.toml`, so those updates are not
+//! ticker is fixed at startup). `keepalive_timeout_secs` is read when a
+//! connection is accepted, so a change applies to new connections only.
+//! Kubernetes ConfigMap mounts swap a `..data` symlink rather than touching `config.toml`, so those updates are not
 //! seen here; restart the pod or point `--config` at a regular file.
 
 use ferryman_core::{build_table, load_config, RouteTable, SharedTable};

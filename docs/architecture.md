@@ -30,19 +30,27 @@ accept ── set TCP_NODELAY
   ├─ TLS? handshake (10s deadline)
   │
   ├─ hyper-util auto builder (HTTP/1.1 or HTTP/2)
-  │    first request must arrive within 10s, each h1 head within 10s
+  │    first request must arrive within 10s; later h1 heads within
+  │    `keepalive_timeout_secs` (default 10)
   │
-  └─ proxy::handle
+  └─ proxy::handle_streaming
        1. table.load_full()             one Arc for the whole request
-       2. lookup(path)                  none -> 404
+       2. bad_path(path)                dot segments, NUL, %u, double-encoded -> 400
+       2b. lookup(path)                 none -> 404
        3. Upgrade (not h2c) / CONNECT   -> 501
        4. upstream.try_acquire()        None -> 503, else Admission
        5. rewrite request:
             strip hop-by-hop, join h2 cookies, Host from authority,
             URI = upstream scheme+authority + original path+query,
-            version = HTTP/1.1, x-forwarded-for / -proto
-       6. client.request() under upstream_timeout (to response headers)
-            timeout          -> 504 (breaker failure only if bodyless)
+            version = HTTP/1.1, x-forwarded-for / -proto;
+            forwarded headers per trusted_proxies: x-real-ip always set by
+            ferryman; forwarded / x-forwarded-host stripped for untrusted
+            peers; x-forwarded-proto from the connection unless trusted
+       6. client.request(); body wrapped in RequestBody (idle timeout
+          between frames, signals EOS). upstream_timeout (to response
+          headers) starts at body EOS, or immediately if bodyless
+            timeout          -> 504 + breaker failure
+            upload stalled   -> 408 (no breaker effect)
             client body err  -> 400 (no breaker effect)
             transport err    -> 502 + breaker failure
             502/503/504      -> passed through + breaker failure
@@ -50,9 +58,13 @@ accept ── set TCP_NODELAY
        7. strip hop-by-hop from the response, stream the body back
 ```
 
-Bodies are never buffered: the inbound `Incoming` is handed to the hyper
-client and the upstream's `Incoming` is returned boxed. Metrics are
-recorded at step 6, measuring time to response headers.
+Bodies are never buffered: the inbound `Incoming` is wrapped in `RequestBody` (idle and total
+deadlines, end-of-body signal) and handed to the hyper
+client, and the upstream's `Incoming` is returned boxed. Metrics are
+recorded at step 6, measuring time from request start (so including the upload) to response
+headers. If hyper stops reading the body for a whole `upstream_timeout` window
+while not waiting on the client (upstream not draining it), the request is a 504
+and a breaker failure.
 
 ## Routing
 
@@ -66,6 +78,12 @@ linear scan wins over a trie for the tens of routes this targets (see
 Lookup deliberately ignores health. If `/api/v1` is down, falling back to
 `/api` would send the request to a different service, so the answer is a
 503.
+
+Prefixes match the raw, undecoded, case-sensitive request path on a
+segment boundary. A less specific route (especially `/`) can receive paths
+that its upstream decodes or merges into a more specific prefix (e.g.
+`/%61pi/x`, `//api/x`). Routes are not access control: don't rely on a
+route to hide paths of an upstream that another route also reaches.
 
 ## Circuit breaker
 
@@ -137,8 +155,9 @@ swap) are not seen by the watcher.
 
 - TLS handshake: 10s. First request on a connection: 10s (covers the
   auto builder's h1/h2 sniff, which has no deadline of its own, and
-  clients idling after a handshake). HTTP/1 header read, including idle
-  keep-alive: 10s. HTTP/2: keep-alive ping every 30s.
+  clients idling after a handshake). Later HTTP/1 request heads, including
+  idle keep-alive: `keepalive_timeout_secs` (default 10; also caps the
+  first request's head when below 10s). HTTP/2: keep-alive ping every 30s.
 - Accept errors (e.g. `EMFILE`) are logged; the loop sleeps 100ms and
   continues.
 - On SIGINT/SIGTERM the listener closes, `GracefulShutdown` asks open

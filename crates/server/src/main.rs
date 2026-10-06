@@ -59,6 +59,8 @@ async fn main() -> anyhow::Result<()> {
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
     let cfg = load_config(&args.config)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
+    // Validate (bounds on every duration) before any `interval * 3` below.
+    let table = build_table(cfg, None)?;
 
     // Prometheus exporter binds its own listener; the proxy is unaffected by
     // /metrics traffic. Installed before any gauge is set, or the writes go
@@ -74,7 +76,6 @@ async fn main() -> anyhow::Result<()> {
         .idle_timeout(MetricKindMask::GAUGE, Some(interval * 3))
         .install()?;
     tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
-    let table = build_table(cfg, None)?;
     table.publish_gauges();
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 

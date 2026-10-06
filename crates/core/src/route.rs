@@ -7,6 +7,7 @@
 
 use crate::breaker::Breaker;
 pub use crate::breaker::{Admission, CircuitState};
+use crate::proxies::TrustedProxies;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +84,10 @@ pub struct Route {
 pub struct RouteTable {
     routes: Vec<Route>,
     pub upstream_timeout: Duration,
+    keepalive_timeout: Duration,
+    request_body_idle_timeout: Duration,
+    request_body_timeout: Duration,
+    trusted_proxies: TrustedProxies,
 }
 
 impl RouteTable {
@@ -91,7 +96,58 @@ impl RouteTable {
         Self {
             routes,
             upstream_timeout,
+            keepalive_timeout: Duration::from_secs(crate::config::DEFAULT_KEEPALIVE_SECS),
+            request_body_idle_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_IDLE_SECS),
+            request_body_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_TOTAL_SECS),
+            trusted_proxies: TrustedProxies::default(),
         }
+    }
+
+    /// Set the HTTP/1 keep-alive idle timeout (config `keepalive_timeout_secs`;
+    /// default 10 s).
+    pub fn with_keepalive_timeout(mut self, d: Duration) -> Self {
+        self.keepalive_timeout = d;
+        self
+    }
+
+    /// Set the longest gap between request-body frames (config
+    /// `request_body_idle_timeout_secs`; default 30 s).
+    pub fn with_request_body_idle_timeout(mut self, d: Duration) -> Self {
+        self.request_body_idle_timeout = d;
+        self
+    }
+
+    /// Set the total time allowed to receive a request body (config
+    /// `request_body_timeout_secs`; default 300 s).
+    pub fn with_request_body_timeout(mut self, d: Duration) -> Self {
+        self.request_body_timeout = d;
+        self
+    }
+
+    /// Set the trusted proxy ranges (config `trusted_proxies`; default empty).
+    pub fn with_trusted_proxies(mut self, t: TrustedProxies) -> Self {
+        self.trusted_proxies = t;
+        self
+    }
+
+    /// HTTP/1 keep-alive idle timeout.
+    pub fn keepalive_timeout(&self) -> Duration {
+        self.keepalive_timeout
+    }
+
+    /// Longest gap between request-body frames before a stalled upload is dropped.
+    pub fn request_body_idle_timeout(&self) -> Duration {
+        self.request_body_idle_timeout
+    }
+
+    /// Total time a client may take to send its request body.
+    pub fn request_body_timeout(&self) -> Duration {
+        self.request_body_timeout
+    }
+
+    /// Peers whose forwarding headers may be trusted.
+    pub fn trusted_proxies(&self) -> &TrustedProxies {
+        &self.trusted_proxies
     }
 
     /// Longest prefix that matches `path` on a path-segment boundary: prefix

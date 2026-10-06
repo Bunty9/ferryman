@@ -16,6 +16,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `cargo test -p ferryman-embedded-example` - embedded-library reference example's tests
 - `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` - no intra-doc links to private items
+- CI jobs beyond test/deny: `semver` (cargo-semver-checks vs the latest crates.io release, blocking; additive-only public API), `msrv` (`cargo check` on 1.88 via `RUSTUP_TOOLCHAIN`), doctests run in the `test` job (`cargo test --doc`, nextest skips them)
 - `gh run list -L 3` / `gh run view <id> --log` - CI status and smoke-bench numbers
 
 ## Invariants (don't regress)
@@ -24,7 +25,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Health loop reports as `Probe`; a probe success while closed is a no-op (must not reset request failure counts).
 - `build_table` validates everything before touching `prev` breakers; reload reuses the same `Arc<Breaker>` per `host:port`.
 - `lookup` ignores health: dead upstream = 503, never fall back to a shorter prefix.
-- Client-side body errors (`hyper::Error::is_user`) and timeouts on requests with bodies must not trip the breaker.
+- Client-side body errors (`hyper::Error::is_user`) and stalled or over-long uploads (`request_body_idle_timeout_secs` / `request_body_timeout_secs`, 408) never trip the breaker. `upstream_timeout` starts at request-body EOS (immediately if bodyless); a 504 after that is recorded as a breaker failure, as is an upstream that stops reading the upload for a whole `upstream_timeout` window (hyper not polling the body while not waiting on the client).
 - Metric labels are config-bounded (`route` = prefix, `upstream` = host:port); never label with raw paths.
 - Gauges: exporter is installed before any gauge write; health loop republishes every tick (removed upstreams expire via `idle_timeout`).
 - `examples/*` crates are workspace members with `publish = false`.
@@ -45,8 +46,8 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Version lives in `[workspace.package]` AND the `ferryman-core` entry of `[workspace.dependencies]`; bump both together. On a minor/major bump also update the `version = "0.x"` reqs on both crates in `examples/embedded/Cargo.toml`, and commit the refreshed `Cargo.lock` (`release.yml` builds `--locked`).
 - `crates/*/LICENSE-*` are symlinks to the root files; keep them (they ship the license texts in each `.crate`).
 - `ConfigToml`/`RouteToml` are `#[non_exhaustive]`: construct via TOML parsing outside the core crate.
-- Release binaries: `binaries` job in `release.yml` (`binaries` tier 1 gates publish; `binaries-extra` tier 2 best effort); naming `ferryman-v<ver>-<target>.tar.gz|zip` is mirrored in `[package.metadata.binstall]`. Dry run: run the workflow via `workflow_dispatch` (builds only, no publish). Actions are SHA-pinned; zizmor runs in CI.
-- `.github/workflows/release.yml` publishes on a `v[0-9]+.[0-9]+.[0-9]+` or prerelease `v…-*` tag push (Trusted Publishing; jobs verify, binaries (tier 1) -> publish -> release, plus best-effort binaries-extra; idempotent per-crate publish); see `docs/plans/2026-09-28-publishing.md` for the one remaining manual step, the release procedure, and half-published-release recovery.
+- Release binaries: `binaries` job in `release.yml` (`binaries` tier 1 gates attest and publish; `binaries-extra` tier 2 best effort, not attested); naming `ferryman-v<ver>-<target>.tar.gz|zip` is mirrored in `[package.metadata.binstall]`. Tier 1 builds with `cargo auditable` (tier 2 is built without it). `attest` job (only one with `id-token`/`attestations: write`; no checkout, no cargo; tier-1 archives only; skipped on dry runs) runs before `publish`. Dry run: run the workflow via `workflow_dispatch` (builds only, no publish). Actions are SHA-pinned; zizmor runs in CI.
+- `.github/workflows/release.yml` publishes on a `v[0-9]+.[0-9]+.[0-9]+` or prerelease `v…-*` tag push (Trusted Publishing; jobs verify -> binaries (tier 1) -> attest -> publish -> release, plus best-effort binaries-extra; idempotent per-crate publish); see `docs/plans/2026-09-28-publishing.md` for the one remaining manual step, the release procedure, and half-published-release recovery.
 
 ## Testing patterns
 

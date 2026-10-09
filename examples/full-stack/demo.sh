@@ -475,6 +475,10 @@ echo "  orders-v2 recovery time: ${recovery_secs}s"
 # Step 10: Grafana health + provisioned dashboard
 ########################################################################
 step "Grafana: health check and provisioned dashboard"
+# Grafana can still be starting on a cold, small VM (e.g. a 4 vCPU kiln
+# runner) after the earlier steps finish; poll instead of checking once.
+grafana_up() { [ "$(status_of "$GRAFANA/api/health")" = "200" ]; }
+wait_until "Grafana /api/health is 200" 60 grafana_up
 expect_status "$GRAFANA/api/health" 200
 health_db=$(body_of "$GRAFANA/api/health" | jq -r '.database // empty')
 if [ "$health_db" = "ok" ]; then

@@ -1044,6 +1044,8 @@ async fn dot_segments_get_400_and_never_reach_upstream() {
         "/api/a%5c..",
         "/api/..%2f",
         "/api/%252e",
+        "/api/%2%65%2%65/x",
+        "/api/%%32%65%%32%65/x",
         "/api/x?q=/../ok-in-query-only/../",
     ] {
         let out = get(p).await;

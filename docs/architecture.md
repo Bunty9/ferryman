@@ -36,7 +36,7 @@ accept ── set TCP_NODELAY
   │
   └─ proxy::handle_streaming
        1. table.load_full()             one Arc for the whole request
-       2. bad_path(path)                dot segments, NUL, %u, double-encoded -> 400
+       2. bad_path_normalized(path)      raw and normalised: dot segments, NUL, %u, double-encoded -> 400
        2b. ambiguous_route(table, path) %2F/%5C/\/; reading picks another route -> 400
        2c. lookup(path)                 none -> 404
        3. Upgrade (not h2c) / CONNECT   -> 501
@@ -89,8 +89,10 @@ Prefixes match the normalised, case-sensitive path on a segment boundary.
 `lookup` takes the raw path and normalises internally (borrowing, no
 allocation, when the path is already normal): `%XX` of unreserved chars
 (`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, repeated
-`/` is merged. The proxy runs `bad_path` first, so normalisation never has
-to deal with dot segments, and still forwards the raw path. The exception
+`/` is merged. The proxy runs `bad_path_normalized` first (`bad_path` on the raw path, and
+on the normalised one when the raw path contains `%`, which catches
+`%2%65%2%65` becoming `%2e%2e`), so lookup never sees dot segments, and
+still forwards the raw path. The exception
 is a route with `strip_prefix`: it forwards the normalised remainder after the
 prefix (re-checked with `bad_path`; a failing remainder is a 400) and sets
 `X-Forwarded-Prefix` after `apply_forwarded_headers`. `%2f` stays

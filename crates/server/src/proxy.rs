@@ -335,7 +335,7 @@ where
         return Ok(error_response(StatusCode::OK, body));
     }
 
-    if ferryman_core::path::bad_path(req.uri().path())
+    if ferryman_core::path::bad_path_normalized(req.uri().path())
         || ferryman_core::path::ambiguous_route(&table, req.uri().path())
     {
         record(started, "none", "none", 400);

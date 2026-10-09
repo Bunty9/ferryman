@@ -17,6 +17,12 @@ and `ferryman` are released together with the same version.
 
 ### Security
 
+- Dot segments hidden behind mixed encodings (`/api/%2%65%2%65/x`,
+  `/api/%%32%65%%32%65/x`, which normalise to `%2e%2e`) are now rejected with
+  400: the path check also runs on the normalised path. New
+  `ferryman_core::path::bad_path_normalized`; `bad_path` is unchanged.
+  Migration: none.
+
 - Request trailers are no longer forwarded: the proxied request body drops
   trailer frames, so a client cannot deliver trust-governed names (`X-Real-IP`)
   to the upstream as trailers. Data frames and timing are unchanged. Migration:

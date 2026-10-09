@@ -143,6 +143,14 @@ pub fn bad_path(path: &str) -> bool {
     false
 }
 
+/// [`bad_path`] on the raw path, and also on its normalised form when the raw
+/// path contains `%`. Catches mixed encodings that only become a dot segment
+/// after normalisation (`/api/%2%65%2%65/x` normalises to `/api/%2e%2e/x`).
+/// This is what the proxy calls; `bad_path` keeps its raw-path semantics.
+pub fn bad_path_normalized(raw: &str) -> bool {
+    bad_path(raw) || (raw.contains('%') && bad_path(&crate::route::normalize(raw)))
+}
+
 /// `.` or `..` after dropping a `;...` suffix and decoding `%2e`.
 fn dot_piece(piece: &[u8]) -> bool {
     let end = piece.iter().position(|&c| c == b';').unwrap_or(piece.len());
@@ -164,6 +172,17 @@ mod tests {
     use super::*;
     use crate::route::{Route, Upstream};
     use std::time::Duration;
+
+    #[test]
+    fn mixed_encodings_hiding_dot_segments_are_rejected() {
+        for p in ["/api/%2%65%2%65/x", "/api/%%32%65%%32%65/x", "/api/%2%65/x"] {
+            assert!(!bad_path(p), "{p} is invisible to the raw check");
+            assert!(bad_path_normalized(p), "{p}");
+        }
+        for p in ["/api/x", "/api/a%2eb", "/api/%41", "/api/%zz"] {
+            assert!(!bad_path_normalized(p), "{p}");
+        }
+    }
 
     #[test]
     fn dot_segments_are_rejected() {

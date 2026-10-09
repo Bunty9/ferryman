@@ -29,6 +29,7 @@ impl Upstream {
         let name = upstream_name(&uri);
         let breaker = Arc::new(Breaker::unchecked(
             Some(name.clone()),
+            true,
             cooldown,
             failure_threshold,
         ));

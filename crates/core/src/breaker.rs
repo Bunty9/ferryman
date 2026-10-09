@@ -24,6 +24,19 @@ fn now_millis() -> u64 {
 }
 
 /// Circuit breaker state. Mirrors the `ferryman_circuit_state` gauge values.
+///
+/// Non-exhaustive: matching without a wildcard arm does not compile.
+///
+/// ```compile_fail,E0004
+/// use ferryman_core::CircuitState;
+/// fn f(s: CircuitState) -> u8 {
+///     match s {
+///         CircuitState::Closed => 0,
+///         CircuitState::Open => 1,
+///         CircuitState::HalfOpen => 2,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -44,6 +57,18 @@ impl CircuitState {
 }
 
 /// Why a request was let through. Pass it back when reporting the result.
+///
+/// Non-exhaustive: matching without a wildcard arm does not compile.
+///
+/// ```compile_fail,E0004
+/// use ferryman_core::Admission;
+/// fn f(a: Admission) -> u8 {
+///     match a {
+///         Admission::Normal => 0,
+///         Admission::Probe => 1,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Admission {
@@ -65,7 +90,8 @@ pub struct BreakerConfig {
     /// How long the circuit stays open before one probe is let through.
     /// Must be at least 1 ms.
     pub cooldown: Duration,
-    /// Label for logs and metric gauges. Unnamed breakers publish no gauges.
+    /// Log label only: standalone breakers never publish metric gauges.
+    /// Keep it to a small fixed set of names.
     pub name: Option<String>,
 }
 
@@ -80,16 +106,21 @@ impl Default for BreakerConfig {
 }
 
 impl BreakerConfig {
+    /// Consecutive failures that open the circuit (must be at least 1).
     pub fn with_failure_threshold(mut self, failure_threshold: u32) -> Self {
         self.failure_threshold = failure_threshold;
         self
     }
 
+    /// Time to stay open before admitting a probe. Validated by
+    /// [`Breaker::new`]: must be at least 1 ms.
     pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
         self.cooldown = cooldown;
         self
     }
 
+    /// Label used in transition logs only (no gauges). Keep it to a small
+    /// fixed set of names, not per-request values.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -133,6 +164,8 @@ impl BreakerConfig {
 /// ```
 pub struct Breaker {
     name: Option<String>,
+    /// Only upstream breakers write the `ferryman_*` gauges.
+    gauges: bool,
     state: AtomicU8,
     consecutive_failures: AtomicU32,
     opened_at_millis: AtomicU64,
@@ -141,12 +174,30 @@ pub struct Breaker {
     cooldown_millis: AtomicU64,
 }
 
+impl std::fmt::Debug for Breaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Breaker")
+            .field("name", &self.name)
+            .field("state", &self.state())
+            .field(
+                "failure_threshold",
+                &self.failure_threshold.load(Ordering::Relaxed),
+            )
+            .field(
+                "cooldown",
+                &Duration::from_millis(self.cooldown_millis.load(Ordering::Relaxed)),
+            )
+            .finish()
+    }
+}
+
 impl Breaker {
     /// Create a closed breaker. Fails if `config` is invalid.
     pub fn new(config: BreakerConfig) -> anyhow::Result<Self> {
         config.validate()?;
         Ok(Self::unchecked(
             config.name,
+            false,
             config.cooldown,
             config.failure_threshold,
         ))
@@ -155,11 +206,13 @@ impl Breaker {
     /// No validation: `Upstream::new` has always accepted any values.
     pub(crate) fn unchecked(
         name: Option<String>,
+        gauges: bool,
         cooldown: Duration,
         failure_threshold: u32,
     ) -> Self {
         let b = Self {
             name,
+            gauges,
             state: AtomicU8::new(CircuitState::Closed as u8),
             consecutive_failures: AtomicU32::new(0),
             opened_at_millis: AtomicU64::new(0),
@@ -295,7 +348,9 @@ impl Breaker {
     /// Publish the *current* state (not a transition target), so racing
     /// transitions can't leave the gauge showing a stale value.
     pub(crate) fn set_gauges(&self) {
-        let Some(name) = &self.name else { return };
+        let (true, Some(name)) = (self.gauges, &self.name) else {
+            return;
+        };
         let state = self.state();
         metrics::gauge!("ferryman_circuit_state", "upstream" => name.clone())
             .set(state as u8 as f64);
@@ -320,6 +375,7 @@ mod tests {
     fn breaker(cooldown_ms: u64, threshold: u32) -> Breaker {
         Breaker::unchecked(
             Some("test:1".to_string()),
+            true,
             Duration::from_millis(cooldown_ms),
             threshold,
         )

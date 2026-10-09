@@ -200,3 +200,9 @@ Embed ferryman as a library (this pattern) when:
   the two listeners, and tying them to one shutdown signal) is something
   you're happy to own and keep working as ferryman's API evolves, in
   exchange for that control.
+
+## Standalone breaker
+
+`src/guarded.rs` shows a standalone `ferryman_core::Breaker` guarding a
+`reqwest` call (no proxy involved); `tests/guarded.rs` runs it against a
+local stub through closed, open and recovery.

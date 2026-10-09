@@ -1,8 +1,8 @@
 //! Guarding a fallible async call with `ferryman-core`'s circuit breaker,
 //! without any of the proxy machinery.
 //!
-//! `Upstream` here isn't routing HTTP requests — it's just an `Arc`-shared
-//! breaker with a label. Anything you can `.await` and get a `Result` from
+//! A standalone [`Breaker`](ferryman_core::Breaker) (no routing table, no
+//! `Upstream`) guards the call. Anything you can `.await` and get a `Result` from
 //! (a database query, a gRPC call, another service's SDK) can be wrapped the
 //! same way: acquire a ticket, make the call only if admitted, report the
 //! ticket back.
@@ -50,7 +50,7 @@
 //! cargo run -p ferryman-core --example guarded_client
 //! ```
 
-use ferryman_core::{CircuitState, Upstream};
+use ferryman_core::{Breaker, BreakerConfig, CircuitState};
 use std::future::Future;
 use std::time::Duration;
 
@@ -73,7 +73,7 @@ enum TimedOut<E> {
 /// the exact ticket `try_acquire` returned. Never calls `call` when the
 /// circuit refuses admission.
 async fn guarded<T, E>(
-    up: &Upstream,
+    up: &Breaker,
     call: impl Future<Output = Result<T, E>>,
 ) -> Result<T, Guarded<E>> {
     let Some(ticket) = up.try_acquire() else {
@@ -97,7 +97,7 @@ async fn guarded<T, E>(
 /// comment's "Timeouts" section for why the timeout has to go here and not
 /// around the whole `guarded(..)` call.
 async fn guarded_with_deadline<T, E>(
-    up: &Upstream,
+    up: &Breaker,
     deadline: Duration,
     call: impl Future<Output = Result<T, E>>,
 ) -> Result<T, Guarded<TimedOut<E>>> {
@@ -125,13 +125,13 @@ async fn main() {
     // threshold 3, cooldown 500ms vs. the 100ms call spacing below: three
     // consecutive failures (calls 3-5) open the circuit, and the first
     // try_acquire that lands 500ms+ after that gets the half-open probe.
-    let up = Upstream::new(
-        // The URI is only an identity/label for the breaker (the `upstream`
-        // metric label and log lines) — no network I/O happens here.
-        "http://inventory.internal".parse().expect("valid uri"),
-        Duration::from_millis(500),
-        3,
-    );
+    let up = Breaker::new(
+        BreakerConfig::default()
+            .with_failure_threshold(3)
+            .with_cooldown(Duration::from_millis(500))
+            .with_name("inventory"),
+    )
+    .expect("valid config");
 
     for n in 1..=20u32 {
         // Captured before the call: nothing else touches this breaker
@@ -165,11 +165,13 @@ async fn main() {
     // threshold 1: a single timeout is enough to trip it, so the breaker
     // state below actually proves the hang was recorded (not just that the
     // call returned Elapsed).
-    let slow_up = Upstream::new(
-        "http://slow.internal".parse().expect("valid uri"),
-        Duration::from_millis(500),
-        1,
-    );
+    let slow_up = Breaker::new(
+        BreakerConfig::default()
+            .with_failure_threshold(1)
+            .with_cooldown(Duration::from_millis(500))
+            .with_name("slow"),
+    )
+    .expect("valid config");
     let hangs_forever = async {
         tokio::time::sleep(Duration::from_secs(3600)).await;
         Ok::<(), &'static str>(())

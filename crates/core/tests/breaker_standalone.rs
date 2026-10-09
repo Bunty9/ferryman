@@ -52,3 +52,15 @@ fn unnamed_breaker_works() {
     b.record_failure(Normal);
     assert_eq!(b.state(), CircuitState::Open);
 }
+
+#[test]
+fn breaker_is_send_sync_and_debug() {
+    fn assert<T: Send + Sync + std::fmt::Debug>() {}
+    assert::<Breaker>();
+    let b = Breaker::new(BreakerConfig::default().with_name("n")).unwrap();
+    let d = format!("{b:?}");
+    assert!(
+        d.contains("Closed") && d.contains("failure_threshold: 3") && d.contains("\"n\""),
+        "{d}"
+    );
+}

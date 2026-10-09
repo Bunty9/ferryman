@@ -39,8 +39,8 @@ and `ferryman` are released together with the same version.
   from the table (`RouteTable::drain_timeout()` / `shutdown_delay()`).
 - PaaS support: bind resolves `--bind` > `FERRYMAN_BIND` > `0.0.0.0:$PORT` >
   `0.0.0.0:8080`; `FERRYMAN_CONFIG_TOML` supplies the config inline (wins over
-  `--config`/`FERRYMAN_CONFIG`, disables the file watch; `check` honours it).
-
+  `--config`/`FERRYMAN_CONFIG`, disables the file watch; `check` honours it). A non-empty invalid `PORT`
+  is a startup error. A second signal during the delay/drain exits with 130.
 - Subcommands `ferryman check [--config]` (validate config + TLS files
   without binding; exit 0/1) and `ferryman healthcheck [--url]` (GET the
   admin `/healthz`, exit 0 on 2xx; no curl needed). The Docker image gains a

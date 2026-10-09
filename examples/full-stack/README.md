@@ -303,7 +303,7 @@ Each is commented in `config/ferryman.toml` with its production value.
   or a cloud load balancer in front of ferryman) — never ship this script
   or its output past a laptop.
 - **`stop_grace_period: 30s`.** ferryman's own SIGTERM handling drains
-  in-flight connections for up to 25s (see `docs/architecture.md`); the
+  in-flight connections for up to `drain_timeout_secs` (default 25s; see `docs/architecture.md`); the
   container orchestrator's grace period must be longer than that or it
   will SIGKILL mid-drain. 30s here, matching `fly.toml`'s
   `kill_timeout` in the main repo.

@@ -229,7 +229,11 @@ impl RouteTable {
         self.drain_timeout
     }
 
-    /// Time to keep accepting (with `/readyz` at 503) after shutdown starts.
+    /// Time to keep accepting (with readiness failing) after shutdown starts.
+    ///
+    /// `ferryman::serve` does NOT apply this: an embedder does it inside its
+    /// shutdown future (flip readiness, then
+    /// `tokio::time::sleep(table.load().shutdown_delay())`, then resolve).
     pub fn shutdown_delay(&self) -> Duration {
         self.shutdown_delay
     }

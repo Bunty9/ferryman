@@ -166,7 +166,7 @@ fail loudly instead of silently falling back to defaults.
 | `keepalive_timeout_secs`         | 10      | HTTP/1 keep-alive idle timeout, 1-86400 (ALB: 75, GCLB: 620).                    |
 | `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
 | `request_body_timeout_secs`      | 300     | Total time to receive a request body, 1-86400 (408 when exceeded).               |
-| `drain_timeout_secs`             | 25      | After the listener closes on shutdown, how long to wait for in-flight requests before cutting them, 1-86400. Keep it under your platform's kill timeout. |
+| `drain_timeout_secs`             | 25      | After the listener closes on shutdown, how long to wait for in-flight requests before cutting them, 1-86400. Delay + drain must stay under the platform kill timeout. |
 | `shutdown_delay_secs`            | 0       | On SIGTERM/SIGINT, `/readyz` flips to 503 at once and ferryman keeps accepting for this long (0-86400) before the drain starts. Read at shutdown, so a reload applies. |
 | `local_health_path`              | none    | Path the proxy answers itself (`GET`/`HEAD` -> `200 ok`, no upstream, no breaker; metric `route="local_health"`), for PaaS platforms that only probe the serving port. Absolute, no `?`/`#`; rejected if equal to a route prefix; shadows a route prefix it falls under (e.g. `/up` under a `/` catch-all). Hot-reloads. |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
@@ -296,17 +296,27 @@ Platforms that inject `PORT` need no flags: `PORT=10000
 FERRYMAN_CONFIG_TOML='[[routes]]...' ferryman` listens on `0.0.0.0:10000`
 with the inline config.
 
-- Cloud Run (SIGTERM, then SIGKILL after 10 s): set `drain_timeout_secs = 8`.
-  It probes the serving port, so set `local_health_path` if you use probes.
+- Cloud Run (SIGTERM, then SIGKILL after 10 s): `shutdown_delay_secs` 0,
+  `drain_timeout_secs` at most 8. It probes the serving port, so set
+  `local_health_path` if you use probes.
 - Render, Railway, Heroku: all set `PORT`; Heroku sends SIGTERM and kills
   after 30 s (the default 25 fits), Render and Railway are configurable.
   Use inline config or a file committed in the image.
-- ECS / Kubernetes: the load balancer needs time to notice the target is
-  leaving. Point the target-group / readiness probe at the admin `/readyz`
-  and set `shutdown_delay_secs` to at least the probe interval times its
-  failure threshold (about 5-15 s; ALB deregistration delay is separate and
-  also keeps connections open). Keep `shutdown_delay_secs + drain_timeout_secs`
-  below ECS `stopTimeout` / the pod's `terminationGracePeriodSeconds`.
+- ECS behind an ALB: the target group's deregistration delay already keeps
+  the task in service before SIGTERM is sent, so `shutdown_delay_secs` is
+  usually unnecessary. Keep `stopTimeout` above delay + drain.
+- Kubernetes: endpoint removal takes about 5-15 s to reach kube-proxy and
+  ingress controllers after the pod starts terminating. Use
+  `shutdown_delay_secs` for that gap (the scratch image has no `sleep`, so
+  an exec `preStop` hook is not an option; newer clusters have the native
+  `lifecycle.preStop.sleep`). Delay + drain must fit
+  `terminationGracePeriodSeconds` (default 30), e.g. delay 10, drain 15.
+  Point the readiness probe at the admin `/readyz`.
+
+On shutdown only the admin `/readyz` signals draining; `local_health_path`
+keeps answering `200 ok` through the delay. A second SIGTERM/SIGINT during
+the delay or drain exits immediately with code 130. Signals received before
+the listeners are up use the OS default action.
 
 ## Behaviour
 

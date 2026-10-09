@@ -79,23 +79,13 @@ fn get(addr: SocketAddr, path: &str) -> Option<u16> {
     buf.split(' ').nth(1)?.parse().ok()
 }
 
-fn free_port() -> u16 {
-    // Racy by nature (released before the child binds); a collision would fail the test loudly.
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 const ROUTE: &str =
     "local_health_path = \"/up\"\n[[routes]]\nprefix = \"/\"\nupstream = \"http://127.0.0.1:1\"\n";
 
 #[test]
 fn port_env_and_inline_config_serve() {
-    let port = free_port();
-    let p = start(ROUTE, &port.to_string());
-    assert_eq!(p.proxy.port(), port, "PORT selects the proxy port");
+    let p = start(ROUTE, "0");
+    assert_ne!(p.proxy.port(), 8080, "PORT=0 (not the default) was bound");
     assert_eq!(get(p.proxy, "/up"), Some(200), "inline config is live");
     assert_eq!(get(p.admin, "/readyz"), Some(200));
 }
@@ -147,6 +137,11 @@ fn shutdown_delay_keeps_serving_then_drain_is_bounded() {
     assert_eq!(get(p.admin, "/readyz"), Some(503));
     assert_eq!(get(p.proxy, "/up"), Some(200), "still accepting in delay");
     assert!(p.child.try_wait().unwrap().is_none());
+    std::thread::sleep(Duration::from_millis(2000)); // past the 2 s delay, still draining
+    assert!(
+        TcpStream::connect_timeout(&p.proxy, Duration::from_millis(500)).is_err(),
+        "listener closed after the delay"
+    );
 
     // Exit = delay (2 s) + drain (1 s, cuts the stuck request); not the 25 s default.
     let status = loop {
@@ -170,4 +165,48 @@ fn shutdown_delay_keeps_serving_then_drain_is_bounded() {
         matches!(inflight.read(&mut b), Ok(0) | Err(_)),
         "request cut, no response"
     );
+}
+
+#[test]
+fn bad_port_is_a_startup_error() {
+    let o = Command::new(env!("CARGO_BIN_EXE_ferryman"))
+        .env("PORT", "nope")
+        .env("FERRYMAN_CONFIG_TOML", ROUTE)
+        .env_remove("FERRYMAN_BIND")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("PORT"));
+}
+
+#[test]
+fn second_signal_exits_130_immediately() {
+    let hang = TcpListener::bind("127.0.0.1:0").unwrap();
+    let toml = format!("shutdown_delay_secs = 20\n{ROUTE}").replace(
+        "http://127.0.0.1:1",
+        &format!("http://{}", hang.local_addr().unwrap()),
+    );
+    let mut p = start(&toml, "0");
+    let kill = |p: &Proc| {
+        Command::new("kill")
+            .args(["-TERM", &p.child.id().to_string()])
+            .status()
+            .unwrap();
+    };
+    kill(&p);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        p.child.try_wait().unwrap().is_none(),
+        "delay holds the exit"
+    );
+    let t0 = Instant::now();
+    kill(&p);
+    let status = loop {
+        if let Some(s) = p.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "no fast exit");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(130));
 }

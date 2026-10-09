@@ -61,6 +61,11 @@ const H2_KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// `drain_timeout_secs`, default 25s, read at that moment) for in-flight
 /// connections to finish.
 ///
+/// `shutdown_delay_secs` is NOT applied here: the caller's `shutdown` future
+/// should flip its readiness signal, sleep `table.load().shutdown_delay()`
+/// and then resolve (see `main.rs` and `examples/embedded`). Signals that
+/// arrive before `serve` starts get the OS default action.
+///
 /// TLS-terminates each connection first when `tls` is `Some`; otherwise
 /// serves plain HTTP. Either way, both HTTP/1 and HTTP/2 are auto-detected.
 pub async fn serve(

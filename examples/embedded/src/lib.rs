@@ -193,13 +193,17 @@ pub async fn start(settings: Settings, metrics: PrometheusHandle) -> anyhow::Res
 
     let proxy_table = shared.clone();
     let mut proxy_shutdown_rx = shutdown_rx.clone();
+    let delay_table = shared.clone();
     let proxy_task: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-        ferryman::serve(
-            proxy_listener,
-            proxy_table,
-            tls,
-            wait_for_shutdown(&mut proxy_shutdown_rx),
-        )
+        ferryman::serve(proxy_listener, proxy_table, tls, async move {
+            wait_for_shutdown(&mut proxy_shutdown_rx).await;
+            // `serve` does not apply `shutdown_delay_secs`: that is the
+            // embedder's job. The admin task here stops on the same signal
+            // (its readiness drops at once); keep the proxy accepting for
+            // the delay so a load balancer can deregister, then `serve`
+            // closes the listener and drains for `drain_timeout_secs`.
+            tokio::time::sleep(delay_table.load().shutdown_delay()).await;
+        })
         .await
     });
 
@@ -259,14 +263,16 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|&v| v).await;
 }
 
-/// `ferryman::serve` stops accepting immediately but then drains in-flight
-/// connections for up to its own internal 25s timeout
-/// (`GRACEFUL_SHUTDOWN_TIMEOUT` in crates/server/src/lib.rs) before dropping
-/// them anyway. `Running::shutdown`'s total bound is set comfortably above
-/// that so a wedged drain can't hang `shutdown` forever — in production this
-/// can legitimately take close to 25s under load; in the test suite there's
-/// nothing in flight, so it returns almost immediately.
-const SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
+/// Margin on top of `shutdown_delay_secs + drain_timeout_secs` (both read
+/// from the live table) before `Running::shutdown` gives up on a task.
+const SHUTDOWN_MARGIN: Duration = Duration::from_secs(5);
+
+/// `serve` drains for `drain_timeout_secs` after its shutdown future
+/// resolves; the delay is this crate's job (see `start`), so the bound
+/// is delay + drain + margin, so a wedged drain can't hang `shutdown`.
+fn shutdown_bound(t: &ferryman_core::RouteTable) -> Duration {
+    t.shutdown_delay() + t.drain_timeout() + SHUTDOWN_MARGIN
+}
 
 /// Await `handle` until `deadline`, aborting it — rather than leaving it
 /// detached and still running — if it doesn't finish in time. `deadline` is
@@ -289,7 +295,7 @@ async fn await_or_abort(
         Err(_elapsed) => {
             abort_handle.abort();
             Err(anyhow::anyhow!(
-                "{name} task did not shut down within the {SHUTDOWN_BOUND:?} shutdown deadline"
+                "{name} task did not shut down within the shutdown deadline"
             ))
         }
     }
@@ -310,7 +316,7 @@ async fn await_or_abort_fallible(
         Err(_elapsed) => {
             abort_handle.abort();
             Err(anyhow::anyhow!(
-                "{name} task did not shut down within the {SHUTDOWN_BOUND:?} shutdown deadline"
+                "{name} task did not shut down within the shutdown deadline"
             ))
         }
     }
@@ -318,8 +324,8 @@ async fn await_or_abort_fallible(
 
 impl Running {
     /// Stop accepting new connections/requests and wait for every
-    /// background task `start` spawned to finish, up to `SHUTDOWN_BOUND`
-    /// (30s total, not per task — see below). Only meant to be called
+    /// background task `start` spawned to finish, up to `shutdown_bound`
+    /// (delay + drain + margin, not per task — see below). Only meant to be called
     /// once — it consumes `self`.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         // Flip the flag once; every clone of `shutdown_rx` wakes on its next
@@ -337,10 +343,10 @@ impl Running {
         self.health_task.abort();
 
         // One deadline, computed once and shared by every await below —
-        // not a fresh `SHUTDOWN_BOUND` per task — so three sequential
-        // awaits bound the *total* wait to ~30s instead of stacking up to
-        // 90s worst case (30s each for proxy, admin, upkeep).
-        let deadline = Instant::now() + SHUTDOWN_BOUND;
+        // not a fresh bound per task — so three sequential
+        // awaits bound the *total* wait instead of stacking three times the
+        // bound (proxy, admin, upkeep).
+        let deadline = Instant::now() + shutdown_bound(&self.table.load());
 
         // Await every remaining task, aborting (rather than leaving it
         // detached) whichever one doesn't finish by `deadline` — and keep

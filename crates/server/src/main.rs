@@ -64,19 +64,18 @@ enum Cmd {
 }
 
 /// `--bind` > `FERRYMAN_BIND` (both parsed by clap) > `0.0.0.0:$PORT` > `0.0.0.0:8080`.
-/// An unparsable `PORT` is ignored with a warning on stderr.
-fn resolve_bind(bind: Option<SocketAddr>, port: Option<&str>) -> SocketAddr {
+/// An empty `PORT` counts as unset; a non-empty invalid one is an error.
+fn resolve_bind(bind: Option<SocketAddr>, port: Option<&str>) -> anyhow::Result<SocketAddr> {
     if let Some(b) = bind {
-        return b;
+        return Ok(b);
     }
-    match port.map(|p| (p, p.trim().parse::<u16>())) {
-        Some((_, Ok(p))) => SocketAddr::from(([0, 0, 0, 0], p)),
-        Some((raw, Err(_))) => {
-            eprintln!("ignoring invalid PORT={raw:?}; using 0.0.0.0:8080");
-            SocketAddr::from(([0, 0, 0, 0], 8080))
-        }
-        None => SocketAddr::from(([0, 0, 0, 0], 8080)),
-    }
+    let port = match port.map(str::trim) {
+        None | Some("") => 8080,
+        Some(p) => p
+            .parse::<u16>()
+            .map_err(|e| anyhow::anyhow!("invalid PORT={p:?}: {e}"))?,
+    };
+    Ok(SocketAddr::from(([0, 0, 0, 0], port)))
 }
 
 /// Where the config comes from. Non-empty `FERRYMAN_CONFIG_TOML` (inline TOML)
@@ -84,8 +83,14 @@ fn resolve_bind(bind: Option<SocketAddr>, port: Option<&str>) -> SocketAddr {
 /// passes `--config`, so a flag cannot be the tiebreaker); no file is
 /// watched then.
 fn load_cfg(args: &Args) -> anyhow::Result<(ferryman_core::ConfigToml, Option<PathBuf>)> {
+    use anyhow::Context;
     match std::env::var("FERRYMAN_CONFIG_TOML") {
-        Ok(raw) if !raw.trim().is_empty() => Ok((raw.parse()?, None)),
+        Ok(raw) if !raw.trim().is_empty() => {
+            Ok((raw.parse().context("parsing FERRYMAN_CONFIG_TOML")?, None))
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("FERRYMAN_CONFIG_TOML is not valid UTF-8")
+        }
         _ => {
             let path = args.config.clone().unwrap_or_else(|| "config.toml".into());
             Ok((load_config(&path)?, Some(path)))
@@ -163,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let bind = resolve_bind(args.bind, std::env::var("PORT").ok().as_deref());
+    let bind = resolve_bind(args.bind, std::env::var("PORT").ok().as_deref())?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(addr = %listener.local_addr()?, tls = tls_acceptor.is_some(), "ferryman listening");
 
@@ -179,8 +184,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %admin_addr, "admin listener bound (/metrics, /healthz, /readyz)");
 
     let table = shared.clone();
+    let signalled = Arc::new(AtomicBool::new(false));
+    let first = signalled.clone();
     let shutdown = async move {
         shutdown_signal().await;
+        first.store(true, Ordering::Relaxed);
         // Readiness flips first; /readyz stays up (503) through the delay and
         // the drain. The proxy keeps accepting until the delay elapses.
         draining.store(true, Ordering::Relaxed);
@@ -190,7 +198,25 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(delay).await;
         }
     };
-    ferryman::serve(listener, shared, tls_acceptor, shutdown).await
+    // A second signal during the delay or drain exits at once with 130.
+    let res = tokio::select! {
+        r = ferryman::serve(listener, shared, tls_acceptor, shutdown) => r,
+        () = second_signal(&signalled) => {
+            tracing::warn!("second signal during shutdown, exiting immediately");
+            std::process::exit(130);
+        }
+    };
+    // Exit explicitly: a stuck spawn_blocking (DNS) must not outlive the drain bound.
+    res?;
+    std::process::exit(0);
+}
+
+/// Resolves on a signal arriving after the first one was taken.
+async fn second_signal(first: &AtomicBool) {
+    while !first.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    shutdown_signal().await;
 }
 
 /// Prints the error chain to stderr; returns the process exit code.
@@ -279,11 +305,15 @@ mod tests {
     #[test]
     fn bind_order() {
         let b = Some("127.0.0.1:1".parse().unwrap());
-        assert_eq!(resolve_bind(b, Some("9000")).to_string(), "127.0.0.1:1");
-        assert_eq!(resolve_bind(None, Some("9000")).to_string(), "0.0.0.0:9000");
-        assert_eq!(resolve_bind(None, None).to_string(), "0.0.0.0:8080");
-        for bad in ["", "abc", "70000", "-1"] {
-            assert_eq!(resolve_bind(None, Some(bad)).to_string(), "0.0.0.0:8080");
+        let ok = |b, p| resolve_bind(b, p).unwrap().to_string();
+        assert_eq!(ok(b, Some("9000")), "127.0.0.1:1");
+        assert_eq!(ok(None, Some("9000")), "0.0.0.0:9000");
+        assert_eq!(ok(None, None), "0.0.0.0:8080");
+        assert_eq!(ok(None, Some("")), "0.0.0.0:8080");
+        for bad in ["abc", "70000", "-1"] {
+            let e = resolve_bind(None, Some(bad)).unwrap_err().to_string();
+            assert!(e.contains("PORT"), "{e}");
         }
+        assert_eq!(ok(b, Some("abc")), "127.0.0.1:1");
     }
 }

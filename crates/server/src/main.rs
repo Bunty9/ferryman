@@ -184,11 +184,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %admin_addr, "admin listener bound (/metrics, /healthz, /readyz)");
 
     let table = shared.clone();
-    let signalled = Arc::new(AtomicBool::new(false));
+    let signalled = Arc::new(tokio::sync::Notify::new());
     let first = signalled.clone();
     let shutdown = async move {
         shutdown_signal().await;
-        first.store(true, Ordering::Relaxed);
+        first.notify_one();
         // Readiness flips first; /readyz stays up (503) through the delay and
         // the drain. The proxy keeps accepting until the delay elapses.
         draining.store(true, Ordering::Relaxed);
@@ -212,10 +212,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Resolves on a signal arriving after the first one was taken.
-async fn second_signal(first: &AtomicBool) {
-    while !first.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+async fn second_signal(first: &tokio::sync::Notify) {
+    first.notified().await;
     shutdown_signal().await;
 }
 

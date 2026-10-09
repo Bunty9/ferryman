@@ -480,14 +480,14 @@ mod tests {
 
     #[test]
     fn closed_always_acquires() {
-        let b = breaker(50, 3);
+        let b = breaker(1_000, 3);
         assert_eq!(b.state(), CircuitState::Closed);
         assert_eq!(b.try_acquire(), Some(N));
     }
 
     #[test]
     fn opens_after_threshold_failures() {
-        let b = breaker(50, 3);
+        let b = breaker(1_000, 3);
         b.record_failure(N);
         b.record_failure(N);
         assert_eq!(b.state(), CircuitState::Closed);
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn success_resets_failure_count() {
-        let b = breaker(50, 2);
+        let b = breaker(1_000, 2);
         b.record_failure(N);
         b.record_success(N);
         b.record_failure(N);

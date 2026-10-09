@@ -18,9 +18,12 @@ pub enum Error {
         source: std::io::Error,
     },
     /// The config file is not valid TOML for the schema.
-    #[error("parsing config file {}", path.display())]
+    ///
+    /// `path` is `None` when parsed from a string or table
+    /// ([`ConfigToml::from_str`](crate::ConfigToml), `from_table`).
+    #[error("parsing config{}", match path { Some(p) => format!(" file {}", p.display()), None => String::new() })]
     Toml {
-        path: PathBuf,
+        path: Option<PathBuf>,
         #[source]
         source: toml::de::Error,
     },

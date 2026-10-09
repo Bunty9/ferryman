@@ -9,6 +9,10 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- `ConfigToml::from_table(toml::Table)` and `ConfigToml: FromStr` (shared
+  parse path with `load_config`). Core never claims the top-level names
+  `mtls`, `jwt`, `limits`, `tls`, `tenant_rps` (reserved for ferryman-edge).
+
 - Per-route `health_path` (default `/health`; absolute, no `?`/`#`) and
   `health_disabled` (default `false`) keys, plus `Upstream::with_health`,
   `health_path()` and `health_disabled()`. Disabled upstreams get no probes
@@ -32,6 +36,10 @@ and `ferryman` are released together with the same version.
   holding the half-open probe no longer blocks recovery for a cooldown.
 
 ### Changed (breaking)
+
+- `Error::Toml { path }` is now `Option<PathBuf>` (`None` for `from_str` /
+  `from_table`). Migration: `path.display()` becomes `path.as_deref()`;
+  `Display` is unchanged when the path is set.
 
 - `CircuitState` and `Admission` are now `#[non_exhaustive]`.
   **Migration:** add a `_ =>` arm to any `match` on either enum.

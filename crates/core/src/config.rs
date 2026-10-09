@@ -15,6 +15,11 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Top-level config file.
+///
+/// Reserved: the top-level names `mtls`, `jwt`, `limits`, `tls` and
+/// `tenant_rps` are never claimed by core; an embedding (ferryman-edge)
+/// strips them before [`ConfigToml::from_table`]. Any other unknown key is
+/// rejected.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -110,10 +115,41 @@ pub fn load_config(path: &Path) -> Result<ConfigToml, Error> {
         path: path.to_path_buf(),
         source,
     })?;
-    toml::from_str(&raw).map_err(|source| Error::Toml {
-        path: path.to_path_buf(),
-        source,
+    raw.parse().map_err(|e| match e {
+        Error::Toml { source, .. } => Error::Toml {
+            path: Some(path.to_path_buf()),
+            source,
+        },
+        e => e,
     })
+}
+
+impl std::str::FromStr for ConfigToml {
+    type Err = Error;
+
+    /// Parse config text (no file context: [`Error::Toml`] has `path: None`).
+    fn from_str(s: &str) -> Result<Self, Error> {
+        toml::from_str(s).map_err(|source| Error::Toml { path: None, source })
+    }
+}
+
+impl ConfigToml {
+    /// Build a config from an already-parsed TOML table (two-pass parse: the
+    /// caller removes the keys it owns first). `deny_unknown_fields` applies
+    /// to whatever remains.
+    ///
+    /// Core never claims the top-level names `mtls`, `jwt`, `limits`, `tls`
+    /// and `tenant_rps`; they are reserved for ferryman-edge, which strips
+    /// them before calling this.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Toml`] (with `path: None`) on unknown keys or wrong types.
+    pub fn from_table(table: toml::Table) -> Result<Self, Error> {
+        table
+            .try_into()
+            .map_err(|source| Error::Toml { path: None, source })
+    }
 }
 
 /// Build a [`RouteTable`] from a parsed [`ConfigToml`], validating routes
@@ -492,6 +528,43 @@ mod tests {
         assert!(toml::from_str::<ConfigToml>(raw).is_err());
         let raw = "[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\ncooldown_sec = 5\n";
         assert!(toml::from_str::<ConfigToml>(raw).is_err());
+    }
+
+    const MIN: &str = "[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n";
+
+    #[test]
+    fn from_table_rejects_unknown_and_accepts_stripped_edge_keys() {
+        let mut t: toml::Table = format!("failure_treshold = 1\n{MIN}").parse().unwrap();
+        let e = ConfigToml::from_table(t.clone()).unwrap_err();
+        assert!(matches!(e, Error::Toml { path: None, .. }), "{e}");
+        t.remove("failure_treshold");
+        t.insert("tenant_rps".into(), 5.into());
+        t.insert("jwt".into(), toml::Table::new().into());
+        t.insert("limits".into(), toml::Table::new().into());
+        assert!(ConfigToml::from_table(t.clone()).is_err());
+        for k in ["tenant_rps", "jwt", "limits"] {
+            t.remove(k);
+        }
+        assert_eq!(ConfigToml::from_table(t).unwrap().routes.len(), 1);
+    }
+
+    #[test]
+    fn from_str_matches_load_config_and_has_no_path() {
+        let p = std::env::temp_dir().join(format!("ferryman-a4-{}.toml", std::process::id()));
+        let raw = format!("failure_threshold = 7\n{MIN}");
+        std::fs::write(&p, &raw).unwrap();
+        let a = load_config(&p).unwrap();
+        let b: ConfigToml = raw.parse().unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        std::fs::write(&p, "routes = 3").unwrap();
+        let Error::Toml { path, .. } = load_config(&p).unwrap_err() else {
+            panic!()
+        };
+        assert_eq!(path.as_deref(), Some(p.as_path()));
+        std::fs::remove_file(&p).ok();
+        let e = "routes = 3".parse::<ConfigToml>().unwrap_err();
+        assert!(matches!(&e, Error::Toml { path: None, .. }));
+        assert_eq!(e.to_string(), "parsing config");
     }
 
     #[test]

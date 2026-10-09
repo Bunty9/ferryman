@@ -23,7 +23,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 
 - Breaker results go through `Admission` tickets: only `Probe` may leave open/half-open; `Normal` results only count while closed.
 - Health loop reports as `Probe`; a probe success while closed is a no-op (must not reset request failure counts). A probe failure while Open is a no-op too (no `opened_at` re-stamp); only HalfOpen -> Open stamps, so a broken health endpoint can't starve the request-path half-open probe.
-- `release(Probe)` only re-arms the probe slot while HalfOpen, at most once per cooldown, and never changes state or counts; client-side failures (408, client body error, bad request) `release`, they never `record_*`.
+- `release(Probe)` only re-arms the probe slot while HalfOpen, at most once per cooldown, and never changes state or counts; client-side failures (408, client body error, URI-rebuild 502) `release`, they never `record_*`.
 - Routes sharing an upstream must agree on `cooldown_secs`, `health_path`, `health_disabled` (build_table error). Reload with changed health keys reuses the `Arc<Breaker>` (state kept); `health_disabled` upstreams are skipped by the health loop.
 - `build_table` validates everything before touching `prev` breakers; reload reuses the same `Arc<Breaker>` per `host:port`.
 - `lookup` ignores health: dead upstream = 503, never fall back to a shorter prefix.

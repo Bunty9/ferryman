@@ -208,8 +208,9 @@ itself. Health results are authoritative, like the half-open probe:
   the cooldown. Once the cooldown has elapsed, one request is let through
   as the half-open probe whether or not `/health` is failing, and if it
   succeeds the circuit closes. So a broken health endpoint no longer pins a
-  circuit open while real traffic works (it can still reopen it only via a
-  failed half-open probe, or a failing check landing while half-open).
+  circuit open while real traffic works (failing checks while closed still count toward `failure_threshold`, and
+  a failed half-open probe or a failing check landing while half-open
+  reopens it).
   Without a running health loop, recovery is the same: cooldown expiry plus
   one successful half-open request.
 - Health failures while the circuit is closed do count toward

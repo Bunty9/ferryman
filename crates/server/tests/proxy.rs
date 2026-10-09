@@ -980,23 +980,33 @@ async fn abandoned_probe(proxy: SocketAddr) {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(s);
-    tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
 #[tokio::test]
 async fn abandoned_half_open_probe_is_released_immediately() {
     let proxy = open_then_cooled_down().await;
     abandoned_probe(proxy).await;
-    // Well inside the 1 s cooldown: the slot was handed back, so this
-    // request is the next probe (200 closes the circuit), not a 503.
-    let r = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
-    assert_eq!(r.status(), 200);
+    // Well inside the 1 s cooldown: the slot is handed back once the proxy
+    // notices the hang-up, so this request becomes the next probe (200
+    // closes the circuit). A 503 doesn't consume the probe; retry briefly.
+    let url = format!("http://{proxy}/svc-a");
+    let mut status = 503;
+    for _ in 0..12 {
+        status = reqwest::get(&url).await.unwrap().status().as_u16();
+        if status != 503 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, 200);
 }
 
 #[tokio::test]
 async fn repeated_abandoned_probes_rearm_at_most_once_per_cooldown() {
     let proxy = open_then_cooled_down().await;
     abandoned_probe(proxy).await; // takes the probe, release re-arms
+                                  // Let the proxy notice the hang-up and release (nothing observable to poll).
+    tokio::time::sleep(Duration::from_millis(150)).await;
     abandoned_probe(proxy).await; // takes it again, release must not re-arm
     let url = format!("http://{proxy}/svc-a");
     assert_eq!(reqwest::get(&url).await.unwrap().status(), 503);

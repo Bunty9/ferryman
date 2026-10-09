@@ -218,6 +218,12 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 reason: format!("{p:?} must start with '/' and contain no '?' or '#'"),
             });
         }
+        if crate::path::bad_path(p) {
+            return Err(Error::InvalidConfig {
+                key: "local_health_path",
+                reason: format!("{p:?} is not an acceptable request path"),
+            });
+        }
         if let Some(r) = cfg.routes.iter().find(|r| &r.prefix == p) {
             return Err(Error::InvalidConfig {
                 key: "local_health_path",
@@ -494,7 +500,7 @@ mod tests {
 
     #[test]
     fn local_health_path_validation() {
-        for bad in ["healthz", "/h?x=1", "/h#f", "/svc-a"] {
+        for bad in ["healthz", "/h?x=1", "/h#f", "/svc-a", "/a/../b", "/a%00"] {
             let mut c = cfg(vec![route("/svc-a", "http://h:1")]);
             c.local_health_path = Some(bad.into());
             assert!(

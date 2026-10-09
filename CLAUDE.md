@@ -31,7 +31,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Client-side body errors (`hyper::Error::is_user`) and stalled or over-long uploads (`request_body_idle_timeout_secs` / `request_body_timeout_secs`, 408) never trip the breaker. `upstream_timeout` starts at request-body EOS (immediately if bodyless); a 504 after that is recorded as a breaker failure, as is an upstream that stops reading the upload for a whole `upstream_timeout` window (hyper not polling the body while not waiting on the client).
 - A client that stalled its upload for >= theta = min(1s, `request_body_idle_timeout`/2) is never blamed for an upstream 502/503/504/transport error (ticket is `release`d, status unchanged); the 504 timer branch still counts. (handle_streaming only; the deprecated `handle` is unchanged.)
 - Metric labels are config-bounded (`route` = prefix, `upstream` = host:port); never label with raw paths.
-- Gauges: exporter is installed before any gauge write; health loop republishes every tick (removed upstreams expire via `idle_timeout`).
+- Gauges: recorder is installed before any gauge write; health loop republishes every tick (removed upstreams expire via `idle_timeout`).
 - `examples/*` crates are workspace members with `publish = false`.
 - Examples use only ferryman's public API — no `pub(crate)`/internal access.
 - Example demo timings (health interval, cooldown, timeouts) are shortened for a fast tour; each is commented with its production value.
@@ -40,7 +40,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 
 - rustls/tokio-rustls use `ring` only (default-features off). Default `aws-lc-rs` breaks the musl scratch Docker build.
 - reqwest has no TLS features (health probes are plain http); adding `rustls-tls` pulls `webpki-roots` (CDLA license, deny fails).
-- metrics-exporter-prometheus: `default-features = false, features = ["http-listener"]` (push-gateway pulls hyper-rustls/aws-lc).
+- metrics-exporter-prometheus: `default-features = false` (no features; `http-listener` is unused since the admin server is ours, push-gateway pulls hyper-rustls/aws-lc).
 - Don't add `rustls-pemfile` (unmaintained advisory); use `rustls::pki_types::pem::PemObject`.
 - `rust-toolchain.toml` is in `.dockerignore` on purpose: it made rustup switch to a toolchain without the musl target.
 - CI test job sets `RUSTUP_TOOLCHAIN=${{ matrix.rust }}`; otherwise the toolchain file forces stable on the beta leg.

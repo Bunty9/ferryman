@@ -63,12 +63,13 @@ and `ferryman` are released together with the same version.
 ### Changed (breaking)
 
 - The metrics listener is now ferryman's own admin server, not the
-  Prometheus exporter's. Previously every path and method returned the
-  metrics; now only `GET`/`HEAD /metrics` does (other paths 404, other
-  methods 405). Scrape configs using the default `/metrics` path are
-  unaffected; anything scraping `/` must switch to `/metrics`. The
-  `http-listener` feature of `metrics-exporter-prometheus` is no longer used.
-  `ConfigToml` gains a field (it is `#[non_exhaustive]`; no migration).
+  Prometheus exporter's. The old one answered `OK` on `/health` and metrics
+  on every other path and method; now `GET`/`HEAD` `/metrics` is metrics,
+  `/healthz` (alias `/health`) is `200 ok`, `/readyz` is readiness, other
+  paths 404 and other methods 405. Scrape configs and probes must use
+  `/metrics`, `/healthz` (or `/health`) or `/readyz`. The admin server is
+  HTTP/1 only. The `http-listener` feature of `metrics-exporter-prometheus`
+  is no longer used. `ConfigToml` gains a field (it is `#[non_exhaustive]`; no migration).
 
 - `build_table` rejects route prefixes containing `;`, `\`, `%2F` or `%5C`
   (`Error::NonCanonicalPrefix`): every request to them would be 400.

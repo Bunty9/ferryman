@@ -15,9 +15,10 @@ contract (config keys, status codes, metrics) is in the
 |                  | `health.rs`                             | Concurrent active health checks                                  |
 | `ferryman`       | `lib.rs`                                | `serve`: accept loop, deadlines, TLS, graceful shutdown          |
 |                  | `proxy.rs`                              | Per-request handler                                              |
+|                  | `admin.rs`                              | `/metrics`, `/healthz`, `/readyz` server                         |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
 |                  | `reload.rs`                             | Debounced config file watcher                                    |
-|                  | `main.rs`                               | CLI, tracing, metrics recorder, admin server, signal handling                  |
+|                  | `main.rs`                               | CLI, tracing, metrics recorder, signal handling                  |
 
 `ferryman` is a library plus a thin binary so the end-to-end tests
 can drive the real `serve` loop on an ephemeral port.

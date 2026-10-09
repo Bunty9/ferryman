@@ -96,9 +96,9 @@ pub struct Running {
 /// upstream removed by a hot reload stops being reported instead of
 /// reporting a stale value forever (see health.rs / reload.rs).
 ///
-/// Unlike `crates/server/src/main.rs`, this builder is never told to open
-/// its own HTTP listener (`with_http_listener`): this crate's admin server
-/// (`admin.rs`) renders `/metrics` itself from the returned
+/// Like `crates/server/src/main.rs` (whose admin server is
+/// `ferryman::admin`), this builder never opens its own HTTP listener: this
+/// crate's admin server renders `/metrics` itself from the returned
 /// [`PrometheusHandle`], so an embedding app that already runs its own
 /// admin/ops HTTP surface can fold ferryman's metrics into it instead of
 /// ferryman opening a second port nobody asked for.

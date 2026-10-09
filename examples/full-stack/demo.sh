@@ -399,6 +399,8 @@ else
     fail "breaker never refused a request (no bare 503 without x-served-by) within 5 tries"
 fi
 
+expect_status "$METRICS/healthz" 200
+expect_status "$METRICS/readyz" 200
 expect_body_contains "$METRICS/metrics" 'ferryman_circuit_state{upstream="orders:8080"} 1'
 
 # Recovery: the breaker now blocks the proxied admin/fail?on=0 too, and

@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     let table = build_table(cfg, None)?;
 
     // Recorder installed before any gauge is set, or the writes go to the
-    // no-op recorder. The admin server (below) renders it on /metrics. The
+    // no-op recorder. The admin server (spawned once the proxy port is bound) renders it on /metrics. The
     // health loop rewrites every live gauge each tick, so gauges of upstreams
     // removed by a reload expire after a few missed ticks instead of
     // reporting a stale value forever.
@@ -76,13 +76,6 @@ async fn main() -> anyhow::Result<()> {
         .idle_timeout(MetricKindMask::GAUGE, Some(interval * 3))
         .install_recorder()?;
     let draining = Arc::new(AtomicBool::new(false));
-    let admin_listener = tokio::net::TcpListener::bind(args.metrics_bind).await?;
-    tokio::spawn(admin::serve_admin(
-        admin_listener,
-        metrics,
-        draining.clone(),
-    ));
-    tracing::info!(addr = %args.metrics_bind, "admin listener bound (/metrics, /healthz, /readyz)");
     table.publish_gauges();
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 
@@ -92,6 +85,16 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, tls = tls_acceptor.is_some(), "ferryman listening");
+
+    // Spawned after the proxy port is bound so /readyz is never 200 before
+    // the proxy can accept.
+    let admin_listener = tokio::net::TcpListener::bind(args.metrics_bind).await?;
+    tokio::spawn(admin::serve_admin(
+        admin_listener,
+        metrics,
+        draining.clone(),
+    ));
+    tracing::info!(addr = %args.metrics_bind, "admin listener bound (/metrics, /healthz, /readyz)");
 
     let shutdown = async move {
         shutdown_signal().await;

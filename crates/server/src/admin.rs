@@ -1,16 +1,18 @@
-//! Admin server on the metrics bind: `GET /metrics`, `/healthz`, `/readyz`.
+//! Admin server on the metrics bind: `GET /metrics`, `/healthz` (alias
+//! `/health`), `/readyz`. HTTP/1 only, with a header-read deadline so idle
+//! sockets cannot pin file descriptors.
 //!
 //! Readiness only reflects whether this process is accepting traffic (it
 //! flips to 503 once shutdown begins); it is deliberately not tied to
 //! upstream health, so a dead upstream never takes the proxy out of rotation.
 
-use http::{header, Method, Response, StatusCode};
+use http::{header, HeaderValue, Method, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto::Builder;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,11 +20,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-fn respond(status: StatusCode, ctype: &str, body: String) -> Response<Full<Bytes>> {
+/// Time a client has to send a request head (also bounds idle keep-alive).
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn respond(status: StatusCode, ctype: &'static str, body: String) -> Response<Full<Bytes>> {
     let mut r = Response::new(Full::new(Bytes::from(body)));
     *r.status_mut() = status;
     r.headers_mut()
-        .insert(header::CONTENT_TYPE, ctype.parse().unwrap());
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
     r
 }
 
@@ -45,7 +50,7 @@ fn route(
             "text/plain; version=0.0.4",
             metrics.render(),
         ),
-        "/healthz" => respond(StatusCode::OK, TEXT, "ok".into()),
+        "/healthz" | "/health" => respond(StatusCode::OK, TEXT, "ok".into()),
         "/readyz" if draining.load(Ordering::Relaxed) => {
             respond(StatusCode::SERVICE_UNAVAILABLE, TEXT, "draining".into())
         }
@@ -54,40 +59,54 @@ fn route(
     }
 }
 
-/// Serve the admin endpoints on `listener` until the future is dropped.
+/// Serve the admin endpoints on `listener`; runs until the returned future
+/// is dropped (which also stops the histogram upkeep it drives every 5 s).
 /// `draining` is set by the caller when shutdown begins (`/readyz` then
-/// returns 503). Also runs the recorder's histogram upkeep every 5 s, as the
-/// exporter's own listener used to.
+/// returns 503).
+///
+/// Note: `PrometheusHandle` is a `metrics-exporter-prometheus` 0.16 type, so
+/// this signature is coupled to that crate's version.
 pub async fn serve_admin(
     listener: TcpListener,
     metrics: PrometheusHandle,
     draining: Arc<AtomicBool>,
 ) {
-    let upkeep = metrics.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            tick.tick().await;
-            upkeep.run_upkeep();
+    let upkeep = {
+        let metrics = metrics.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                metrics.run_upkeep();
+            }
         }
-    });
-    let mut builder = Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(Duration::from_secs(10));
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let (metrics, draining, builder) = (metrics.clone(), draining.clone(), builder.clone());
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| {
-                let r = route(&req, &metrics, &draining);
-                async move { Ok::<_, Infallible>(r) }
+    };
+    let accept = async {
+        loop {
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    tracing::warn!(?e, "admin accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let (metrics, draining) = (metrics.clone(), draining.clone());
+            tokio::spawn(async move {
+                let svc = service_fn(move |req| {
+                    let r = route(&req, &metrics, &draining);
+                    async move { Ok::<_, Infallible>(r) }
+                });
+                let _ = http1::Builder::new()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_READ_TIMEOUT)
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
             });
-            let _ = builder.serve_connection(TokioIo::new(stream), svc).await;
-        });
+        }
+    };
+    tokio::select! {
+        _ = upkeep => {}
+        _ = accept => {}
     }
 }

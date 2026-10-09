@@ -241,6 +241,22 @@ CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
 (`FERRYMAN_METRICS_BIND`, `0.0.0.0:9090`), `--tls-cert` / `--tls-key`
 (`FERRYMAN_TLS_CERT` / `FERRYMAN_TLS_KEY`).
 
+### Subcommands
+
+- `ferryman` (no subcommand) runs the proxy, as before.
+- `ferryman check [--config PATH]` validates the config (parse, route table,
+  and TLS cert/key when `--tls-cert`/`--tls-key` are set) without binding
+  anything. Prints `config ok: N routes` or the error chain to stderr; exit 0
+  or 1. Use it as a CI gate before deploying a config.
+- `ferryman healthcheck [--url URL]` does an HTTP/1 GET (3 s budget) on
+  `http://127.0.0.1:<--metrics-bind port>/healthz` and exits 0 on 2xx, else 1.
+  The Docker image has no shell or curl, so this is its `HEALTHCHECK`
+  (`CMD ["/usr/local/bin/ferryman", "healthcheck"]`, built into the image);
+  in an ECS task definition use `"healthCheck": {"command": ["CMD",
+  "/usr/local/bin/ferryman", "healthcheck"]}`. If you set a non-default
+  metrics port via flag, pass `--metrics-bind` (or `FERRYMAN_METRICS_BIND`) to
+  the healthcheck too, or give `--url`.
+
 ## Running behind a load balancer
 
 An LB that reuses backend connections needs ferryman to keep them open

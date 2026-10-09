@@ -57,5 +57,9 @@ WORKDIR /app
 COPY --from=builder /out/ferryman /usr/local/bin/ferryman
 COPY config.toml /app/config.toml
 EXPOSE 8080 9090
+# Exec form: scratch has no shell or curl. Probes the admin /healthz on the
+# metrics port (override with FERRYMAN_METRICS_BIND at run time).
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/usr/local/bin/ferryman", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/ferryman"]
 CMD ["--config", "/app/config.toml"]

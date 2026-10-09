@@ -3,7 +3,7 @@
 //! watcher, then hands off to [`ferryman::serve`].
 
 use arc_swap::ArcSwap;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use ferryman::{admin, reload, tls, LATENCY_BUCKETS};
 use ferryman_core::{build_table, health_loop, load_config, SharedTable};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -18,8 +18,16 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "ferryman", about = "ferryman L7 reverse proxy", version)]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
     /// Path to the TOML routing config.
-    #[arg(long, env = "FERRYMAN_CONFIG", default_value = "config.toml")]
+    #[arg(
+        long,
+        global = true,
+        env = "FERRYMAN_CONFIG",
+        default_value = "config.toml"
+    )]
     config: PathBuf,
 
     /// Bind address for the proxy listener.
@@ -27,29 +35,60 @@ struct Args {
     bind: SocketAddr,
 
     /// Bind address for the admin listener (`/metrics`, `/healthz`, `/readyz`).
-    #[arg(long, env = "FERRYMAN_METRICS_BIND", default_value = "0.0.0.0:9090")]
+    #[arg(
+        long,
+        global = true,
+        env = "FERRYMAN_METRICS_BIND",
+        default_value = "0.0.0.0:9090"
+    )]
     metrics_bind: SocketAddr,
 
     /// TLS certificate PEM path. Requires `--tls-key`; omit both to serve
     /// plain HTTP.
-    #[arg(long, env = "FERRYMAN_TLS_CERT")]
+    #[arg(long, global = true, env = "FERRYMAN_TLS_CERT")]
     tls_cert: Option<PathBuf>,
 
     /// TLS private key PEM path. Requires `--tls-cert`.
-    #[arg(long, env = "FERRYMAN_TLS_KEY")]
+    #[arg(long, global = true, env = "FERRYMAN_TLS_KEY")]
     tls_key: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Validate the config (and TLS files) without binding; exit 0 or 1.
+    Check,
+    /// GET the admin `/healthz` and exit 0 on 2xx, else 1 (for container
+    /// HEALTHCHECKs; the image has no curl).
+    Healthcheck {
+        /// Full URL to probe. Default: `http://127.0.0.1:<metrics-bind port>/healthz`.
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    match &args.cmd {
+        Some(Cmd::Check) => {
+            std::process::exit(report(check(&args), |n| eprintln!("config ok: {n} routes")))
+        }
+        Some(Cmd::Healthcheck { url }) => {
+            let url = url.clone().unwrap_or_else(|| {
+                // Wildcard binds are not connectable on every OS: use loopback.
+                format!("http://127.0.0.1:{}/healthz", args.metrics_bind.port())
+            });
+            std::process::exit(report(healthcheck(&url).await, |()| {}));
+        }
+        None => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .json()
         .init();
-
-    let args = Args::parse();
 
     let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => Some(tls::load_acceptor(cert, key)?),
@@ -102,6 +141,57 @@ async fn main() -> anyhow::Result<()> {
         draining.store(true, Ordering::Relaxed);
     };
     ferryman::serve(listener, shared, tls_acceptor, shutdown).await
+}
+
+/// Prints the error chain to stderr; returns the process exit code.
+fn report<T>(r: anyhow::Result<T>, ok: impl FnOnce(T)) -> i32 {
+    match r {
+        Ok(v) => {
+            ok(v);
+            0
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            1
+        }
+    }
+}
+
+/// `ferryman check`: same validation as startup, minus binding. Returns the route count.
+fn check(args: &Args) -> anyhow::Result<usize> {
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        tls::load_acceptor(cert, key)?;
+    } else if args.tls_cert.is_some() || args.tls_key.is_some() {
+        anyhow::bail!("--tls-cert and --tls-key must both be set or both omitted");
+    }
+    let cfg = load_config(&args.config)?;
+    let n = cfg.routes.len();
+    build_table(cfg, None)?;
+    Ok(n)
+}
+
+/// `ferryman healthcheck`: HTTP/1 GET with a 3 s total budget; Ok on 2xx.
+async fn healthcheck(url: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let uri: hyper::Uri = url.parse().context("invalid --url")?;
+    anyhow::ensure!(uri.scheme_str() == Some("http"), "--url must be http://");
+    let host = uri.host().context("--url has no host")?;
+    let port = uri.port_u16().unwrap_or(80);
+    let path = uri.path_and_query().map_or("/", |p| p.as_str());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let stream = tokio::net::TcpStream::connect((host.trim_matches(['[', ']']), port)).await?;
+        let (mut tx, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
+        tokio::spawn(conn);
+        let req = hyper::Request::get(path)
+            .header(hyper::header::HOST, uri.authority().unwrap().as_str())
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
+        let status = tx.send_request(req).await?.status();
+        anyhow::ensure!(status.is_success(), "unhealthy: {status}");
+        Ok(())
+    })
+    .await
+    .context("timed out")?
 }
 
 /// Resolves on SIGINT or SIGTERM, for graceful shutdown.

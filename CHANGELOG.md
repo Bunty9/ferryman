@@ -32,6 +32,11 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Subcommands `ferryman check [--config]` (validate config + TLS files
+  without binding; exit 0/1) and `ferryman healthcheck [--url]` (GET the
+  admin `/healthz`, exit 0 on 2xx; no curl needed). The Docker image gains a
+  `HEALTHCHECK` using it. Running with no subcommand is unchanged.
+
 - Admin server on the metrics bind: `/metrics`, `/healthz` (liveness) and
   `/readyz` (200, then 503 once shutdown begins; not tied to upstream
   health). Public `ferryman::admin::serve_admin`. New top-level config key

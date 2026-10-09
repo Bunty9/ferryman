@@ -327,12 +327,10 @@ Each is commented in `config/ferryman.toml` with its production value.
   — restart the pod (or use a sidecar/init pattern that does a real
   rename-replace) after a config change, and don't rely on live reload
   there the way this demo does with a plain bind mount.
-- **No `docker HEALTHCHECK` is possible.** The ferryman image is `FROM
-  scratch` — no shell, no `curl`, nothing a `HEALTHCHECK` instruction
-  could exec. Rely on Prometheus's own `up` metric (see
-  `prometheus/alerts.yml`'s `FerrymanDown` rule) or an external prober
-  hitting `/metrics` or a route through the proxy, not a container-level
-  health check.
+- **No shell or `curl` in the image**, so a `HEALTHCHECK` must be exec
+  form: the published image has one (`ferryman healthcheck`). This demo
+  still relies on Prometheus's `up` metric (see `prometheus/alerts.yml`'s
+  `FerrymanDown` rule) for alerting.
 
 ## Using crates.io instead of this repo
 

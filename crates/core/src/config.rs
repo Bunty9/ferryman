@@ -87,6 +87,15 @@ pub struct RouteToml {
     /// Per-route circuit-breaker cooldown override.
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+    /// Active health-probe path; absolute, no query or fragment. Default
+    /// `/health`. Routes sharing an upstream must agree.
+    #[serde(default)]
+    pub health_path: Option<String>,
+    /// Skip active health probing for this route's upstream (default
+    /// `false`); only request traffic then drives its breaker. Routes
+    /// sharing an upstream must agree.
+    #[serde(default)]
+    pub health_disabled: bool,
 }
 
 /// Read and parse the TOML config at `path`. Shared by the server's initial
@@ -118,7 +127,8 @@ pub fn load_config(path: &Path) -> Result<ConfigToml, Error> {
 /// [`Error::InvalidConfig`] (out-of-range top-level key),
 /// [`Error::InvalidCidr`] (`trusted_proxies`), [`Error::InvalidPrefix`],
 /// [`Error::DuplicatePrefix`], [`Error::InvalidUpstream`],
-/// [`Error::InvalidCooldown`], [`Error::ConflictingCooldown`] and
+/// [`Error::InvalidCooldown`], [`Error::ConflictingCooldown`],
+/// [`Error::InvalidHealthPath`], [`Error::ConflictingHealth`] and
 /// [`Error::InvalidBreakerConfig`].
 pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTable, Error> {
     if cfg.failure_threshold < 1 {
@@ -164,6 +174,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
     // breakers the live table is still using.
     let mut seen_prefixes = HashSet::new();
     let mut cooldown_by_name: HashMap<String, Duration> = HashMap::new();
+    let mut health_by_name: HashMap<String, (String, bool)> = HashMap::new();
     let mut validated = Vec::with_capacity(cfg.routes.len());
 
     for r in cfg.routes {
@@ -270,18 +281,60 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 other_secs: first.as_secs(),
             });
         }
-        validated.push((r.prefix, uri, name, cooldown, breaker));
+        if let Some(p) = &r.health_path {
+            if !(p.starts_with('/')
+                && !p.contains(['?', '#'])
+                && p.parse::<http::uri::PathAndQuery>().is_ok())
+            {
+                return Err(Error::InvalidHealthPath {
+                    route: r.prefix,
+                    path: p.clone(),
+                });
+            }
+        }
+        let health = (
+            r.health_path.unwrap_or_else(|| "/health".to_string()),
+            r.health_disabled,
+        );
+        let first = health_by_name
+            .entry(name.clone())
+            .or_insert_with(|| health.clone());
+        let conflict = if first.0 != health.0 {
+            Some(("health_path", health.0.clone(), first.0.clone()))
+        } else if first.1 != health.1 {
+            Some(("health_disabled", health.1.to_string(), first.1.to_string()))
+        } else {
+            None
+        };
+        if let Some((setting, value, other)) = conflict {
+            return Err(Error::ConflictingHealth {
+                route: r.prefix,
+                upstream: name,
+                setting,
+                value,
+                other,
+            });
+        }
+        validated.push((r.prefix, uri, name, cooldown, breaker, health));
     }
 
     let mut upstreams_by_name: HashMap<String, Upstream> = HashMap::new();
     let mut routes = Vec::with_capacity(validated.len());
-    for (prefix, uri, name, cooldown, breaker) in validated {
+    for (prefix, uri, name, cooldown, breaker, (health_path, health_disabled)) in validated {
         let upstream = match upstreams_by_name.get(&name) {
             Some(u) => u.clone(),
             None => {
+                let health_path = Some(health_path);
                 let u = match prev_by_name.get(name.as_str()) {
-                    Some(prev_u) => prev_u.reuse(cooldown, cfg.failure_threshold),
-                    None => Upstream::new(uri, breaker)?,
+                    // Breaker (and its state) is kept; health settings are
+                    // simply replaced on the new table's Upstream.
+                    Some(prev_u) => prev_u.reuse(
+                        cooldown,
+                        cfg.failure_threshold,
+                        health_path,
+                        health_disabled,
+                    ),
+                    None => Upstream::new(uri, breaker)?.with_health(health_path, health_disabled),
                 };
                 upstreams_by_name.insert(name, u.clone());
                 u
@@ -321,6 +374,8 @@ mod tests {
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             cooldown_secs: None,
+            health_path: None,
+            health_disabled: false,
         }
     }
 
@@ -532,5 +587,87 @@ mod tests {
         }
         let err = parse("trusted_proxies = [\"10.0.0.0/33\"]").err().unwrap();
         assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
+    }
+
+    #[test]
+    fn health_keys_default_and_parse() {
+        let t = parse("").unwrap();
+        let u = t.lookup("/a").unwrap().upstream.clone();
+        assert_eq!((u.health_path(), u.health_disabled()), ("/health", false));
+
+        let raw = "[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n\
+                   health_path = \"/ready\"\nhealth_disabled = true\n";
+        let t = build_table(toml::from_str(raw).unwrap(), None).unwrap();
+        let u = &t.lookup("/a").unwrap().upstream;
+        assert_eq!((u.health_path(), u.health_disabled()), ("/ready", true));
+    }
+
+    #[test]
+    fn rejects_bad_health_path() {
+        for bad in ["healthz", "", "/h?x=1", "/h#f", "/a b"] {
+            let mut r = route("/a", "http://h:1");
+            r.health_path = Some(bad.to_string());
+            let r = build_table(cfg(vec![r]), None);
+            assert!(
+                matches!(r, Err(Error::InvalidHealthPath { .. })),
+                "{bad:?}: {:?}",
+                r.err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_health_for_shared_upstream() {
+        let mut b = route("/b", "http://localhost:8001");
+        b.health_path = Some("/ready".into());
+        let c = cfg(vec![route("/a", "http://localhost:8001"), b]);
+        let err = build_table(c, None).err().expect("conflict");
+        assert!(
+            matches!(&err, Error::ConflictingHealth { route, setting: "health_path", .. } if route == "/b"),
+            "{err}"
+        );
+
+        let mut b = route("/b", "http://localhost:8001");
+        b.health_disabled = true;
+        let c = cfg(vec![route("/a", "http://localhost:8001"), b]);
+        assert!(matches!(
+            build_table(c, None).err(),
+            Some(Error::ConflictingHealth {
+                setting: "health_disabled",
+                ..
+            })
+        ));
+
+        // Explicit default equals implicit default: no conflict.
+        let mut b = route("/b", "http://localhost:8001");
+        b.health_path = Some("/health".into());
+        let c = cfg(vec![route("/a", "http://localhost:8001"), b]);
+        assert!(build_table(c, None).is_ok());
+    }
+
+    #[test]
+    fn reload_changing_health_keeps_breaker_state() {
+        let c = cfg(vec![route("/a", "http://localhost:8001")]);
+        let old = build_table(c.clone(), None).unwrap();
+        let up = old.upstreams().next().unwrap();
+        for _ in 0..3 {
+            up.record_failure(Admission::Normal);
+        }
+        assert_eq!(up.state(), CircuitState::Open);
+
+        let mut r = route("/a", "http://localhost:8001");
+        r.health_path = Some("/ready".into());
+        r.health_disabled = true;
+        let new = build_table(cfg(vec![r]), Some(&old)).unwrap();
+        let new_up = new.upstreams().next().unwrap();
+        assert_eq!(new_up.state(), CircuitState::Open, "state must survive");
+        assert_eq!(
+            (new_up.health_path(), new_up.health_disabled()),
+            ("/ready", true)
+        );
+        // Old table keeps its own settings; breaker is still shared.
+        assert_eq!((up.health_path(), up.health_disabled()), ("/health", false));
+        up.record_success(Admission::Probe);
+        assert_eq!(new_up.state(), CircuitState::Closed);
     }
 }

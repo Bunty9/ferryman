@@ -56,6 +56,22 @@ pub enum Error {
         cooldown_secs: u64,
         other_secs: u64,
     },
+    /// A route's `health_path` is not an absolute path without query or fragment.
+    #[error("route {route:?}: health_path {path:?} must start with '/' and contain no '?' or '#'")]
+    InvalidHealthPath { route: String, path: String },
+    /// Routes sharing one upstream (one breaker) disagree on a health setting.
+    #[error(
+        "route {route:?}: upstream {upstream} is shared with another route but has a \
+         different {setting} ({value} vs {other}); routes to one upstream share one health check"
+    )]
+    ConflictingHealth {
+        route: String,
+        upstream: String,
+        /// `"health_path"` or `"health_disabled"`.
+        setting: &'static str,
+        value: String,
+        other: String,
+    },
     /// A `trusted_proxies` entry is not a valid CIDR or address.
     #[error("trusted_proxies entry {entry:?}: {reason}")]
     InvalidCidr { entry: String, reason: String },

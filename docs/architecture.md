@@ -101,6 +101,7 @@ pointing there and kept across hot reloads.
        │  health check)          ┌──────────┐              │
        └──────────────────────── │ HalfOpen │ ─────────────┘
                                  └──────────┘
+        Probe failure while Open: no-op (no restamp)
                      probe lost for > cooldown: a new probe is admitted
 ```
 
@@ -118,6 +119,11 @@ pointing there and kept across hot reloads.
 - Health checks report as `Probe`: a healthy answer closes an open circuit
   at once (fast failover recovery), but a healthy answer while closed is a
   no-op, so it can't mask failing real traffic by resetting the count.
+- Only a failed half-open probe (`HalfOpen` -> `Open`) restamps `opened_at`.
+  A failing health check while already `Open` is a no-op, so a broken
+  health endpoint cannot starve the request-path probe of its slot.
+- Per-route `health_path` / `health_disabled` live on `Upstream`, not the
+  breaker; reload swaps them while reusing the same `Arc<Breaker>`.
 - Gauges publish the breaker's *current* state, so racing transitions
   can't leave a stale value.
 

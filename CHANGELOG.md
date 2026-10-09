@@ -9,6 +9,14 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Per-route `health_path` (default `/health`; absolute, no `?`/`#`) and
+  `health_disabled` (default `false`) keys, plus `Upstream::with_health`,
+  `health_path()` and `health_disabled()`. Disabled upstreams get no probes
+  and no breaker effect; `ferryman_upstream_alive` for them still follows
+  the circuit state. Routes sharing a `host:port` must agree
+  (`Error::ConflictingHealth`); a bad path is `Error::InvalidHealthPath`.
+  Changing them on reload keeps the breaker's state.
+
 - `ferryman_core::Breaker` and `BreakerConfig` are public: a standalone
   circuit breaker (`Breaker::new(config)?`, `try_acquire`, `record_success`,
   `record_failure`, `state`) usable without a routing table. Defaults:
@@ -42,6 +50,16 @@ and `ferryman` are released together with the same version.
 - `toml::de::Error` and `http::uri::InvalidUri` are exposed as `Error` sources
   (`ReadConfig`/`Toml`/`InvalidUpstream`); a major bump of those crates is a
   semver break for `ferryman-core`.
+
+### Fixed
+
+- Health-driven recovery: a failing health check while the circuit is open
+  no longer re-stamps the cooldown. Before, with a cooldown longer than
+  `health_interval_secs` (the defaults), a broken `/health` kept the circuit
+  open forever even though real requests would succeed. Now the request-path
+  half-open probe gets its slot after the cooldown regardless; only a failed
+  half-open probe restarts the cooldown. Health successes and the
+  success-while-closed no-op are unchanged.
 
 ## [0.2.3] - 2026-10-05
 

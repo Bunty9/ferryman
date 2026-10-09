@@ -23,6 +23,8 @@ pub struct Upstream {
     /// the scheme (80 for http) when the URI doesn't specify one.
     pub name: String,
     breaker: Arc<Breaker>,
+    health_path: Option<String>,
+    health_disabled: bool,
 }
 
 impl Upstream {
@@ -34,7 +36,32 @@ impl Upstream {
     pub fn new(uri: http::Uri, breaker: BreakerConfig) -> Result<Self, Error> {
         let name = upstream_name(&uri);
         let breaker = Arc::new(Breaker::for_upstream(name.clone(), &breaker)?);
-        Ok(Self { uri, name, breaker })
+        Ok(Self {
+            uri,
+            name,
+            breaker,
+            health_path: None,
+            health_disabled: false,
+        })
+    }
+
+    /// Set the health-probe path (`None` = `/health`) and whether active
+    /// probing is disabled. Does not touch the breaker.
+    pub fn with_health(mut self, path: Option<String>, disabled: bool) -> Self {
+        self.health_path = path;
+        self.health_disabled = disabled;
+        self
+    }
+
+    /// Health-probe path; `/health` unless configured.
+    pub fn health_path(&self) -> &str {
+        self.health_path.as_deref().unwrap_or("/health")
+    }
+
+    /// Whether the health loop skips this upstream (only requests drive its
+    /// breaker).
+    pub fn health_disabled(&self) -> bool {
+        self.health_disabled
     }
 
     /// May this request be sent to the upstream right now? Returns the
@@ -55,12 +82,20 @@ impl Upstream {
         self.breaker.state()
     }
 
-    /// Same upstream, same breaker, new config. Used by hot reload so
-    /// in-flight requests and health probes holding the old table keep
-    /// reporting to the breaker the new table uses.
-    pub(crate) fn reuse(&self, cooldown: Duration, failure_threshold: u32) -> Self {
+    /// Same upstream, same breaker (state kept), new config and health
+    /// settings. Used by hot reload so in-flight requests and health probes
+    /// holding the old table keep reporting to the breaker the new table
+    /// uses. Health settings are plain fields on the returned value, so the
+    /// old table keeps its own and nothing is shared mutably.
+    pub(crate) fn reuse(
+        &self,
+        cooldown: Duration,
+        failure_threshold: u32,
+        health_path: Option<String>,
+        health_disabled: bool,
+    ) -> Self {
         self.breaker.reconfigure(cooldown, failure_threshold);
-        self.clone()
+        self.clone().with_health(health_path, health_disabled)
     }
 }
 

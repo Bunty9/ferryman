@@ -9,6 +9,10 @@
 # upstream; any answer below 500 counts as healthy and closes an open circuit.
 health_interval_secs = 5
 
+# Per-route health keys (routes sharing an upstream must agree):
+#   health_path     = "/health"  # probed path; absolute, no ? or #
+#   health_disabled = false      # true: never probe; requests drive the breaker
+
 # Default circuit-breaker cooldown if a route doesn't set cooldown_secs.
 default_cooldown_secs = 30
 

@@ -170,11 +170,15 @@ fail loudly instead of silently falling back to defaults.
 | `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the raw, undecoded, case-sensitive request path (see "Routing and access control"). |
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
 | `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
+| `[[routes]] health_path`         | `/health` | Health probe path: absolute, no `?` or `#`. Hot-reloads.                       |
+| `[[routes]] health_disabled`     | `false` | Skip active probing of this route's upstream (see "Health-driven recovery").     |
 
 All `*_secs` values must be between 1 and 86400 (one day). An upstream
 with an empty host (`http://:80`) is rejected.
 
-Routes pointing at the same `host:port` share one circuit breaker. A hot
+Routes pointing at the same `host:port` share one circuit breaker, so they
+must also agree on `cooldown_secs`, `health_path` and `health_disabled`
+(a mismatch is rejected). A hot
 reload keeps each surviving upstream's breaker, so an open circuit stays
 open across a config edit. An invalid config on reload is logged and the
 old table stays live.
@@ -200,20 +204,24 @@ itself. Health results are authoritative, like the half-open probe:
   not wait for the cooldown. Passing while already closed is a no-op and
   does not reset the request failure count. A recovered upstream is
   routable again within about one `health_interval_secs`.
-- A failing check while open re-stamps the cooldown. When the cooldown is
-  longer than `health_interval_secs` (as with the defaults, 30 s vs 5 s),
-  the request-path half-open probe never gets a slot while `/health` keeps
-  failing, so recovery comes from the first passing health check, not from
-  cooldown expiry. With a shorter cooldown, requests can claim the probe
-  slot between ticks (open -> half-open -> open each window, each logged).
-- An upstream whose `/health` keeps failing (5xx, timeout, unreachable)
-  stays open even if real requests would succeed: fix the health endpoint.
-  Without a running health loop, recovery is cooldown expiry plus one
-  successful half-open request.
+- A failing check while already open changes nothing: it does not restart
+  the cooldown. Once the cooldown has elapsed, one request is let through
+  as the half-open probe whether or not `/health` is failing, and if it
+  succeeds the circuit closes. So a broken health endpoint no longer pins a
+  circuit open while real traffic works (it can still reopen it only via a
+  failed half-open probe, or a failing check landing while half-open).
+  Without a running health loop, recovery is the same: cooldown expiry plus
+  one successful half-open request.
+- `health_path` (default `/health`) sets the probed path;
+  `health_disabled = true` makes the loop skip the upstream entirely: no
+  probe and no effect on its breaker, so only request traffic drives it.
+  For a disabled upstream `ferryman_upstream_alive` is still published
+  from the circuit state (1 = closed, 0 = open/half-open), not from probes.
+  Changing either key on reload keeps the breaker's state.
 
 State changes are logged with `upstream`, `from` and `to` fields: `warn`
-when a circuit opens, `info` otherwise. Re-stamps while open are not
-logged.
+when a circuit opens, `info` otherwise. Failing checks while open
+are not logged.
 
 CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
 (`FERRYMAN_BIND`, `0.0.0.0:8080`), `--metrics-bind`
@@ -303,7 +311,7 @@ Surface:
 | ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ |
 | `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404 and 400 bad path) | Counter of inbound requests.                                 |
 | `ferryman_request_duration_seconds` | `route`, `upstream`                             | Histogram (buckets `le`), time from request start (includes the upload) to upstream response headers. |
-| `ferryman_upstream_alive`           | `upstream`                                      | Gauge: 1 = circuit closed, 0 otherwise.                      |
+| `ferryman_upstream_alive`           | `upstream`                                      | Gauge: 1 = circuit closed, 0 otherwise (also for `health_disabled` upstreams).                      |
 | `ferryman_circuit_state`            | `upstream`                                      | Gauge: 0 closed / 1 open / 2 half-open.                      |
 
 `route` is the configured prefix and `upstream` is `host:port`, so label

@@ -77,7 +77,9 @@ pub enum Admission {
     /// while the circuit is still closed.
     Normal,
     /// The single half-open probe, or an active health check. Its result is
-    /// authoritative: success closes the circuit, failure (re)opens it.
+    /// authoritative: success closes the circuit, failure of a half-open
+    /// probe reopens it (and restarts the cooldown). A failing probe while
+    /// already open changes nothing.
     Probe,
 }
 
@@ -336,12 +338,17 @@ impl Breaker {
 
     pub fn record_failure(&self, admission: Admission) {
         match (admission, self.state()) {
-            (Admission::Probe, CircuitState::Open | CircuitState::HalfOpen) => {
+            (Admission::Probe, CircuitState::HalfOpen) => {
                 // Stamp before publishing Open so no reader pairs the Open
                 // state with a stale timestamp.
                 self.opened_at_millis.store(now_millis(), Ordering::Release);
                 self.transition(CircuitState::HalfOpen, CircuitState::Open);
             }
+            // A failing health check while already open must not push the
+            // cooldown out: otherwise a broken health endpoint (tick < cooldown)
+            // keeps the circuit open forever and no request-path probe ever
+            // gets a slot. Only a failed half-open probe re-stamps.
+            (Admission::Probe, CircuitState::Open) => {}
             (_, CircuitState::Closed) => {
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
                 if failures < self.failure_threshold.load(Ordering::Relaxed) {
@@ -477,6 +484,22 @@ mod tests {
         b.record_failure(P);
         assert_eq!(b.state(), CircuitState::Open);
         assert_eq!(b.try_acquire(), None);
+    }
+
+    #[test]
+    fn probe_failure_while_open_does_not_restamp() {
+        // Health ticks (every 50 ms) are shorter than the cooldown (200 ms)
+        // and always fail; a request-path probe must still get its slot.
+        let b = breaker(200, 1);
+        b.record_failure(N);
+        for _ in 0..6 {
+            thread::sleep(Duration::from_millis(50));
+            b.record_failure(P);
+        }
+        assert_eq!(b.state(), CircuitState::Open);
+        assert_eq!(b.try_acquire(), Some(P), "cooldown must have elapsed");
+        b.record_success(P);
+        assert_eq!(b.state(), CircuitState::Closed);
     }
 
     #[test]

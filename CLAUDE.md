@@ -22,7 +22,8 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 ## Invariants (don't regress)
 
 - Breaker results go through `Admission` tickets: only `Probe` may leave open/half-open; `Normal` results only count while closed.
-- Health loop reports as `Probe`; a probe success while closed is a no-op (must not reset request failure counts).
+- Health loop reports as `Probe`; a probe success while closed is a no-op (must not reset request failure counts). A probe failure while Open is a no-op too (no `opened_at` re-stamp); only HalfOpen -> Open stamps, so a broken health endpoint can't starve the request-path half-open probe.
+- Routes sharing an upstream must agree on `cooldown_secs`, `health_path`, `health_disabled` (build_table error). Reload with changed health keys reuses the `Arc<Breaker>` (state kept); `health_disabled` upstreams are skipped by the health loop.
 - `build_table` validates everything before touching `prev` breakers; reload reuses the same `Arc<Breaker>` per `host:port`.
 - `lookup` ignores health: dead upstream = 503, never fall back to a shorter prefix.
 - Client-side body errors (`hyper::Error::is_user`) and stalled or over-long uploads (`request_body_idle_timeout_secs` / `request_body_timeout_secs`, 408) never trip the breaker. `upstream_timeout` starts at request-body EOS (immediately if bodyless); a 504 after that is recorded as a breaker failure, as is an upstream that stops reading the upload for a whole `upstream_timeout` window (hyper not polling the body while not waiting on the client).

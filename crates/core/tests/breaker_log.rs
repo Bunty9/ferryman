@@ -36,7 +36,7 @@ fn transitions_log_once_and_noops_do_not() {
     .unwrap();
     u.record_failure(Normal); // closed -> open
     u.record_failure(Normal); // late normal result: no change
-    u.record_failure(Probe); // probe failure while open: re-stamp only
+    u.record_failure(Probe); // probe failure while open: no change, no re-stamp
     u.record_success(Normal); // no change
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(u.try_acquire(), Some(Probe)); // open -> half-open

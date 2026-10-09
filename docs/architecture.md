@@ -17,7 +17,7 @@ contract (config keys, status codes, metrics) is in the
 |                  | `proxy.rs`                              | Per-request handler                                              |
 |                  | `admin.rs`                              | `/metrics`, `/healthz`, `/readyz` server                         |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
-|                  | `reload.rs`                             | Debounced config file watcher                                    |
+|                  | `reload.rs`                             | Debounced directory watcher, hash de-dup, SIGHUP/TLS reload                                    |
 |                  | `main.rs`                               | CLI (`check`, `healthcheck` subcommands), tracing, metrics recorder, signals |
 
 `ferryman` is a library plus a thin binary so the end-to-end tests
@@ -145,9 +145,14 @@ removed by a reload disappear from `/metrics`.
 
 ## Hot reload
 
-`reload::watch_config` watches the config file's parent directory (so
-rename-replace saves are seen) and forwards matching events to a thread
-that waits for 200ms of quiet before reloading. The reload runs
+`reload::Reloader` watches the directories of the config file and the TLS
+cert/key (so rename-replace saves and ConfigMap/Secret `..data` symlink swaps
+are seen; any event counts) and a thread waits for 200ms of quiet. It then
+compares a content hash of the config bytes (and, separately, cert+key) with
+the last one acted on and does nothing if unchanged; SIGHUP skips that check.
+TLS uses a `ResolvesServerCert` holding an `ArcSwap<CertifiedKey>`, so a new
+pair applies to new handshakes only and a bad pair keeps the old one. The
+config reload runs
 `load_config` then `build_table(cfg, Some(&current))`:
 
 1. Validate every route and global setting. Any error: log it, keep the
@@ -160,8 +165,7 @@ In-flight requests keep the table they loaded; because breakers are
 shared, their results still land on the live breaker.
 
 Not reloadable: `health_interval_secs` (ticker is fixed at startup), bind
-addresses, TLS files. Kubernetes ConfigMap updates (a `..data` symlink
-swap) are not seen by the watcher.
+addresses, TLS on/off and the cert/key paths.
 
 ## Connection handling and shutdown
 

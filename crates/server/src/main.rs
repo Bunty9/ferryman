@@ -130,9 +130,17 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert), Some(key)) => Some(tls::load_acceptor(cert, key)?),
-        (None, None) => None,
+    // Installed before any slow startup work: SIGHUP's default action kills
+    // the process, and it now means "reload".
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+    let (tls_acceptor, tls_reloader) = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => {
+            let (acceptor, reloader) = tls::load_reloadable(cert, key)?;
+            (Some(acceptor), Some(reloader))
+        }
+        (None, None) => (None, None),
         _ => anyhow::bail!("--tls-cert and --tls-key must both be set or both omitted"),
     };
 
@@ -160,13 +168,31 @@ async fn main() -> anyhow::Result<()> {
 
     // Background tasks: active health checker + config watcher.
     tokio::spawn(health_loop(shared.clone(), interval));
-    let _watcher = match &config_path {
-        Some(p) => Some(reload::watch_config(p, shared.clone())?),
-        None => {
-            tracing::info!("config from FERRYMAN_CONFIG_TOML: file watch disabled, no hot reload");
-            None
-        }
+    let inline = config_path.is_none();
+    if inline {
+        tracing::info!("config from FERRYMAN_CONFIG_TOML: config is not reloaded");
+    }
+    let has_tls = tls_reloader.is_some();
+    let reloader = reload::Reloader::new(config_path, shared.clone(), tls_reloader);
+    let _watcher = if inline && !has_tls {
+        None
+    } else {
+        Some(reloader.watch()?)
     };
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        while sighup.recv().await.is_some() {
+            tracing::info!("received SIGHUP, reloading");
+            if inline {
+                tracing::info!("reload not applicable: config is inline (FERRYMAN_CONFIG_TOML)");
+            }
+            let r = reloader.clone();
+            let _ = tokio::task::spawn_blocking(move || r.reload(true)).await;
+        }
+    });
+    // No SIGHUP on Windows: the file watch is the only reload trigger.
+    #[cfg(not(unix))]
+    drop(reloader);
 
     let bind = resolve_bind(args.bind, std::env::var("PORT").ok().as_deref())?;
     let listener = tokio::net::TcpListener::bind(bind).await?;

@@ -140,6 +140,29 @@ curl -s http://localhost:9090/metrics | head
 Edit `config.toml` while ferryman is running — the routing table reloads
 atomically without dropping live connections.
 
+### Reloading
+
+- **File watch.** ferryman watches the *directory* of the config file (and of
+  the TLS cert/key). Any change there schedules a reload after 200 ms of quiet,
+  but only if the file's bytes actually changed (content hash), so `touch` and
+  identical rewrites are ignored. This covers editors that rename-replace and
+  Kubernetes ConfigMap/Secret mounts, which swap a `..data` symlink instead of
+  touching `config.toml`. Mount the whole ConfigMap as a directory (not with
+  `subPath`, which never updates) and point `--config` at the file in it.
+- **SIGHUP (Unix).** Forces a reload of the config and the TLS certificate even
+  if nothing changed. systemd: `ExecReload=/bin/kill -HUP $MAINPID`. With inline
+  `FERRYMAN_CONFIG_TOML` there is nothing to re-read and it logs "reload not
+  applicable". Windows has no SIGHUP; only the file watch applies. (Before 0.3,
+  SIGHUP terminated the process.)
+- **TLS cert/key.** A changed `--tls-cert`/`--tls-key` pair (e.g. a cert-manager
+  Secret renewal) is picked up the same way and used for *new* handshakes;
+  open connections keep their old session. A bad or mismatched pair is logged
+  and the previous certificate stays. Turning TLS on or off, or changing the
+  cert/key paths, needs a restart.
+- **Failure.** A config that fails to parse or validate is logged and the old
+  table stays live. Bind addresses, the metrics bind and `health_interval_secs`
+  need a restart.
+
 ## Examples
 
 Reference examples live under [`examples/`](./examples) (index:
@@ -250,8 +273,9 @@ CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
 When `FERRYMAN_CONFIG_TOML` is set and non-empty, its value is the whole
 TOML config and `--config` / `FERRYMAN_CONFIG` are ignored (the Docker
 image's default `CMD` passes `--config`, so a flag cannot be the
-tiebreaker). No file is watched, so there is no hot reload (a startup log
-line says so); change the env var and restart. `ferryman check` honours it
+tiebreaker). No file is watched, so the config is not hot-reloaded (a startup
+log line says so; SIGHUP logs "reload not applicable"); change the env var and
+restart. `ferryman check` honours it
 too.
 
 ### Subcommands

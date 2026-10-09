@@ -1,95 +1,179 @@
-//! Filesystem-watch driven hot-reload of the routing table.
+//! Hot-reload of the routing table and the TLS certificate.
 //!
-//! Watches the config file's *parent directory*, non-recursively, rather
-//! than the file itself: editors that save via rename-and-replace (write a
-//! temp file, then rename it over the original) emit a remove + create on
-//! the directory rather than a `Modify` on a stable inode, and a watch on
-//! the file alone misses those. An event is acted on only when one of its
-//! paths' file name matches the config file's.
+//! Reloads are triggered by a filesystem watch ([`Reloader::watch`]) and, in
+//! the binary, by SIGHUP on Unix ([`Reloader::reload`] with `force`).
 //!
-//! One save can emit several events (e.g. `MODIFY` then `CLOSE_WRITE`), and
-//! the first may fire while the file is half written. Events are therefore
-//! coalesced: a reload runs once the directory has been quiet for
-//! `DEBOUNCE` (200ms).
+//! The watch is on the *directories* holding the config file and the TLS
+//! cert/key (non-recursive), and any event there schedules a reload; the
+//! trigger is deliberately not filtered by file name. That covers editors
+//! that save by rename-and-replace (remove + create on the directory, no
+//! `Modify` on a stable inode) and Kubernetes ConfigMap/Secret mounts, which
+//! never touch `config.toml` itself but atomically retarget a `..data`
+//! symlink in the directory.
 //!
-//! Limits: `health_interval_secs` changes need a restart (the health loop's
-//! ticker is fixed at startup). `keepalive_timeout_secs` is read when a
-//! connection is accepted, so a change applies to new connections only.
-//! Kubernetes ConfigMap mounts swap a `..data` symlink rather than touching `config.toml`, so those updates are not
-//! seen here; restart the pod or point `--config` at a regular file.
+//! Events are coalesced: a reload runs once the directory has been quiet for
+//! `DEBOUNCE` (200ms), because one save can emit several events and the first
+//! may fire while the file is half written. A watch-triggered reload also only
+//! acts when the *bytes* of the config (or of the cert+key) differ from those
+//! last seen, so `touch`, atomic rewrites with identical content, and the
+//! unrelated churn of a ConfigMap volume do not swap the table. SIGHUP is
+//! unconditional. A failed reload logs the error and keeps the old table or
+//! certificate; the bad bytes are remembered, so the same bad file is not
+//! retried until it changes (or SIGHUP).
+//!
+//! Limits (need a restart): the proxy and admin bind addresses, whether TLS is
+//! on at all (a TLS-less start cannot gain a certificate, and the TLS paths
+//! themselves are fixed), `health_interval_secs` (the health loop's ticker is
+//! fixed at startup) and the metrics exporter settings. `keepalive_timeout_secs`
+//! is read when a connection is accepted, so a change applies to new
+//! connections only; a rotated certificate likewise applies to new TLS
+//! handshakes only. With inline `FERRYMAN_CONFIG_TOML` there is no file, so
+//! the config is not reloaded (the TLS files still are). On Windows there is
+//! no SIGHUP; the file watch is the only trigger.
 
-use ferryman_core::{build_table, load_config, RouteTable, SharedTable};
+use crate::tls::TlsReloader;
+use ferryman_core::{build_table, load_config, SharedTable};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::ffi::OsString;
+use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Quiet period after the last matching event before reloading.
+/// Quiet period after the last event before reloading.
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// Spin up a `notify` watcher on `path`'s parent directory and return it.
-/// Dropping the returned watcher cancels the subscription.
-pub fn watch_config(path: &Path, table: SharedTable) -> notify::Result<RecommendedWatcher> {
-    let path = path.to_path_buf();
-    let dir = watch_dir(&path);
-    let file_name: Option<OsString> = path.file_name().map(|n| n.to_os_string());
-
-    let (tx, rx) = mpsc::channel::<()>();
-    let mut watcher: RecommendedWatcher =
-        notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let event = match res {
-                Ok(event) => event,
-                Err(e) => {
-                    // e.g. inotify queue overflow: we may have missed a save,
-                    // so reload anyway; a spurious reload is harmless.
-                    tracing::warn!(error = %e, "config watch error");
-                    let _ = tx.send(());
-                    return;
-                }
-            };
-            if event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == file_name.as_deref())
-            {
-                let _ = tx.send(());
-            }
-        })?;
-    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
-
-    // Exits when the watcher (and with it `tx`) is dropped.
-    std::thread::spawn(move || {
-        while rx.recv().is_ok() {
-            loop {
-                match rx.recv_timeout(DEBOUNCE) {
-                    Ok(()) => continue,
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            if let Some(new_table) = reload_once(&path, &table) {
-                table.store(Arc::new(new_table));
-                table.load().publish_gauges();
-                tracing::info!(path = %path.display(), "config reloaded");
-            }
-        }
-    });
-    Ok(watcher)
+/// Reloads the routing table (from `config`) and the TLS certificate (via
+/// `tls`) on demand or when the watched directories change.
+pub struct Reloader {
+    config: Option<PathBuf>,
+    table: SharedTable,
+    tls: Option<TlsReloader>,
+    /// Content hashes of the config file and of cert+key last acted on.
+    seen: Mutex<(u64, u64)>,
 }
 
-fn watch_dir(config_path: &Path) -> PathBuf {
-    match config_path.parent() {
+impl Reloader {
+    /// `config` is `None` when the config is inline (nothing to re-read);
+    /// `tls` comes from [`load_reloadable`](crate::tls::load_reloadable).
+    /// The current file contents count as already loaded.
+    pub fn new(config: Option<PathBuf>, table: SharedTable, tls: Option<TlsReloader>) -> Arc<Self> {
+        let seen = Mutex::new((
+            digest(config.iter().map(PathBuf::as_path)),
+            digest(tls.iter().flat_map(|t| t.files())),
+        ));
+        Arc::new(Self {
+            config,
+            table,
+            tls,
+            seen,
+        })
+    }
+
+    /// Reload what changed. With `force` (SIGHUP) the config and certificate
+    /// are re-read even if their bytes are unchanged. Failures are logged and
+    /// keep the previous table / certificate.
+    pub fn reload(&self, force: bool) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(path) = &self.config {
+            let h = digest([path.as_path()]);
+            if force || h != seen.0 {
+                seen.0 = h;
+                if let Some(new_table) = reload_once(path, &self.table) {
+                    self.table.store(Arc::new(new_table));
+                    self.table.load().publish_gauges();
+                    tracing::info!(path = %path.display(), "config reloaded");
+                }
+            }
+        }
+        if let Some(tls) = &self.tls {
+            let h = digest(tls.files());
+            if force || h != seen.1 {
+                seen.1 = h;
+                match tls.reload() {
+                    Ok(()) => tracing::info!("TLS certificate reloaded"),
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "TLS reload failed; keeping old certificate")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Watch the directories of the config file and TLS files; any event
+    /// there triggers a debounced [`reload`](Self::reload)`(false)`. Dropping
+    /// the returned watcher cancels the subscription.
+    pub fn watch(self: &Arc<Self>) -> notify::Result<RecommendedWatcher> {
+        let dirs: BTreeSet<PathBuf> = self
+            .config
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(self.tls.iter().flat_map(|t| t.files()))
+            .map(watch_dir)
+            .collect();
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Err(e) = res {
+                    // e.g. inotify queue overflow: we may have missed a save,
+                    // so reload anyway; the content hash makes that harmless.
+                    tracing::warn!(error = %e, "config watch error");
+                }
+                let _ = tx.send(());
+            })?;
+        for dir in &dirs {
+            watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        }
+
+        let this = self.clone();
+        // Exits when the watcher (and with it `tx`) is dropped.
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                loop {
+                    match rx.recv_timeout(DEBOUNCE) {
+                        Ok(()) => continue,
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                this.reload(false);
+            }
+        });
+        Ok(watcher)
+    }
+}
+
+/// Watch `path`'s parent directory for config reloads (no TLS). Dropping the
+/// returned watcher cancels the subscription. Shorthand for
+/// [`Reloader::new`] + [`Reloader::watch`].
+pub fn watch_config(path: &Path, table: SharedTable) -> notify::Result<RecommendedWatcher> {
+    Reloader::new(Some(path.to_path_buf()), table, None).watch()
+}
+
+fn watch_dir(file: &Path) -> PathBuf {
+    match file.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     }
 }
 
+/// Hash of the bytes of `files` (a missing/unreadable file hashes as such).
+/// `DefaultHasher::new()` is deterministic within a process, which is all
+/// the de-dup needs.
+fn digest<'a>(files: impl IntoIterator<Item = &'a Path>) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in files {
+        std::fs::read(f).ok().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Re-read and rebuild the routing table, keeping the old one on any error
 /// (config unreadable, unparsable, or failing validation). Returns `None`
 /// on error, having already logged the full error chain.
-fn reload_once(path: &Path, table: &SharedTable) -> Option<RouteTable> {
+fn reload_once(path: &Path, table: &SharedTable) -> Option<ferryman_core::RouteTable> {
     let cfg = load_config(path)
         // anyhow keeps the `{e:#}` cause chain (toml detail) that Error hides.
         .map_err(anyhow::Error::from)

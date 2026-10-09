@@ -32,6 +32,22 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Reload model. The watcher now watches the config file's directory and
+  reacts to any event there, so Kubernetes ConfigMap mounts (an atomic
+  `..data` symlink swap) are picked up without a restart. Reloads are
+  de-duplicated by a content hash: touching a file or rewriting identical
+  bytes does not swap the table. SIGHUP (Unix) forces a reload of the config
+  and the TLS certificate (`systemctl reload`; `ExecReload=/bin/kill -HUP $MAINPID`);
+  with inline `FERRYMAN_CONFIG_TOML` it logs "reload not applicable". Windows
+  has no SIGHUP; the file watch is the trigger there.
+- TLS certificate hot reload: when `--tls-cert`/`--tls-key` change (watched
+  directory, so cert-manager Secret mounts work, or SIGHUP) the pair is
+  rebuilt and swapped in for new handshakes; established connections are
+  unaffected. A bad pair is logged and the old certificate stays. New public
+  API (additive): `tls::load_reloadable`, `tls::TlsReloader`,
+  `reload::Reloader`; `tls::load_acceptor`, `reload::watch_config` and
+  `serve` are unchanged.
+
 - Shutdown tuning: `drain_timeout_secs` (default 25, the previous constant)
   and `shutdown_delay_secs` (default 0). On SIGTERM/SIGINT `/readyz` flips to
   503 at once, the proxy keeps serving for the delay, then drains for up to
@@ -89,6 +105,9 @@ and `ferryman` are released together with the same version.
 
 ### Changed (breaking)
 
+- SIGHUP no longer terminates the process: it reloads the config and TLS
+  certificate (see Added). Migration: anything that used SIGHUP to stop or
+  restart ferryman must send SIGTERM (or SIGINT) instead.
 - The metrics listener is now ferryman's own admin server, not the
   Prometheus exporter's. The old one answered `OK` on `/health` and metrics
   on every other path and method; now `GET`/`HEAD` `/metrics` is metrics,

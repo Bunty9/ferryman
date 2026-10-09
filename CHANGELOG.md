@@ -57,7 +57,8 @@ and `ferryman` are released together with the same version.
   New public items: `XffMode`, `RouteTable::{with_forwarded_header,
   forwarded_header, with_xff_mode, xff_mode}`, `proxy::handle_streaming_at`
   (takes the local port; `serve` uses it; `handle_streaming` and the
-  deprecated `handle` take the port from `Host`, if any).
+  deprecated `handle` have no port, so `X-Forwarded-Port` is omitted for
+  untrusted peers).
 
 - Reload model. The watcher now watches the config file's directory and
   reacts to any event there, so Kubernetes ConfigMap mounts (an atomic
@@ -132,6 +133,9 @@ and `ferryman` are released together with the same version.
 
 ### Changed (breaking)
 
+- Untrusted peers' `X-Forwarded-Ssl`, `X-Forwarded-Scheme` and
+  `X-Forwarded-Prefix` are now stripped; see the Security note above for the
+  migration.
 - SIGHUP no longer terminates the process: it reloads the config and TLS
   certificate (see Added). Migration: anything that used SIGHUP to stop or
   restart ferryman must send SIGTERM (or SIGINT) instead.

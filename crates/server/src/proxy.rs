@@ -256,8 +256,8 @@ pub async fn handle_streaming(
 
 /// [`handle_streaming`] plus the listener's local port, used for
 /// `X-Forwarded-Port`. `serve` calls this; without a port
-/// (`handle_streaming`) the port comes from the request's `Host` (or is
-/// omitted when the peer is untrusted and `Host` has none).
+/// (`handle_streaming`) `X-Forwarded-Port` is omitted for untrusted peers
+/// (never derived from the client's `Host`).
 pub async fn handle_streaming_at(
     table: SharedTable,
     client: StreamingClient,
@@ -391,6 +391,16 @@ where
     // HTTP/1 absolute-form target) overrides `Host` (RFC 9112 §3.2.2). Pin it
     // before the URI is rewritten so upstreams see the client's host either
     // way. With `rewrite_host`, the upstream's own authority wins over both.
+    // The client's effective host, for `Forwarded host=`; captured before
+    // `rewrite_host` can overwrite it.
+    let client_host: Option<String> = match parts.uri.authority() {
+        Some(a) => Some(a.as_str().rsplit('@').next().unwrap_or("").to_string()),
+        None => parts
+            .headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+    };
     let authority = if rewrite_host {
         upstream.uri.authority()
     } else {
@@ -426,21 +436,12 @@ where
     if table.trusted_proxies().is_empty() && is_private_peer(peer.ip()) {
         warn_private_peer_once();
     }
-    let local_port = local_port.or_else(|| {
-        parts
-            .headers
-            .get(header::HOST)?
-            .to_str()
-            .ok()?
-            .parse::<http::uri::Authority>()
-            .ok()?
-            .port_u16()
-    });
     apply_forwarded_headers(
         &mut parts.headers,
         peer.ip(),
         local_port,
         proto,
+        client_host.as_deref(),
         &FwdCfg {
             trusted: table.trusted_proxies(),
             forwarded_header: table.forwarded_header(),
@@ -776,12 +777,15 @@ fn forwarded_node(ip: IpAddr) -> String {
 ///
 /// With `forwarded_header`, a `for=<peer>;proto=;host=` element is appended
 /// to `forwarded` (fresh for untrusted peers, whose value was stripped).
-/// `local_port` None: `x-forwarded-port` is omitted unless a trusted peer sent one.
+/// `local_port` None: `x-forwarded-port` is omitted unless a trusted peer sent a
+/// valid one (never derived from `Host`). `proto=` is this hop's connection scheme;
+/// `host=` is the client's effective host (URI authority, else `Host`).
 fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     peer: IpAddr,
     local_port: Option<u16>,
     proto: &'static str,
+    client_host: Option<&str>,
     cfg: &FwdCfg<'_>,
 ) {
     strip_underscore_spellings(headers);
@@ -843,16 +847,8 @@ fn apply_forwarded_headers(
         _ => append_forwarded_for(headers, peer),
     }
     if cfg.forwarded_header {
-        append_forwarded(headers, peer, headers_proto(headers, proto));
+        append_forwarded(headers, peer, proto, client_host);
     }
-}
-
-fn headers_proto(headers: &HeaderMap, fallback: &'static str) -> String {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(fallback)
-        .to_string()
 }
 
 fn set_port(headers: &mut HeaderMap, name: &HeaderName, port: Option<u16>) {
@@ -867,10 +863,10 @@ fn set_port(headers: &mut HeaderMap, name: &HeaderName, port: Option<u16>) {
 }
 
 /// Append `for=<peer>;proto=<proto>;host=<Host>` to the `forwarded` list.
-fn append_forwarded(headers: &mut HeaderMap, peer: IpAddr, proto: String) {
+fn append_forwarded(headers: &mut HeaderMap, peer: IpAddr, proto: &str, host: Option<&str>) {
     let mut el = format!("for={};proto={proto}", forwarded_node(peer));
     // `host` is a token only without ':' etc.; quote anything else.
-    if let Some(h) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+    if let Some(h) = host {
         if h.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
         {
@@ -1043,6 +1039,7 @@ mod tests {
             peer.parse().unwrap(),
             None,
             proto,
+            None,
             &cfg(&tp(trusted), false, XffMode::Append),
         );
         m
@@ -1054,6 +1051,10 @@ mod tests {
             forwarded_header,
             xff,
         }
+    }
+
+    fn host_of<'a>(h: &[(&str, &'a str)]) -> Option<&'a str> {
+        h.iter().find(|(k, _)| *k == "host").map(|(_, v)| *v)
     }
 
     fn run_with(
@@ -1077,6 +1078,7 @@ mod tests {
             peer.parse().unwrap(),
             port,
             "http",
+            host_of(h),
             &cfg(&t, fh, xff),
         );
         m
@@ -1206,6 +1208,7 @@ mod tests {
             "10.1.2.3".parse().unwrap(),
             None,
             "http",
+            None,
             &cfg(&tp(&["10.0.0.0/8"]), false, XffMode::Append),
         );
         assert_eq!(get(&m, "x-real-ip"), Some("10.1.2.3"));
@@ -1218,6 +1221,7 @@ mod tests {
             "10.1.2.3".parse().unwrap(),
             None,
             "http",
+            None,
             &cfg(&tp(&["10.0.0.0/8"]), false, XffMode::Append),
         );
         assert_eq!(get(&m, "x-real-ip"), Some("5.5.5.5"));
@@ -1385,12 +1389,12 @@ mod tests {
             get(&m, "forwarded"),
             Some("for=1.2.3.4;proto=http;host=\"app.example:8080\"")
         );
-        // trusted: appended to the list; proto follows X-Forwarded-Proto
+        // trusted: appended to the list; proto= is this hop's connection scheme
         let h = [("forwarded", "for=6.6.6.6"), ("x-forwarded-proto", "https")];
         let m = run_with(&["10.0.0.0/8"], "10.1.2.3", None, true, XffMode::Append, &h);
         assert_eq!(
             get(&m, "forwarded"),
-            Some("for=6.6.6.6, for=10.1.2.3;proto=https")
+            Some("for=6.6.6.6, for=10.1.2.3;proto=http")
         );
         // IPv6 quoted + bracketed (RFC 7239 section 6); v4-mapped shown as v4
         let m = run_with(&[], "2001:db8::1", None, true, XffMode::Append, &[]);
@@ -1422,6 +1426,33 @@ mod tests {
             assert_eq!(get(&m, "x_custom"), Some("keep"));
             assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
         }
+    }
+
+    #[test]
+    fn forwarded_host_is_the_clients_even_when_rewritten_elsewhere() {
+        // host= comes from the caller-supplied client host, not the headers.
+        let mut m = HeaderMap::new();
+        m.insert("host", "upstream.internal:9".parse().unwrap());
+        let t = tp(&[]);
+        apply_forwarded_headers(
+            &mut m,
+            "1.2.3.4".parse().unwrap(),
+            None,
+            "http",
+            Some("client.example"),
+            &cfg(&t, true, XffMode::Append),
+        );
+        assert_eq!(
+            get(&m, "forwarded"),
+            Some("for=1.2.3.4;proto=http;host=client.example")
+        );
+    }
+
+    #[test]
+    fn no_listener_port_never_uses_host() {
+        let h = [("host", "x:443")];
+        let m = run_with(&[], "1.2.3.4", None, false, XffMode::Append, &h);
+        assert_eq!(get(&m, "x-forwarded-port"), None);
     }
 
     #[test]

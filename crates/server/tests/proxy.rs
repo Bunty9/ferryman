@@ -360,21 +360,42 @@ async fn trusted_peer_forwarded_headers_are_preserved() {
 }
 
 #[tokio::test]
-async fn forwarded_port_is_the_listener_port_and_forwarded_header_is_opt_in() {
+async fn forwarded_header_is_opt_in() {
     let body = forged_headers_echo("").await;
     assert!(!body.contains("\nforwarded:"), "{body}");
-    let body = forged_headers_echo("forwarded_header = true\nxff = \"replace\"").await;
-    let port = body
-        .lines()
-        .find_map(|l| l.strip_prefix("x-forwarded-port: "))
-        .expect(&body);
-    assert_ne!(port, "4443", "{body}");
+}
+
+#[tokio::test]
+async fn forwarded_port_and_host_come_from_the_listener_and_client() {
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "forwarded_header = true\nxff = \"replace\"\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\nrewrite_host = true\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let body = reqwest::Client::new()
+        .get(format!("http://{proxy}/svc-a/x"))
+        .header("x-forwarded-port", "4443")
+        .header("x-forwarded-for", "6.6.6.6")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let port = proxy.port();
+    assert!(
+        body.contains(&format!("x-forwarded-port: {port}\n")),
+        "{body}"
+    );
+    assert!(!body.contains("4443"), "{body}");
+    // host= is the client's host even though Host was rewritten to the upstream's.
     assert!(
         body.contains(&format!(
             "forwarded: for=127.0.0.1;proto=http;host=\"127.0.0.1:{port}\""
         )),
         "{body}"
     );
+    assert!(body.contains(&format!("host: {upstream}\n")), "{body}");
     assert!(!body.contains("6.6.6.6"), "{body}");
     assert!(body.contains("x-forwarded-for: 127.0.0.1\n"), "{body}");
 }

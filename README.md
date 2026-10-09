@@ -392,9 +392,12 @@ What the upstream sees depends on whether the connecting peer is in
 | `X-Forwarded-Prefix`   | stripped                             | kept                                                                                           |
 
 Without a known listener port (the deprecated `proxy::handle`, or
-`handle_streaming` called directly) the port comes from the request's `Host`
-header and `X-Forwarded-Port` is omitted if there is none. With
-`rewrite_host = true` the `host=` of `Forwarded` is the upstream's authority.
+`handle_streaming` called directly) `X-Forwarded-Port` is omitted for
+untrusted peers; it is never derived from `Host`. In `Forwarded`, `for=` is the
+connecting peer, `proto=` this hop's connection scheme and `host=` the client's
+own host (URI authority, else `Host`), also with `rewrite_host = true`.
+Request headers that differ from a trust-governed header only by `_` for `-`
+(e.g. `X_Real_IP`) are removed for every peer.
 
 If `trusted_proxies` is empty and a request arrives from a private, loopback
 or link-local peer, ferryman logs one warning (per process) suggesting

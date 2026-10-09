@@ -4,26 +4,28 @@ use std::time::Duration;
 
 fn build_table() -> RouteTable {
     let mut routes: Vec<Route> = (0..50)
-        .map(|i| Route {
-            prefix: format!("/svc-{i}"),
-            upstream: Upstream::new(
-                format!("http://localhost:{}", 9000 + i).parse().unwrap(),
-                BreakerConfig::default(),
+        .map(|i| {
+            Route::new(
+                format!("/svc-{i}"),
+                Upstream::new(
+                    format!("http://localhost:{}", 9000 + i).parse().unwrap(),
+                    BreakerConfig::default(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
         })
         .collect();
     // A deep, specific prefix nested under one of the shallow ones, so
     // "hit deep" has to win a longest-prefix comparison instead of just
     // being the first (and only) candidate that starts_with-matches.
-    routes.push(Route {
-        prefix: "/svc-25/api/v1/users".to_string(),
-        upstream: Upstream::new(
+    routes.push(Route::new(
+        "/svc-25/api/v1/users",
+        Upstream::new(
             "http://localhost:9999".parse().unwrap(),
             BreakerConfig::default(),
         )
         .unwrap(),
-    });
+    ));
     RouteTable::new(routes, Duration::from_secs(30))
 }
 

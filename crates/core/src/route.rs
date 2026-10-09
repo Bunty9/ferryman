@@ -116,9 +116,30 @@ pub(crate) fn upstream_name(uri: &http::Uri) -> String {
 }
 
 /// One routing rule: a path prefix and the upstream it forwards to.
+#[non_exhaustive]
 pub struct Route {
     pub prefix: String,
     pub upstream: Upstream,
+    /// `true`: send the upstream's own authority as `Host`. `false` (default):
+    /// keep the client's `Host` (or the request authority, see the proxy docs).
+    pub rewrite_host: bool,
+}
+
+impl Route {
+    /// A route with `rewrite_host` off.
+    pub fn new(prefix: impl Into<String>, upstream: Upstream) -> Self {
+        Self {
+            prefix: prefix.into(),
+            upstream,
+            rewrite_host: false,
+        }
+    }
+
+    /// Set [`Route::rewrite_host`].
+    pub fn with_rewrite_host(mut self, rewrite: bool) -> Self {
+        self.rewrite_host = rewrite;
+        self
+    }
 }
 
 /// Routing decisions table. `routes` is sorted DESC by prefix length at
@@ -328,10 +349,7 @@ mod tests {
     fn table(prefixes: &[&str]) -> RouteTable {
         let routes = prefixes
             .iter()
-            .map(|p| Route {
-                prefix: p.to_string(),
-                upstream: upstream(),
-            })
+            .map(|p| Route::new(*p, upstream()))
             .collect();
         RouteTable::new(routes, Duration::from_secs(30))
     }
@@ -434,14 +452,8 @@ mod tests {
     fn upstreams_deduped_by_name() {
         let shared = upstream();
         let routes = vec![
-            Route {
-                prefix: "/a".to_string(),
-                upstream: shared.clone(),
-            },
-            Route {
-                prefix: "/b".to_string(),
-                upstream: shared.clone(),
-            },
+            Route::new("/a", shared.clone()),
+            Route::new("/b", shared.clone()),
         ];
         let t = RouteTable::new(routes, Duration::from_secs(30));
         assert_eq!(t.upstreams().count(), 1);

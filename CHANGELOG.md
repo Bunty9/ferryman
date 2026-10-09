@@ -9,6 +9,12 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- `ferryman_core::path` module: `bad_path` (moved from ferryman, same
+  semantics) and `ambiguous_route(&RouteTable, raw_path)`. Per-route
+  `rewrite_host` (default `false`) sends the upstream's authority as `Host`,
+  also for HTTP/2 and absolute-form requests. `Route::new` and
+  `Route::with_rewrite_host`.
+
 - `ConfigToml::from_table(toml::Table)` and `ConfigToml: FromStr` (shared
   parse path with `load_config`). Core never claims the top-level names
   `mtls`, `jwt`, `limits`, `tls`, `tenant_rps` (reserved for ferryman-edge).
@@ -37,6 +43,13 @@ and `ferryman` are released together with the same version.
 
 ### Changed (breaking)
 
+- `Route` is `#[non_exhaustive]` with a new pub `rewrite_host` field: replace
+  struct literals with `Route::new(prefix, upstream)`.
+- Paths that are ambiguous between ferryman and an upstream that treats
+  `%2F`/`%5C`/`\` as `/` or drops `;params` now get 400 `bad path` when that
+  reading would select a different route (`/api%2Fsecret`, `/api;x/x`).
+  Migration: send plain `/` separators; encoded separators inside a segment
+  that do not change the route (`group%2Fproject`) still pass.
 - Route matching uses a normalised path: `%XX` of unreserved characters
   (`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, and
   repeated `/` is merged. Requests such as `/%61pi/x` or `//api/x` may now

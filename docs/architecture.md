@@ -36,11 +36,12 @@ accept ── set TCP_NODELAY
   └─ proxy::handle_streaming
        1. table.load_full()             one Arc for the whole request
        2. bad_path(path)                dot segments, NUL, %u, double-encoded -> 400
-       2b. lookup(path)                 none -> 404
+       2b. ambiguous_route(table, path) %2F/%5C/\/; reading picks another route -> 400
+       2c. lookup(path)                 none -> 404
        3. Upgrade (not h2c) / CONNECT   -> 501
        4. upstream.try_acquire()        None -> 503, else Admission
        5. rewrite request:
-            strip hop-by-hop, join h2 cookies, Host from authority,
+            strip hop-by-hop, join h2 cookies, Host from authority (route `rewrite_host`: upstream authority),
             URI = upstream scheme+authority + original path+query,
             version = HTTP/1.1, x-forwarded-for / -proto;
             forwarded headers per trusted_proxies: x-real-ip always set by

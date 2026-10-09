@@ -173,7 +173,6 @@ async fn routes_on_normalised_path_but_forwards_raw() {
     for (path, want) in [
         ("/%61pi/x", "api /%61pi/x"),
         ("//api/x", "api //api/x"),
-        ("/api%2fx", "root /api%2fx"),
         ("/API/x", "root /API/x"),
     ] {
         let body = client
@@ -1042,4 +1041,118 @@ async fn repeated_abandoned_probes_rearm_at_most_once_per_cooldown() {
     assert_eq!(reqwest::get(&url).await.unwrap().status(), 503);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(reqwest::get(&url).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn rewrite_host_sets_upstream_authority_on_h1_h2_and_absolute_form() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/rw\"\nupstream = \"http://{upstream}\"\nrewrite_host = true\n\n\
+         [[routes]]\nprefix = \"/keep\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let want = format!("host: {upstream}");
+
+    let h1 = reqwest::Client::new();
+    let body = h1
+        .get(format!("http://{proxy}/rw/x"))
+        .header("host", "client.example")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(&want), "{body}");
+    let body = h1
+        .get(format!("http://{proxy}/keep/x"))
+        .header("host", "client.example")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("host: client.example"), "{body}");
+
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let body = h2
+        .get(format!("http://{proxy}/rw/x"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(&want), "{body}");
+    assert!(!body.contains(&format!("host: {proxy}")), "{body}");
+    let body = h2
+        .get(format!("http://{proxy}/keep/x"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(&format!("host: {proxy}")), "{body}");
+
+    for (path, host) in [("rw", want.as_str()), ("keep", "host: a.example")] {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let req = format!(
+            "GET http://a.example/{path}/x HTTP/1.1\r\nhost: b.example\r\nconnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains(host), "{path}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_route_paths_get_400_and_never_reach_upstream() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |req| {
+        h.fetch_add(1, Ordering::SeqCst);
+        echo(req)
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\n\n\
+         [[routes]]\nprefix = \"/\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let get = |path: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    };
+    for p in [
+        "/api%2Fsecret",
+        "/api%2fsecret",
+        "/api%5Csecret",
+        "/api\\secret",
+        "/api;x/secret",
+    ] {
+        let out = get(p).await;
+        assert!(out.starts_with("HTTP/1.1 400"), "{p}: {out}");
+        assert!(out.ends_with("bad path\n"), "{p}: {out}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    for p in ["/api/v4/projects/group%2Fproject", "/files/a%2Fb"] {
+        let out = get(p).await;
+        assert!(out.starts_with("HTTP/1.1 200"), "{p}: {out}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }

@@ -143,10 +143,7 @@ mod tests {
         .unwrap()
         .with_health(path.map(String::from), disabled);
         let t = crate::route::RouteTable::new(
-            vec![crate::route::Route {
-                prefix: "/".into(),
-                upstream: up,
-            }],
+            vec![crate::route::Route::new("/", up)],
             Duration::from_secs(5),
         );
         std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(t))

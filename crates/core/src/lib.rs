@@ -31,6 +31,7 @@ mod breaker;
 pub mod config;
 mod error;
 pub mod health;
+pub mod path;
 mod proxies;
 pub mod route;
 

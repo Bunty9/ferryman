@@ -171,6 +171,7 @@ fail loudly instead of silently falling back to defaults.
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
 | `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
 | `[[routes]] health_path`         | `/health` | Health probe path: absolute, no `?` or `#`. Hot-reloads.                       |
+| `[[routes]] rewrite_host`        | `false` | `true` sends the upstream's `host[:port]` as `Host` (HTTP/1 and HTTP/2); default keeps the client's. |
 | `[[routes]] health_disabled`     | `false` | Skip active probing of this route's upstream (see "Health-driven recovery").     |
 
 All `*_secs` values must be between 1 and 86400 (one day). An upstream
@@ -263,6 +264,7 @@ hot reload.
 | ------------------------------------------------------ | -------- | ---------------------- |
 | No route matches                                       | 404      | —                      |
 | Path has a `.`/`..` segment (also `%2e`, `..;`, or after an encoded `%2f`/`%5c`/`\` separator), or contains `%00`, `%u`, or a double-encoded dot or slash (`%252e`, `%252f`) | 400 (`bad path`) | no |
+| Path whose reading as `%2F`/`%5C`/`\` = `/` with `;params` dropped selects a different route than the raw path (`/api%2Fsecret`, `/api;x/secret`; `group%2Fproject` under `/api` is fine). Routes are case-sensitive: case-folding upstreams are not detected | 400 (`bad path`) | no |
 | Circuit open                                           | 503      | —                      |
 | `Upgrade` / `CONNECT` (e.g. WebSocket)                 | 501      | —                      |
 | Connect / transport error                              | 502      | yes                    |
@@ -276,7 +278,7 @@ hot reload.
 Request and response bodies are streamed, never buffered. Hop-by-hop
 headers are stripped both ways; forwarding headers are set as described
 under "Forwarded headers" below; the client's `Host` is kept (HTTP/2
-`:authority` becomes `Host`).
+`:authority` becomes `Host`) unless the route sets `rewrite_host = true`.
 Upstreams always get HTTP/1.1. The TLS handshake and the first request on a
 connection must complete within 10s; later HTTP/1 request heads are bounded
 by `keepalive_timeout_secs` (default 10). SIGINT/SIGTERM stop accepting and drain

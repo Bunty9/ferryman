@@ -101,6 +101,10 @@ pub struct RouteToml {
     /// sharing an upstream must agree.
     #[serde(default)]
     pub health_disabled: bool,
+    /// Send the upstream's `host[:port]` as `Host` instead of the client's
+    /// (default `false`). Routes sharing an upstream may differ.
+    #[serde(default)]
+    pub rewrite_host: bool,
 }
 
 /// Read and parse the TOML config at `path`. Shared by the server's initial
@@ -364,12 +368,22 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 other,
             });
         }
-        validated.push((r.prefix, uri, name, cooldown, breaker, health));
+        validated.push((
+            r.prefix,
+            uri,
+            name,
+            cooldown,
+            breaker,
+            health,
+            r.rewrite_host,
+        ));
     }
 
     let mut upstreams_by_name: HashMap<String, Upstream> = HashMap::new();
     let mut routes = Vec::with_capacity(validated.len());
-    for (prefix, uri, name, cooldown, breaker, (health_path, health_disabled)) in validated {
+    for (prefix, uri, name, cooldown, breaker, (health_path, health_disabled), rewrite_host) in
+        validated
+    {
         let upstream = match upstreams_by_name.get(&name) {
             Some(u) => u.clone(),
             None => {
@@ -389,7 +403,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 u
             }
         };
-        routes.push(Route { prefix, upstream });
+        routes.push(Route::new(prefix, upstream).with_rewrite_host(rewrite_host));
     }
 
     Ok(RouteTable::new(routes, upstream_timeout)
@@ -434,6 +448,7 @@ mod tests {
             cooldown_secs: None,
             health_path: None,
             health_disabled: false,
+            rewrite_host: false,
         }
     }
 

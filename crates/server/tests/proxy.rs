@@ -295,6 +295,8 @@ async fn forged_headers_echo(extra_cfg: &str) -> String {
         .header("X_Real_IP", "8.8.8.8")
         .header("X_Forwarded_Prefix", "/evil3")
         .header("X_Forwarded_Host", "evil3.example")
+        .header("x.forwarded.for", "9.9.9.9")
+        .header("X.Real.IP", "9.9.9.9")
         .send()
         .await
         .unwrap()
@@ -325,6 +327,11 @@ async fn untrusted_peer_cannot_forge_forwarded_headers() {
         assert!(!body.contains("evil"), "{body}");
         assert!(!body.to_lowercase().contains("x_"), "{body}");
         assert!(!body.contains("8.8.8.8"), "{body}");
+        assert!(!body.contains("9.9.9.9"), "{body}");
+        assert!(
+            !body.contains("x.real.ip") && !body.contains("x.forwarded"),
+            "{body}"
+        );
         assert!(!body.contains("4443"), "{body}");
         assert_eq!(body.matches("x-forwarded-port:").count(), 1, "{body}");
         assert!(!body.contains("x-forwarded-port: 4443"), "{body}");

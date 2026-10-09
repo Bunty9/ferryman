@@ -773,8 +773,10 @@ const UNTRUSTED_STRIPPED: [&str; 6] = [
     "x-forwarded-prefix",
 ];
 
-/// Names (with `_` folded to `-`) that CGI-style backends (WSGI, Rack, PHP-FPM)
-/// would confuse with the trust-governed headers below.
+/// Canonical trust-governed names. A header whose name maps onto one of these
+/// (every non-alphanumeric byte read as `-`, as CGI-style backends do: WSGI,
+/// Rack, PHP-FPM fold `_`, `.` and space) without being spelled exactly so is
+/// dropped.
 const TRUST_GOVERNED: [&str; 9] = [
     "forwarded",
     "x-forwarded-for",
@@ -787,14 +789,33 @@ const TRUST_GOVERNED: [&str; 9] = [
     "x-real-ip",
 ];
 
-/// Remove, for every peer, underscore spellings (`X_Real_IP`) of trust-governed headers.
-fn strip_underscore_spellings(headers: &mut HeaderMap) {
+/// Is `name` (already lowercase) a non-canonical spelling of a trust-governed
+/// header? Allocation-free for names made only of `[a-z0-9-]`, which are
+/// either canonical or unrelated. Runs of separators are collapsed and
+/// the ends trimmed (`x__real_ip`, `-x-real-ip` -> `x-real-ip`).
+fn is_noncanonical_spelling(name: &str) -> bool {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return false;
+    }
+    // Fold every non-alphanumeric byte to `-`, collapse runs, trim the ends.
+    let mut folded = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            folded.push(c);
+        } else if !folded.is_empty() && !folded.ends_with('-') {
+            folded.push('-');
+        }
+    }
+    let folded = folded.trim_end_matches('-');
+    TRUST_GOVERNED.contains(&folded)
+}
+
+/// Remove, for every peer, non-canonical spellings (`X_Real_IP`, `x.forwarded.for`)
+/// of trust-governed headers.
+fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
     let bad: Vec<HeaderName> = headers
         .keys()
-        .filter(|k| {
-            k.as_str().contains('_')
-                && TRUST_GOVERNED.contains(&k.as_str().replace('_', "-").as_str())
-        })
+        .filter(|k| is_noncanonical_spelling(k.as_str()))
         .cloned()
         .collect();
     for k in bad {
@@ -850,7 +871,7 @@ fn apply_forwarded_headers(
     client_host: Option<&str>,
     cfg: &FwdCfg<'_>,
 ) {
-    strip_underscore_spellings(headers);
+    strip_noncanonical_spellings(headers);
     let trusted = cfg.trusted;
     let xfp = HeaderName::from_static("x-forwarded-proto");
     let xport = HeaderName::from_static("x-forwarded-port");
@@ -1472,19 +1493,32 @@ mod tests {
     }
 
     #[test]
-    fn underscore_spellings_are_stripped_for_every_peer() {
+    fn noncanonical_spellings_are_stripped_for_every_peer() {
         let h = [
             ("x_real_ip", "6.6.6.6"),
             ("x_forwarded_prefix", "/evil"),
             ("X_Forwarded_For", "6.6.6.6"),
             ("forwarded", "for=1.1.1.1"),
             ("x_custom", "keep"),
+            ("x.forwarded.for", "6.6.6.6"),
+            ("X.Real.IP", "6.6.6.6"),
+            ("x-forwarded.proto", "https"),
+            ("x__forwarded_for", "6.6.6.6"),
+            ("x-.forwarded.for", "6.6.6.6"),
+            ("x.custom", "keep"),
         ];
         for trusted in [&[][..], &["10.0.0.0/8"][..]] {
             let m = run_with(trusted, "10.1.2.3", None, false, XffMode::Append, &h);
             for k in ["x_real_ip", "x_forwarded_prefix", "x_forwarded_for"] {
                 assert_eq!(get(&m, k), None, "{k}");
             }
+            for k in ["x.forwarded.for", "x.real.ip", "x-forwarded.proto"] {
+                assert_eq!(get(&m, k), None, "{k}");
+            }
+            for k in ["x__forwarded_for", "x-.forwarded.for"] {
+                assert_eq!(get(&m, k), None, "{k}");
+            }
+            assert_eq!(get(&m, "x.custom"), Some("keep"));
             assert_eq!(get(&m, "x_custom"), Some("keep"));
             assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
         }

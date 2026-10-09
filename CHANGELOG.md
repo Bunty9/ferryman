@@ -17,6 +17,14 @@ and `ferryman` are released together with the same version.
 
 ### Security
 
+- Strip non-canonical spellings of proxy-asserted headers: any request header
+  whose name maps onto a trust-governed one when every non-alphanumeric byte is
+  read as `-` (`x.forwarded.for`, `X.Real.IP`, as well as the
+  `_` forms below) is removed for every peer. This generalises the underscore
+  rule to PHP-style `.`/space folding. Runs of separators are collapsed and the ends
+  trimmed first (`x__real_ip`, `x-.forwarded.for`). Migration: none unless a client
+  deliberately sent these spellings.
+
 - Request headers whose name differs from a trust-governed header only by
   `_` instead of `-` (`X_Real_IP`, `X_Forwarded_For`, `X_Forwarded_Prefix`,
   `X_Forwarded_Proto`/`-Host`/`-Port`/`-Ssl`/`-Scheme`, `Forwarded`) are now

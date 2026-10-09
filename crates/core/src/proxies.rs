@@ -32,6 +32,11 @@ fn bits(ip: IpAddr) -> (u128, u8) {
 
 impl TrustedProxies {
     /// Parse CIDR strings. Errors name the offending entry.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidCidr`] for a bad address, prefix length, or
+    /// IPv4-mapped range shorter than /96.
     pub fn parse<S: AsRef<str>>(cidrs: &[S]) -> Result<Self, crate::Error> {
         let mut nets = Vec::with_capacity(cidrs.len());
         for raw in cidrs {

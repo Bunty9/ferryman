@@ -39,6 +39,9 @@ and `ferryman` are released together with the same version.
   (`Error::InvalidBreakerConfig`). **Migration:**
   `Upstream::new(uri, BreakerConfig::default().with_cooldown(c).with_failure_threshold(n))?`.
   `BreakerConfig::name` is ignored here (the breaker is named `host:port`).
+- `toml::de::Error` and `http::uri::InvalidUri` are exposed as `Error` sources
+  (`ReadConfig`/`Toml`/`InvalidUpstream`); a major bump of those crates is a
+  semver break for `ferryman-core`.
 
 ## [0.2.3] - 2026-10-05
 

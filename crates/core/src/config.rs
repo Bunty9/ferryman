@@ -91,6 +91,11 @@ pub struct RouteToml {
 
 /// Read and parse the TOML config at `path`. Shared by the server's initial
 /// boot and its hot-reload watcher so both get the same error context.
+///
+/// # Errors
+///
+/// [`Error::ReadConfig`] if the file can't be read, [`Error::Toml`] if it
+/// doesn't parse (both carry the cause as `source()`).
 pub fn load_config(path: &Path) -> Result<ConfigToml, Error> {
     let raw = std::fs::read_to_string(path).map_err(|source| Error::ReadConfig {
         path: path.to_path_buf(),
@@ -107,6 +112,14 @@ pub fn load_config(path: &Path) -> Result<ConfigToml, Error> {
 /// (matched by `host:port` name) share its circuit breaker, so a hot reload
 /// neither resets an open circuit nor strands results from in-flight
 /// requests on an orphaned breaker. Fails without side effects.
+///
+/// # Errors
+///
+/// [`Error::InvalidConfig`] (out-of-range top-level key),
+/// [`Error::InvalidCidr`] (`trusted_proxies`), [`Error::InvalidPrefix`],
+/// [`Error::DuplicatePrefix`], [`Error::InvalidUpstream`],
+/// [`Error::InvalidCooldown`], [`Error::ConflictingCooldown`] and
+/// [`Error::InvalidBreakerConfig`].
 pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTable, Error> {
     if cfg.failure_threshold < 1 {
         return Err(Error::InvalidConfig {
@@ -236,6 +249,18 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 reason: format!("must be <= {MAX_SECS}, got {}", cooldown.as_secs()),
             });
         }
+        // Validate the breaker config here, before `prev` is touched, so the
+        // `Upstream::new` below cannot fail.
+        let breaker = BreakerConfig::default()
+            .with_cooldown(cooldown)
+            .with_failure_threshold(cfg.failure_threshold);
+        breaker.validate().map_err(|e| match e {
+            Error::InvalidBreakerConfig { reason, .. } => Error::InvalidBreakerConfig {
+                reason,
+                upstream: Some(name.clone()),
+            },
+            e => e,
+        })?;
         let first = *cooldown_by_name.entry(name.clone()).or_insert(cooldown);
         if first != cooldown {
             return Err(Error::ConflictingCooldown {
@@ -245,23 +270,18 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 other_secs: first.as_secs(),
             });
         }
-        validated.push((r.prefix, uri, name, cooldown));
+        validated.push((r.prefix, uri, name, cooldown, breaker));
     }
 
     let mut upstreams_by_name: HashMap<String, Upstream> = HashMap::new();
     let mut routes = Vec::with_capacity(validated.len());
-    for (prefix, uri, name, cooldown) in validated {
+    for (prefix, uri, name, cooldown, breaker) in validated {
         let upstream = match upstreams_by_name.get(&name) {
             Some(u) => u.clone(),
             None => {
                 let u = match prev_by_name.get(name.as_str()) {
                     Some(prev_u) => prev_u.reuse(cooldown, cfg.failure_threshold),
-                    None => Upstream::new(
-                        uri,
-                        BreakerConfig::default()
-                            .with_cooldown(cooldown)
-                            .with_failure_threshold(cfg.failure_threshold),
-                    )?,
+                    None => Upstream::new(uri, breaker)?,
                 };
                 upstreams_by_name.insert(name, u.clone());
                 u

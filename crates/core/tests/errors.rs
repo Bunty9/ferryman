@@ -115,7 +115,36 @@ fn upstream_new_validates_breaker_config() {
     let e = Upstream::new(uri(), c.clone().with_failure_threshold(0))
         .err()
         .unwrap();
-    assert_eq!(e.to_string(), "failure_threshold must be >= 1, got 0");
+    assert_eq!(
+        e.to_string(),
+        "failure_threshold must be >= 1, got 0 (upstream h:1)"
+    );
     let u = Upstream::new(uri(), c.with_cooldown(Duration::from_millis(1))).unwrap();
     assert_eq!(u.name, "h:1");
+}
+
+#[test]
+fn upstream_new_error_names_the_upstream() {
+    let e = Upstream::new(
+        "http://h:1".parse().unwrap(),
+        BreakerConfig::default().with_failure_threshold(0),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(&e, Error::InvalidBreakerConfig { upstream: Some(u), .. } if u == "h:1"));
+    assert_eq!(
+        e.to_string(),
+        "failure_threshold must be >= 1, got 0 (upstream h:1)"
+    );
+}
+
+#[test]
+fn alternate_display_via_anyhow_shows_toml_cause() {
+    let path = std::env::temp_dir().join(format!("ferryman-chain-{}.toml", std::process::id()));
+    std::fs::write(&path, "routes = 3").unwrap();
+    let e = ferryman_core::load_config(&path).unwrap_err();
+    std::fs::remove_file(&path).ok();
+    let chain = format!("{:#}", anyhow::Error::from(e));
+    assert!(chain.contains("parsing config file"), "{chain}");
+    assert!(chain.contains("invalid type"), "{chain}");
 }

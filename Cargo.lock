@@ -392,6 +392,7 @@ dependencies = [
 name = "ferryman-core"
 version = "0.2.3"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "criterion",
  "http",

@@ -128,15 +128,22 @@ impl BreakerConfig {
     }
 
     /// Check the invariants [`Breaker::new`] relies on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidBreakerConfig`] if the threshold is 0 or the cooldown
+    /// is under 1 ms.
     pub fn validate(&self) -> Result<(), Error> {
         if self.failure_threshold < 1 {
             return Err(Error::InvalidBreakerConfig {
                 reason: "failure_threshold must be >= 1, got 0".into(),
+                upstream: None,
             });
         }
         if self.cooldown < Duration::from_millis(1) {
             return Err(Error::InvalidBreakerConfig {
                 reason: format!("cooldown must be >= 1ms, got {:?}", self.cooldown),
+                upstream: None,
             });
         }
         Ok(())
@@ -198,6 +205,10 @@ impl std::fmt::Debug for Breaker {
 
 impl Breaker {
     /// Create a closed breaker. Fails if `config` is invalid.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidBreakerConfig`] (see [`BreakerConfig::validate`]).
     pub fn new(config: BreakerConfig) -> Result<Self, Error> {
         config.validate()?;
         Ok(Self::unchecked(
@@ -210,7 +221,13 @@ impl Breaker {
 
     /// Validated breaker that writes the per-upstream gauges.
     pub(crate) fn for_upstream(name: String, config: &BreakerConfig) -> Result<Self, Error> {
-        config.validate()?;
+        config.validate().map_err(|e| match e {
+            Error::InvalidBreakerConfig { reason, .. } => Error::InvalidBreakerConfig {
+                reason,
+                upstream: Some(name.clone()),
+            },
+            e => e,
+        })?;
         Ok(Self::unchecked(
             Some(name),
             true,

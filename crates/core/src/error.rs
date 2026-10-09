@@ -60,8 +60,12 @@ pub enum Error {
     #[error("trusted_proxies entry {entry:?}: {reason}")]
     InvalidCidr { entry: String, reason: String },
     /// `BreakerConfig` failed validation (`Breaker::new`, `Upstream::new`).
-    #[error("{reason}")]
-    InvalidBreakerConfig { reason: String },
+    /// `upstream` is the `host:port` name when raised by `Upstream::new`.
+    #[error("{reason}{}", upstream.as_ref().map(|u| format!(" (upstream {u})")).unwrap_or_default())]
+    InvalidBreakerConfig {
+        reason: String,
+        upstream: Option<String>,
+    },
 }
 
 const _: fn() = || {

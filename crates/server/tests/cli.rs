@@ -133,13 +133,12 @@ fn check_tls_branches() {
         "tls",
         "[[routes]]\nprefix = \"/\"\nupstream = \"http://127.0.0.1:1\"\n",
     );
-    let certs = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/full-stack/certs/"
-    );
+    // Committed test-only fixture (examples/full-stack/certs is generated at
+    // runtime and gitignored, so it's absent on a fresh CI checkout).
+    let certs = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
     let (cert, key) = (
-        format!("{certs}server.pem"),
-        format!("{certs}server-key.pem"),
+        format!("{certs}test-cert.pem"),
+        format!("{certs}test-key.pem"),
     );
     let o = run(&[
         "check",

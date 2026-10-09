@@ -19,6 +19,15 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Admin server on the metrics bind: `/metrics`, `/healthz` (liveness) and
+  `/readyz` (200, then 503 once shutdown begins; not tied to upstream
+  health). Public `ferryman::admin::serve_admin`. New top-level config key
+  `local_health_path` (default none): the proxy answers `GET`/`HEAD` on that
+  path with `200 ok` before routing (no upstream, no breaker, metric
+  `route="local_health"`); it shadows route prefixes it falls under and is
+  rejected if equal to a prefix. `RouteTable::local_health_path` /
+  `with_local_health_path`.
+
 - `ferryman_core::path` module: `bad_path` (moved from ferryman, same
   semantics) and `ambiguous_route(&RouteTable, raw_path)`. Per-route
   `rewrite_host` (default `false`) sends the upstream's authority as `Host`,
@@ -52,6 +61,14 @@ and `ferryman` are released together with the same version.
   holding the half-open probe no longer blocks recovery for a cooldown.
 
 ### Changed (breaking)
+
+- The metrics listener is now ferryman's own admin server, not the
+  Prometheus exporter's. Previously every path and method returned the
+  metrics; now only `GET`/`HEAD /metrics` does (other paths 404, other
+  methods 405). Scrape configs using the default `/metrics` path are
+  unaffected; anything scraping `/` must switch to `/metrics`. The
+  `http-listener` feature of `metrics-exporter-prometheus` is no longer used.
+  `ConfigToml` gains a field (it is `#[non_exhaustive]`; no migration).
 
 - `build_table` rejects route prefixes containing `;`, `\`, `%2F` or `%5C`
   (`Error::NonCanonicalPrefix`): every request to them would be 400.

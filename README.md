@@ -166,6 +166,7 @@ fail loudly instead of silently falling back to defaults.
 | `keepalive_timeout_secs`         | 10      | HTTP/1 keep-alive idle timeout, 1-86400 (ALB: 75, GCLB: 620).                    |
 | `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
 | `request_body_timeout_secs`      | 300     | Total time to receive a request body, 1-86400 (408 when exceeded).               |
+| `local_health_path`              | none    | Path the proxy answers itself (`GET`/`HEAD` -> `200 ok`, no upstream, no breaker; metric `route="local_health"`), for PaaS platforms that only probe the serving port. Absolute, no `?`/`#`; rejected if equal to a route prefix; shadows a route prefix it falls under (e.g. `/up` under a `/` catch-all). Hot-reloads. |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
 | `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the normalised, case-sensitive request path (see "Routing and access control"). |
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
@@ -316,10 +317,26 @@ default `IP_HEADER=X-Real-IP` is correct. On 0.2.2 the only non-spoofable
 setting is `IP_HEADER=none`, which makes all clients share ferryman's IP for
 rate limiting.
 
-## Metrics endpoints
+## Admin endpoints and metrics
 
-The Prometheus exporter binds a separate listener (default `:9090`).
-Surface:
+A small admin server binds a separate listener (`--metrics-bind`, default
+`:9090`):
+
+| Path       | Response                                                                 |
+| ---------- | ------------------------------------------------------------------------ |
+| `/metrics` | Prometheus text format.                                                  |
+| `/healthz` | `200 ok` while the process is alive (liveness).                          |
+| `/readyz`  | `200 ok` while serving; `503` once shutdown (SIGTERM/SIGINT) has begun. Not tied to upstream health: a dead upstream never takes ferryman out of rotation. |
+
+Anything else is `404`; methods other than `GET`/`HEAD` are `405`.
+
+Probes: Kubernetes `livenessProbe` -> `/healthz` and `readinessProbe` ->
+`/readyz` on port 9090; ECS/ALB health checks can target 9090 `/healthz` (or
+the proxy port with `local_health_path`). PaaS platforms that only probe the
+serving port (Fly, Render, Railway) should set `local_health_path = "/up"`
+and probe that. Keep the admin port off the public internet.
+
+Metrics surface:
 
 | Metric                              | Labels                                          | Description                                                  |
 | ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ |

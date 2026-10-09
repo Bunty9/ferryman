@@ -299,6 +299,20 @@ where
     // sections only.
     let table = table.load_full();
 
+    // Answered before bad_path/lookup: no upstream, no breaker. Exact match
+    // on the raw path. Metric label is the fixed "local_health".
+    if table.local_health_path() == Some(req.uri().path())
+        && matches!(*req.method(), http::Method::GET | http::Method::HEAD)
+    {
+        record(started, "local_health", "none", 200);
+        let body = if req.method() == http::Method::HEAD {
+            ""
+        } else {
+            "ok"
+        };
+        return Ok(error_response(StatusCode::OK, body));
+    }
+
     if ferryman_core::path::bad_path(req.uri().path())
         || ferryman_core::path::ambiguous_route(&table, req.uri().path())
     {

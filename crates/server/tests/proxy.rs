@@ -1158,3 +1158,47 @@ async fn ambiguous_route_paths_get_400_and_never_reach_upstream() {
     }
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn local_health_path_is_answered_without_touching_upstream() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |_| {
+        let h = h.clone();
+        async move {
+            h.fetch_add(1, Ordering::SeqCst);
+            ok("up")
+        }
+    })
+    .await;
+    // "/" is a catch-all route; /up is shadowed by local_health_path.
+    let cfg = parse_cfg(&format!(
+        "local_health_path = \"/up\"\n[[routes]]\nprefix = \"/\"\nupstream = \"http://{upstream}\"\n"
+    ));
+    let proxy = start_proxy(shared_table(cfg)).await;
+    let c = reqwest::Client::new();
+
+    let r = c.get(format!("http://{proxy}/up")).send().await.unwrap();
+    assert_eq!(
+        (r.status().as_u16(), r.text().await.unwrap()),
+        (200, "ok".into())
+    );
+    let r = c
+        .head(format!("http://{proxy}/up?x=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    // Only exact path + GET/HEAD: everything else still routes upstream.
+    let r = c.post(format!("http://{proxy}/up")).send().await.unwrap();
+    assert_eq!(r.text().await.unwrap(), "up");
+    let r = c
+        .get(format!("http://{proxy}/up/more"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.text().await.unwrap(), "up");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}

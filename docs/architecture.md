@@ -17,7 +17,7 @@ contract (config keys, status codes, metrics) is in the
 |                  | `proxy.rs`                              | Per-request handler                                              |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
 |                  | `reload.rs`                             | Debounced config file watcher                                    |
-|                  | `main.rs`                               | CLI, tracing, metrics exporter, signal handling                  |
+|                  | `main.rs`                               | CLI, tracing, metrics recorder, admin server, signal handling                  |
 
 `ferryman` is a library plus a thin binary so the end-to-end tests
 can drive the real `serve` loop on an ephemeral port.

@@ -156,6 +156,7 @@ pub struct RouteTable {
     request_body_idle_timeout: Duration,
     request_body_timeout: Duration,
     trusted_proxies: TrustedProxies,
+    local_health_path: Option<String>,
 }
 
 impl RouteTable {
@@ -170,7 +171,19 @@ impl RouteTable {
             request_body_idle_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_IDLE_SECS),
             request_body_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_TOTAL_SECS),
             trusted_proxies: TrustedProxies::default(),
+            local_health_path: None,
         }
+    }
+
+    /// Set the path the proxy answers itself (config `local_health_path`).
+    pub fn with_local_health_path(mut self, p: Option<String>) -> Self {
+        self.local_health_path = p;
+        self
+    }
+
+    /// Path answered locally with `200 ok` instead of being routed.
+    pub fn local_health_path(&self) -> Option<&str> {
+        self.local_health_path.as_deref()
     }
 
     /// Set the HTTP/1 keep-alive idle timeout (config `keepalive_timeout_secs`;

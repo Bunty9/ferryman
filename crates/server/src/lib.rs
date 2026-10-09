@@ -5,6 +5,7 @@
 //! `main.rs` is a thin CLI wrapper around [`serve`] so integration tests can
 //! drive the same accept loop on an ephemeral port.
 
+pub mod admin;
 pub mod proxy;
 pub mod reload;
 pub mod tls;

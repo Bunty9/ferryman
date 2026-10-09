@@ -4,12 +4,13 @@
 
 use arc_swap::ArcSwap;
 use clap::Parser;
-use ferryman::{reload, tls, LATENCY_BUCKETS};
+use ferryman::{admin, reload, tls, LATENCY_BUCKETS};
 use ferryman_core::{build_table, health_loop, load_config, SharedTable};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use metrics_util::MetricKindMask;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -25,7 +26,7 @@ struct Args {
     #[arg(long, env = "FERRYMAN_BIND", default_value = "0.0.0.0:8080")]
     bind: SocketAddr,
 
-    /// Bind address for the Prometheus `/metrics` listener.
+    /// Bind address for the admin listener (`/metrics`, `/healthz`, `/readyz`).
     #[arg(long, env = "FERRYMAN_METRICS_BIND", default_value = "0.0.0.0:9090")]
     metrics_bind: SocketAddr,
 
@@ -62,20 +63,26 @@ async fn main() -> anyhow::Result<()> {
     // Validate (bounds on every duration) before any `interval * 3` below.
     let table = build_table(cfg, None)?;
 
-    // Prometheus exporter binds its own listener; the proxy is unaffected by
-    // /metrics traffic. Installed before any gauge is set, or the writes go
-    // to the no-op recorder. The health loop rewrites every live gauge each
-    // tick, so gauges of upstreams removed by a reload expire after a few
-    // missed ticks instead of reporting a stale value forever.
-    PrometheusBuilder::new()
+    // Recorder installed before any gauge is set, or the writes go to the
+    // no-op recorder. The admin server (below) renders it on /metrics. The
+    // health loop rewrites every live gauge each tick, so gauges of upstreams
+    // removed by a reload expire after a few missed ticks instead of
+    // reporting a stale value forever.
+    let metrics = PrometheusBuilder::new()
         .set_buckets_for_metric(
             Matcher::Full("ferryman_request_duration_seconds".into()),
             LATENCY_BUCKETS,
         )?
-        .with_http_listener(args.metrics_bind)
         .idle_timeout(MetricKindMask::GAUGE, Some(interval * 3))
-        .install()?;
-    tracing::info!(addr = %args.metrics_bind, "metrics listener bound");
+        .install_recorder()?;
+    let draining = Arc::new(AtomicBool::new(false));
+    let admin_listener = tokio::net::TcpListener::bind(args.metrics_bind).await?;
+    tokio::spawn(admin::serve_admin(
+        admin_listener,
+        metrics,
+        draining.clone(),
+    ));
+    tracing::info!(addr = %args.metrics_bind, "admin listener bound (/metrics, /healthz, /readyz)");
     table.publish_gauges();
     let shared: SharedTable = Arc::new(ArcSwap::from_pointee(table));
 
@@ -86,7 +93,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, tls = tls_acceptor.is_some(), "ferryman listening");
 
-    ferryman::serve(listener, shared, tls_acceptor, shutdown_signal()).await
+    let shutdown = async move {
+        shutdown_signal().await;
+        // Readiness flips before the drain starts; /readyz stays up during it.
+        draining.store(true, Ordering::Relaxed);
+    };
+    ferryman::serve(listener, shared, tls_acceptor, shutdown).await
 }
 
 /// Resolves on SIGINT or SIGTERM, for graceful shutdown.

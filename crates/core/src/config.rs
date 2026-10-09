@@ -49,6 +49,12 @@ pub struct ConfigToml {
     /// Not required to be >= the idle timeout; whichever fires first wins.
     #[serde(default = "default_body_timeout")]
     pub request_body_timeout_secs: u64,
+    /// Path the proxy itself answers with `200 ok` on `GET`/`HEAD`, for
+    /// platforms that only probe the serving port. Absolute, no query or
+    /// fragment; must not equal a route prefix. Shadows any route prefix it
+    /// falls under. Default: none.
+    #[serde(default)]
+    pub local_health_path: Option<String>,
     pub routes: Vec<RouteToml>,
 }
 
@@ -199,6 +205,26 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
             return Err(Error::InvalidConfig {
                 key,
                 reason: format!("must be <= {MAX_SECS}, got {v}"),
+            });
+        }
+    }
+    if let Some(p) = &cfg.local_health_path {
+        if !(p.starts_with('/')
+            && !p.contains(['?', '#'])
+            && p.parse::<http::uri::PathAndQuery>().is_ok())
+        {
+            return Err(Error::InvalidConfig {
+                key: "local_health_path",
+                reason: format!("{p:?} must start with '/' and contain no '?' or '#'"),
+            });
+        }
+        if let Some(r) = cfg.routes.iter().find(|r| &r.prefix == p) {
+            return Err(Error::InvalidConfig {
+                key: "local_health_path",
+                reason: format!(
+                    "{p:?} equals the prefix of route {:?} and would shadow it",
+                    r.prefix
+                ),
             });
         }
     }
@@ -419,7 +445,8 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
         .with_keepalive_timeout(Duration::from_secs(cfg.keepalive_timeout_secs))
         .with_request_body_idle_timeout(Duration::from_secs(cfg.request_body_idle_timeout_secs))
         .with_request_body_timeout(Duration::from_secs(cfg.request_body_timeout_secs))
-        .with_trusted_proxies(trusted_proxies))
+        .with_trusted_proxies(trusted_proxies)
+        .with_local_health_path(cfg.local_health_path))
 }
 
 #[cfg(test)]
@@ -437,6 +464,7 @@ mod tests {
             trusted_proxies: Vec::new(),
             request_body_idle_timeout_secs: 30,
             request_body_timeout_secs: 300,
+            local_health_path: None,
             routes,
         }
     }
@@ -462,6 +490,32 @@ mod tests {
             health_disabled: false,
             rewrite_host: false,
         }
+    }
+
+    #[test]
+    fn local_health_path_validation() {
+        for bad in ["healthz", "/h?x=1", "/h#f", "/svc-a"] {
+            let mut c = cfg(vec![route("/svc-a", "http://h:1")]);
+            c.local_health_path = Some(bad.into());
+            assert!(
+                matches!(
+                    build_table(c, None),
+                    Err(Error::InvalidConfig {
+                        key: "local_health_path",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+        let mut c = cfg(vec![route("/svc-a", "http://h:1")]);
+        c.local_health_path = Some("/up".into());
+        assert_eq!(
+            build_table(c, None).unwrap().local_health_path(),
+            Some("/up")
+        );
+        let c = cfg(vec![route("/svc-a", "http://h:1")]);
+        assert_eq!(build_table(c, None).unwrap().local_health_path(), None);
     }
 
     #[test]

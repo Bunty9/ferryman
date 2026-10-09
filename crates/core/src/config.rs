@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_health_path() {
-        for bad in ["healthz", "", "/h?x=1", "/h#f", "/a b"] {
+        for bad in ["healthz", "", "/h?x=1", "/h#f", "/a b", "/a\u{1}b"] {
             let mut r = route("/a", "http://h:1");
             r.health_path = Some(bad.to_string());
             let r = build_table(cfg(vec![r]), None);

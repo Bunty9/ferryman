@@ -933,3 +933,73 @@ async fn dot_segments_get_400_and_never_reach_upstream() {
         .contains("GET /api/group%2Fproject"));
     assert_eq!(hits.load(Ordering::SeqCst), 5);
 }
+
+/// Echo stub that drops connections while `down` (so the breaker can be
+/// tripped), and otherwise reads the whole request body before answering.
+async fn spawn_toggle_echo(down: Arc<AtomicBool>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            if down.load(Ordering::SeqCst) {
+                drop(stream);
+                continue;
+            }
+            tokio::spawn(serve_one(stream, echo));
+        }
+    });
+    addr
+}
+
+/// Open the circuit (threshold 1, cooldown 1 s), bring the upstream back and
+/// wait out the cooldown. Returns the proxy address.
+async fn open_then_cooled_down() -> SocketAddr {
+    let down = Arc::new(AtomicBool::new(true));
+    let addr = spawn_toggle_echo(down.clone()).await;
+    let table = shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\ndefault_cooldown_secs = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{addr}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let url = format!("http://{proxy}/svc-a");
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 502);
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 503);
+    down.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    proxy
+}
+
+/// Take the half-open probe with a partial upload, then hang up.
+async fn abandoned_probe(proxy: SocketAddr) {
+    use tokio::io::AsyncWriteExt;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\npartial")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn abandoned_half_open_probe_is_released_immediately() {
+    let proxy = open_then_cooled_down().await;
+    abandoned_probe(proxy).await;
+    // Well inside the 1 s cooldown: the slot was handed back, so this
+    // request is the next probe (200 closes the circuit), not a 503.
+    let r = reqwest::get(format!("http://{proxy}/svc-a")).await.unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+#[tokio::test]
+async fn repeated_abandoned_probes_rearm_at_most_once_per_cooldown() {
+    let proxy = open_then_cooled_down().await;
+    abandoned_probe(proxy).await; // takes the probe, release re-arms
+    abandoned_probe(proxy).await; // takes it again, release must not re-arm
+    let url = format!("http://{proxy}/svc-a");
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 503);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 200);
+}

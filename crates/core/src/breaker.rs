@@ -183,6 +183,8 @@ pub struct Breaker {
     state: AtomicU8,
     consecutive_failures: AtomicU32,
     opened_at_millis: AtomicU64,
+    /// Last `release` re-arm (`u64::MAX` = never); caps re-arms to one per cooldown.
+    rearmed_at_millis: AtomicU64,
     // Config lives in atomics so a hot reload can retune a shared breaker.
     failure_threshold: AtomicU32,
     cooldown_millis: AtomicU64,
@@ -251,6 +253,7 @@ impl Breaker {
             state: AtomicU8::new(CircuitState::Closed as u8),
             consecutive_failures: AtomicU32::new(0),
             opened_at_millis: AtomicU64::new(0),
+            rearmed_at_millis: AtomicU64::new(u64::MAX),
             failure_threshold: AtomicU32::new(0),
             cooldown_millis: AtomicU64::new(0),
         };
@@ -313,16 +316,47 @@ impl Breaker {
     /// Hand back a ticket whose request ended without a verdict on the
     /// upstream (client hung up, bad request, timeout that isn't the
     /// upstream's fault). A `Probe` re-arms the half-open slot at once, so
-    /// the next caller can probe instead of waiting out another cooldown; a
-    /// `Normal` ticket is a no-op. Never changes the state or the failure
-    /// count. Call at most once per ticket and not after `record_*` for it
-    /// (harmless then: it only acts while the circuit is half-open).
+    /// the next caller can probe instead of waiting out another cooldown;
+    /// a `Normal` ticket is a no-op. Never changes the state or the failure
+    /// count.
+    ///
+    /// Re-arming happens at most once per cooldown (otherwise a client that
+    /// keeps starting and abandoning requests would turn every request into
+    /// a probe against a sick upstream). Call at most once per ticket and
+    /// not after `record_*` for it; it only acts while the circuit is
+    /// half-open, so a stale call is harmless except that it can re-arm a
+    /// newer probe's slot (bounded by the once-per-cooldown cap).
     pub fn release(&self, admission: Admission) {
-        if admission == Admission::Probe && self.state() == CircuitState::HalfOpen {
-            let cooldown = self.cooldown_millis.load(Ordering::Relaxed);
-            self.opened_at_millis
-                .store(now_millis().saturating_sub(cooldown), Ordering::Release);
+        if admission != Admission::Probe {
+            return;
         }
+        // ponytail: tickets carry no generation, so a stale release may
+        // re-arm another probe's slot (at most once per cooldown); add
+        // per-ticket generations if exactness matters.
+        let cooldown = self.cooldown_millis.load(Ordering::Relaxed);
+        let now = now_millis();
+        let stamp = self.opened_at_millis.load(Ordering::Acquire);
+        if self.state() != CircuitState::HalfOpen {
+            return;
+        }
+        let last = self.rearmed_at_millis.load(Ordering::Acquire);
+        if last != u64::MAX && now.saturating_sub(last) < cooldown {
+            return;
+        }
+        if self
+            .rearmed_at_millis
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // CAS, not store: a concurrent HalfOpen -> Open restamp wins.
+        let _ = self.opened_at_millis.compare_exchange(
+            stamp,
+            now.saturating_sub(cooldown),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub fn record_success(&self, admission: Admission) {
@@ -529,6 +563,27 @@ mod tests {
         assert_eq!(b.state(), CircuitState::HalfOpen, "state unchanged");
         assert_eq!(b.try_acquire(), Some(P), "slot re-armed at once");
         assert_eq!(b.try_acquire(), None);
+    }
+
+    #[test]
+    fn release_rearms_at_most_once_per_cooldown() {
+        let b = breaker(200, 1);
+        half_open(&b); // probe out
+        let mut admitted = 1;
+        for _ in 0..1000 {
+            b.release(P);
+            if b.try_acquire().is_some() {
+                admitted += 1;
+            }
+        }
+        assert!(admitted <= 2, "probe flood: {admitted}");
+        assert_eq!(b.state(), CircuitState::HalfOpen);
+        thread::sleep(Duration::from_millis(250));
+        // The stale rule may hand out a probe now; take whatever is out,
+        // then a release after the cooldown re-arms again.
+        let _ = b.try_acquire();
+        b.release(P);
+        assert_eq!(b.try_acquire(), Some(P), "re-armed after a cooldown");
     }
 
     #[test]

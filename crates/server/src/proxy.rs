@@ -390,8 +390,6 @@ where
             // upstream's fault; the legacy path can't tell for bodies.
             if counts_timeout {
                 upstream.record_failure(admission);
-            } else {
-                upstream.release(admission);
             }
             record(started, &route_label, &upstream.name, 504);
             Ok(error_response(

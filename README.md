@@ -195,7 +195,7 @@ hide paths of an upstream that another route also reaches.
 ### Health-driven recovery
 
 The `ferryman` binary runs a health loop: every `health_interval_secs` it
-probes each upstream's `/health` (any answer below 500 is healthy;
+probes each upstream's `health_path` (default `/health`; any answer below 500 is healthy;
 transport errors, timeouts and 5xx are not). An embedder calling
 `ferryman::serve` alone has no health loop unless it spawns `health_loop`
 itself. Health results are authoritative, like the half-open probe:
@@ -212,6 +212,11 @@ itself. Health results are authoritative, like the half-open probe:
   failed half-open probe, or a failing check landing while half-open).
   Without a running health loop, recovery is the same: cooldown expiry plus
   one successful half-open request.
+- Health failures while the circuit is closed do count toward
+  `failure_threshold`, like request failures. With a broken health endpoint
+  and sparse traffic the circuit can flap (open on health failures, close
+  on the next half-open request). Set `health_disabled = true` for an
+  upstream whose health endpoint is broken or absent-by-design.
 - `health_path` (default `/health`) sets the probed path;
   `health_disabled = true` makes the loop skip the upstream entirely: no
   probe and no effect on its breaker, so only request traffic drives it.

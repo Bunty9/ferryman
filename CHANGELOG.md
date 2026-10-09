@@ -25,9 +25,11 @@ and `ferryman` are released together with the same version.
 
 - `Breaker::release` / `Upstream::release`: hand back a ticket that ended
   without a verdict on the upstream. A `Probe` re-arms the half-open slot
-  immediately; `Normal` is a no-op. `ferryman` calls it on client-side
-  failures (408, client body error, bad request) so a client hanging up
-  while holding the half-open probe no longer blocks recovery for a cooldown.
+  immediately, at most once per cooldown (so abandoned requests cannot turn
+  into a probe flood); `Normal` is a no-op; state and counts never change.
+  `ferryman` calls it on the 408 (stalled/over-long upload), client
+  body error (400) and URI-rebuild 502 paths, so a client hanging up while
+  holding the half-open probe no longer blocks recovery for a cooldown.
 
 ### Changed (breaking)
 

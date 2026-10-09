@@ -171,7 +171,12 @@ mod tests {
 
         let on = one_route_table(addr, Some("/ready"), false);
         let h = tokio::spawn(health_loop(on.clone(), Duration::from_millis(30)));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while on.load().lookup("/").unwrap().upstream.state() != crate::CircuitState::Open
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         h.abort();
         let seen = seen.lock().unwrap();
         assert!(

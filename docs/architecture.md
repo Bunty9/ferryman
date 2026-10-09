@@ -172,9 +172,11 @@ swap) are not seen by the watcher.
   first request's head when below 10s). HTTP/2: keep-alive ping every 30s.
 - Accept errors (e.g. `EMFILE`) are logged; the loop sleeps 100ms and
   continues.
-- On SIGINT/SIGTERM the listener closes, `GracefulShutdown` asks open
-  connections to finish, and the process exits after at most 25s (under
-  `fly.toml`'s 30s `kill_timeout`).
+- On SIGINT/SIGTERM `/readyz` flips to 503, serving continues for
+  `shutdown_delay_secs` (default 0), then the listener closes,
+  `GracefulShutdown` asks open connections to finish, and the process exits
+  after at most `drain_timeout_secs` (default 25, under `fly.toml`'s 30s
+  `kill_timeout`).
 
 ## Dependencies and build
 

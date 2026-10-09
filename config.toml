@@ -54,6 +54,14 @@ default_cooldown_secs = 30
 # "::/0" does not trust them; host bits are ignored (10.0.0.1/8 = 10.0.0.0/8).
 # trusted_proxies = ["10.0.0.0/8", "fd00::/8"]
 
+# Shutdown (SIGTERM/SIGINT). /readyz goes 503 immediately; ferryman keeps
+# serving for shutdown_delay_secs (0..=86400, default 0) so a load balancer
+# can deregister it, then stops accepting and waits up to drain_timeout_secs
+# (1..=86400, default 25) for in-flight requests. Keep the sum below the
+# platform kill timeout (Cloud Run: drain_timeout_secs = 8).
+# shutdown_delay_secs = 0
+# drain_timeout_secs = 25
+
 # Every *_secs key above (and per-route cooldown_secs) must be <= 86400.
 
 [[routes]]

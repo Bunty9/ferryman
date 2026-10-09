@@ -155,6 +155,8 @@ pub struct RouteTable {
     keepalive_timeout: Duration,
     request_body_idle_timeout: Duration,
     request_body_timeout: Duration,
+    drain_timeout: Duration,
+    shutdown_delay: Duration,
     trusted_proxies: TrustedProxies,
     local_health_path: Option<String>,
 }
@@ -170,6 +172,8 @@ impl RouteTable {
             keepalive_timeout: Duration::from_secs(crate::config::DEFAULT_KEEPALIVE_SECS),
             request_body_idle_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_IDLE_SECS),
             request_body_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_TOTAL_SECS),
+            drain_timeout: Duration::from_secs(crate::config::DEFAULT_DRAIN_SECS),
+            shutdown_delay: Duration::ZERO,
             trusted_proxies: TrustedProxies::default(),
             local_health_path: None,
         }
@@ -205,6 +209,29 @@ impl RouteTable {
     pub fn with_request_body_timeout(mut self, d: Duration) -> Self {
         self.request_body_timeout = d;
         self
+    }
+
+    /// Set the shutdown drain budget (config `drain_timeout_secs`; default 25 s).
+    pub fn with_drain_timeout(mut self, d: Duration) -> Self {
+        self.drain_timeout = d;
+        self
+    }
+
+    /// Set how long to keep serving after shutdown starts, before the
+    /// listener closes (config `shutdown_delay_secs`; default 0).
+    pub fn with_shutdown_delay(mut self, d: Duration) -> Self {
+        self.shutdown_delay = d;
+        self
+    }
+
+    /// Longest wait for in-flight connections once the listener has closed.
+    pub fn drain_timeout(&self) -> Duration {
+        self.drain_timeout
+    }
+
+    /// Time to keep accepting (with `/readyz` at 503) after shutdown starts.
+    pub fn shutdown_delay(&self) -> Duration {
+        self.shutdown_delay
     }
 
     /// Set the trusted proxy ranges (config `trusted_proxies`; default empty).

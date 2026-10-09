@@ -55,6 +55,14 @@ pub struct ConfigToml {
     /// falls under. Default: none.
     #[serde(default)]
     pub local_health_path: Option<String>,
+    /// On shutdown, how long to wait for in-flight connections after the
+    /// listener closes, in seconds (1..=86400). Default 25.
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
+    /// On shutdown, how long to keep serving with `/readyz` at 503 before
+    /// the listener closes, in seconds (0..=86400). Default 0.
+    #[serde(default)]
+    pub shutdown_delay_secs: u64,
     pub routes: Vec<RouteToml>,
 }
 
@@ -71,6 +79,10 @@ fn default_upstream_timeout() -> u64 {
     30
 }
 pub(crate) const DEFAULT_KEEPALIVE_SECS: u64 = 10;
+pub(crate) const DEFAULT_DRAIN_SECS: u64 = 25;
+fn default_drain_timeout() -> u64 {
+    DEFAULT_DRAIN_SECS
+}
 pub(crate) const DEFAULT_BODY_IDLE_SECS: u64 = 30;
 pub(crate) const DEFAULT_BODY_TOTAL_SECS: u64 = 300;
 fn default_body_timeout() -> u64 {
@@ -194,6 +206,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
             cfg.request_body_idle_timeout_secs,
         ),
         ("request_body_timeout_secs", cfg.request_body_timeout_secs),
+        ("drain_timeout_secs", cfg.drain_timeout_secs),
     ] {
         if v == 0 {
             return Err(Error::InvalidConfig {
@@ -207,6 +220,12 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 reason: format!("must be <= {MAX_SECS}, got {v}"),
             });
         }
+    }
+    if cfg.shutdown_delay_secs > MAX_SECS {
+        return Err(Error::InvalidConfig {
+            key: "shutdown_delay_secs",
+            reason: format!("must be <= {MAX_SECS}, got {}", cfg.shutdown_delay_secs),
+        });
     }
     if let Some(p) = &cfg.local_health_path {
         if !(p.starts_with('/')
@@ -451,6 +470,8 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
         .with_keepalive_timeout(Duration::from_secs(cfg.keepalive_timeout_secs))
         .with_request_body_idle_timeout(Duration::from_secs(cfg.request_body_idle_timeout_secs))
         .with_request_body_timeout(Duration::from_secs(cfg.request_body_timeout_secs))
+        .with_drain_timeout(Duration::from_secs(cfg.drain_timeout_secs))
+        .with_shutdown_delay(Duration::from_secs(cfg.shutdown_delay_secs))
         .with_trusted_proxies(trusted_proxies)
         .with_local_health_path(cfg.local_health_path))
 }
@@ -471,6 +492,8 @@ mod tests {
             request_body_idle_timeout_secs: 30,
             request_body_timeout_secs: 300,
             local_health_path: None,
+            drain_timeout_secs: 25,
+            shutdown_delay_secs: 0,
             routes,
         }
     }
@@ -726,6 +749,8 @@ mod tests {
             "keepalive_timeout_secs",
             "request_body_idle_timeout_secs",
             "request_body_timeout_secs",
+            "drain_timeout_secs",
+            "shutdown_delay_secs",
         ] {
             assert!(parse(&format!("{key} = 86400")).is_ok(), "{key} at bound");
             let err = parse(&format!("{key} = 86401")).err().expect(key);
@@ -764,9 +789,17 @@ mod tests {
             "keepalive_timeout_secs",
             "request_body_idle_timeout_secs",
             "request_body_timeout_secs",
+            "drain_timeout_secs",
         ] {
             assert!(parse(&format!("{key} = 0")).is_err());
         }
+        assert!(parse("shutdown_delay_secs = 0").is_ok());
+        let t = parse("").unwrap();
+        assert_eq!(t.drain_timeout(), Duration::from_secs(25));
+        assert_eq!(t.shutdown_delay(), Duration::ZERO);
+        let t = parse("drain_timeout_secs = 8\nshutdown_delay_secs = 3").unwrap();
+        assert_eq!(t.drain_timeout(), Duration::from_secs(8));
+        assert_eq!(t.shutdown_delay(), Duration::from_secs(3));
         let err = parse("trusted_proxies = [\"10.0.0.0/33\"]").err().unwrap();
         assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
     }

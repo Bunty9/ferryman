@@ -47,11 +47,6 @@ pub const LATENCY_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
-/// How long to wait for in-flight connections to finish after `shutdown`
-/// resolves, before dropping them anyway. Kept under fly.toml's 30s
-/// `kill_timeout` so the drain finishes before a SIGKILL.
-const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
-
 /// Deadline for a client to finish the TLS handshake and to send its first
 /// request. Stops idle sockets from pinning file descriptors (slowloris).
 /// Later HTTP/1 requests are bounded by `keepalive_timeout_secs` instead.
@@ -62,8 +57,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const H2_KEEP_ALIVE: Duration = Duration::from_secs(30);
 
 /// Accept connections on `listener` and serve the proxy until `shutdown`
-/// resolves, then stop accepting and wait (up to
-/// `GRACEFUL_SHUTDOWN_TIMEOUT`, 25s) for in-flight connections to finish.
+/// resolves, then stop accepting and wait (up to the table's
+/// `drain_timeout_secs`, default 25s, read at that moment) for in-flight
+/// connections to finish.
 ///
 /// TLS-terminates each connection first when `tls` is `Some`; otherwise
 /// serves plain HTTP. Either way, both HTTP/1 and HTTP/2 are auto-detected.
@@ -171,9 +167,10 @@ pub async fn serve(
     }
 
     drop(listener);
+    let drain = table.load().drain_timeout();
     tokio::select! {
         _ = graceful.shutdown() => {}
-        _ = tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT) => {
+        _ = tokio::time::sleep(drain) => {
             tracing::warn!("graceful shutdown timed out waiting for in-flight connections");
         }
     }

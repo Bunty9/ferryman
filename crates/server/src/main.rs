@@ -21,18 +21,15 @@ struct Args {
     #[command(subcommand)]
     cmd: Option<Cmd>,
 
-    /// Path to the TOML routing config.
-    #[arg(
-        long,
-        global = true,
-        env = "FERRYMAN_CONFIG",
-        default_value = "config.toml"
-    )]
-    config: PathBuf,
+    /// Path to the TOML routing config (default `config.toml`). Ignored when
+    /// `FERRYMAN_CONFIG_TOML` (inline TOML) is set.
+    #[arg(long, global = true, env = "FERRYMAN_CONFIG")]
+    config: Option<PathBuf>,
 
-    /// Bind address for the proxy listener.
-    #[arg(long, env = "FERRYMAN_BIND", default_value = "0.0.0.0:8080")]
-    bind: SocketAddr,
+    /// Bind address for the proxy listener. Order: `--bind`, `FERRYMAN_BIND`,
+    /// `0.0.0.0:$PORT`, `0.0.0.0:8080`.
+    #[arg(long, env = "FERRYMAN_BIND")]
+    bind: Option<SocketAddr>,
 
     /// Bind address for the admin listener (`/metrics`, `/healthz`, `/readyz`).
     #[arg(
@@ -64,6 +61,36 @@ enum Cmd {
         #[arg(long)]
         url: Option<String>,
     },
+}
+
+/// `--bind` > `FERRYMAN_BIND` (both parsed by clap) > `0.0.0.0:$PORT` > `0.0.0.0:8080`.
+/// An unparsable `PORT` is ignored with a warning on stderr.
+fn resolve_bind(bind: Option<SocketAddr>, port: Option<&str>) -> SocketAddr {
+    if let Some(b) = bind {
+        return b;
+    }
+    match port.map(|p| (p, p.trim().parse::<u16>())) {
+        Some((_, Ok(p))) => SocketAddr::from(([0, 0, 0, 0], p)),
+        Some((raw, Err(_))) => {
+            eprintln!("ignoring invalid PORT={raw:?}; using 0.0.0.0:8080");
+            SocketAddr::from(([0, 0, 0, 0], 8080))
+        }
+        None => SocketAddr::from(([0, 0, 0, 0], 8080)),
+    }
+}
+
+/// Where the config comes from. Non-empty `FERRYMAN_CONFIG_TOML` (inline TOML)
+/// always wins over `--config` / `FERRYMAN_CONFIG` (the image's default CMD
+/// passes `--config`, so a flag cannot be the tiebreaker); no file is
+/// watched then.
+fn load_cfg(args: &Args) -> anyhow::Result<(ferryman_core::ConfigToml, Option<PathBuf>)> {
+    match std::env::var("FERRYMAN_CONFIG_TOML") {
+        Ok(raw) if !raw.trim().is_empty() => Ok((raw.parse()?, None)),
+        _ => {
+            let path = args.config.clone().unwrap_or_else(|| "config.toml".into());
+            Ok((load_config(&path)?, Some(path)))
+        }
+    }
 }
 
 #[tokio::main]
@@ -105,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Load + parse the initial config. Fail fast on first-boot misconfiguration.
-    let cfg = load_config(&args.config)?;
+    let (cfg, config_path) = load_cfg(&args)?;
     let interval = Duration::from_secs(cfg.health_interval_secs);
     // Validate (bounds on every duration) before any `interval * 3` below.
     let table = build_table(cfg, None)?;
@@ -128,25 +155,40 @@ async fn main() -> anyhow::Result<()> {
 
     // Background tasks: active health checker + config watcher.
     tokio::spawn(health_loop(shared.clone(), interval));
-    let _watcher = reload::watch_config(&args.config, shared.clone())?;
+    let _watcher = match &config_path {
+        Some(p) => Some(reload::watch_config(p, shared.clone())?),
+        None => {
+            tracing::info!("config from FERRYMAN_CONFIG_TOML: file watch disabled, no hot reload");
+            None
+        }
+    };
 
-    let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    tracing::info!(addr = %args.bind, tls = tls_acceptor.is_some(), "ferryman listening");
+    let bind = resolve_bind(args.bind, std::env::var("PORT").ok().as_deref());
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!(addr = %listener.local_addr()?, tls = tls_acceptor.is_some(), "ferryman listening");
 
     // Spawned after the proxy port is bound so /readyz is never 200 before
     // the proxy can accept.
     let admin_listener = tokio::net::TcpListener::bind(args.metrics_bind).await?;
+    let admin_addr = admin_listener.local_addr()?;
     tokio::spawn(admin::serve_admin(
         admin_listener,
         metrics,
         draining.clone(),
     ));
-    tracing::info!(addr = %args.metrics_bind, "admin listener bound (/metrics, /healthz, /readyz)");
+    tracing::info!(addr = %admin_addr, "admin listener bound (/metrics, /healthz, /readyz)");
 
+    let table = shared.clone();
     let shutdown = async move {
         shutdown_signal().await;
-        // Readiness flips before the drain starts; /readyz stays up during it.
+        // Readiness flips first; /readyz stays up (503) through the delay and
+        // the drain. The proxy keeps accepting until the delay elapses.
         draining.store(true, Ordering::Relaxed);
+        let delay = table.load().shutdown_delay();
+        if !delay.is_zero() {
+            tracing::info!(?delay, "shutdown_delay: not ready, still serving");
+            tokio::time::sleep(delay).await;
+        }
     };
     ferryman::serve(listener, shared, tls_acceptor, shutdown).await
 }
@@ -172,7 +214,7 @@ fn check(args: &Args) -> anyhow::Result<usize> {
     } else if args.tls_cert.is_some() || args.tls_key.is_some() {
         anyhow::bail!("--tls-cert and --tls-key must both be set or both omitted");
     }
-    let cfg = load_config(&args.config)?;
+    let (cfg, _) = load_cfg(args)?;
     let n = cfg.routes.len();
     build_table(cfg, None)?;
     Ok(n)
@@ -227,5 +269,21 @@ async fn shutdown_signal() {
         }
         _ = close.recv() => tracing::info!("received console close, shutting down"),
         _ = shutdown.recv() => tracing::info!("received system shutdown, shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_bind;
+
+    #[test]
+    fn bind_order() {
+        let b = Some("127.0.0.1:1".parse().unwrap());
+        assert_eq!(resolve_bind(b, Some("9000")).to_string(), "127.0.0.1:1");
+        assert_eq!(resolve_bind(None, Some("9000")).to_string(), "0.0.0.0:9000");
+        assert_eq!(resolve_bind(None, None).to_string(), "0.0.0.0:8080");
+        for bad in ["", "abc", "70000", "-1"] {
+            assert_eq!(resolve_bind(None, Some(bad)).to_string(), "0.0.0.0:8080");
+        }
     }
 }

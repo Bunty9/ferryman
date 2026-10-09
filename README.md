@@ -166,6 +166,8 @@ fail loudly instead of silently falling back to defaults.
 | `keepalive_timeout_secs`         | 10      | HTTP/1 keep-alive idle timeout, 1-86400 (ALB: 75, GCLB: 620).                    |
 | `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
 | `request_body_timeout_secs`      | 300     | Total time to receive a request body, 1-86400 (408 when exceeded).               |
+| `drain_timeout_secs`             | 25      | After the listener closes on shutdown, how long to wait for in-flight requests before cutting them, 1-86400. Keep it under your platform's kill timeout. |
+| `shutdown_delay_secs`            | 0       | On SIGTERM/SIGINT, `/readyz` flips to 503 at once and ferryman keeps accepting for this long (0-86400) before the drain starts. Read at shutdown, so a reload applies. |
 | `local_health_path`              | none    | Path the proxy answers itself (`GET`/`HEAD` -> `200 ok`, no upstream, no breaker; metric `route="local_health"`), for PaaS platforms that only probe the serving port. Absolute, no `?`/`#`; rejected if equal to a route prefix; shadows a route prefix it falls under (e.g. `/up` under a `/` catch-all). Hot-reloads. |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
 | `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the normalised, case-sensitive request path (see "Routing and access control"). |
@@ -237,9 +239,20 @@ when a circuit opens, `info` otherwise. Failing checks while open
 are not logged.
 
 CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
-(`FERRYMAN_BIND`, `0.0.0.0:8080`), `--metrics-bind`
+(`FERRYMAN_BIND`; resolution order `--bind` > `FERRYMAN_BIND` >
+`0.0.0.0:$PORT` (ignored with a warning if not a valid port) >
+`0.0.0.0:8080`), `--metrics-bind`
 (`FERRYMAN_METRICS_BIND`, `0.0.0.0:9090`), `--tls-cert` / `--tls-key`
 (`FERRYMAN_TLS_CERT` / `FERRYMAN_TLS_KEY`).
+
+### Inline config (`FERRYMAN_CONFIG_TOML`)
+
+When `FERRYMAN_CONFIG_TOML` is set and non-empty, its value is the whole
+TOML config and `--config` / `FERRYMAN_CONFIG` are ignored (the Docker
+image's default `CMD` passes `--config`, so a flag cannot be the
+tiebreaker). No file is watched, so there is no hot reload (a startup log
+line says so); change the env var and restart. `ferryman check` honours it
+too.
 
 ### Subcommands
 
@@ -277,6 +290,24 @@ can send one request and then hold the connection for up to this value, so
 raise it only behind a load balancer. Changes apply to new connections on
 hot reload.
 
+### PaaS and orchestrators
+
+Platforms that inject `PORT` need no flags: `PORT=10000
+FERRYMAN_CONFIG_TOML='[[routes]]...' ferryman` listens on `0.0.0.0:10000`
+with the inline config.
+
+- Cloud Run (SIGTERM, then SIGKILL after 10 s): set `drain_timeout_secs = 8`.
+  It probes the serving port, so set `local_health_path` if you use probes.
+- Render, Railway, Heroku: all set `PORT`; Heroku sends SIGTERM and kills
+  after 30 s (the default 25 fits), Render and Railway are configurable.
+  Use inline config or a file committed in the image.
+- ECS / Kubernetes: the load balancer needs time to notice the target is
+  leaving. Point the target-group / readiness probe at the admin `/readyz`
+  and set `shutdown_delay_secs` to at least the probe interval times its
+  failure threshold (about 5-15 s; ALB deregistration delay is separate and
+  also keeps connections open). Keep `shutdown_delay_secs + drain_timeout_secs`
+  below ECS `stopTimeout` / the pod's `terminationGracePeriodSeconds`.
+
 ## Behaviour
 
 | Situation                                              | Response | Counts against breaker |
@@ -302,8 +333,10 @@ under "Forwarded headers" below; the client's `Host` is kept (HTTP/2
 `:authority` becomes `Host`) unless the route sets `rewrite_host = true`.
 Upstreams always get HTTP/1.1. The TLS handshake and the first request on a
 connection must complete within 10s; later HTTP/1 request heads are bounded
-by `keepalive_timeout_secs` (default 10). SIGINT/SIGTERM stop accepting and drain
-in-flight connections for up to 25s.
+by `keepalive_timeout_secs` (default 10). On SIGINT/SIGTERM `/readyz` goes
+503 immediately, ferryman keeps serving for `shutdown_delay_secs` (default 0),
+then stops accepting and drains in-flight connections for up to
+`drain_timeout_secs` (default 25) before exiting.
 
 ### Forwarded headers and `trusted_proxies`
 

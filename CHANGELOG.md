@@ -32,6 +32,15 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Shutdown tuning: `drain_timeout_secs` (default 25, the previous constant)
+  and `shutdown_delay_secs` (default 0). On SIGTERM/SIGINT `/readyz` flips to
+  503 at once, the proxy keeps serving for the delay, then drains for up to
+  `drain_timeout_secs`. `serve` keeps its signature and reads the drain value
+  from the table (`RouteTable::drain_timeout()` / `shutdown_delay()`).
+- PaaS support: bind resolves `--bind` > `FERRYMAN_BIND` > `0.0.0.0:$PORT` >
+  `0.0.0.0:8080`; `FERRYMAN_CONFIG_TOML` supplies the config inline (wins over
+  `--config`/`FERRYMAN_CONFIG`, disables the file watch; `check` honours it).
+
 - Subcommands `ferryman check [--config]` (validate config + TLS files
   without binding; exit 0/1) and `ferryman healthcheck [--url]` (GET the
   admin `/healthz`, exit 0 on 2xx; no curl needed). The Docker image gains a

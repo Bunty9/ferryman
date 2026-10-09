@@ -162,8 +162,9 @@ impl Route {
     /// raw path unchanged.
     ///
     /// `raw_path` must have passed `bad_path` and match this route. The
-    /// remainder is a suffix of that accepted path, so it holds no new dot
-    /// segments.
+    /// remainder is a suffix of the NORMALISED path, which CAN hold dot
+    /// segments `bad_path` never saw (`/api/%2%65%2%65/x` normalises to
+    /// `/api/%2e%2e/x`); the runtime re-check is load-bearing.
     pub fn stripped_path(&self, raw_path: &str) -> Option<String> {
         let prefix = self.stripped_prefix();
         if prefix.is_empty() {
@@ -407,7 +408,9 @@ fn rewrite_at(b: &[u8], i: usize) -> Option<(usize, [u8; 3], usize)> {
     }
 }
 
-/// Matching-only normalisation; borrows when the path is already normal.
+/// Normalisation for matching; borrows when the path is already normal.
+/// Routes with `strip_prefix` also forward the normalised remainder (see
+/// [`Route::stripped_path`]); every other route forwards the raw path.
 pub(crate) fn normalize(path: &str) -> Cow<'_, str> {
     if !path.contains('%') && !path.contains("//") {
         return Cow::Borrowed(path);
@@ -587,8 +590,10 @@ mod tests {
             Some("/a%2Fb")
         );
         assert_eq!(r("/").stripped_path("/x").as_deref(), Some("/x"));
-        // Unreachable via the proxy (lookup guarantees a boundary and
-        // bad_path runs first), so exercised directly: None means 400.
+        // None means 400. `/apix` and `/other` can't reach this via the
+        // proxy; the `%2%65` form can (it passes bad_path, normalises to
+        // dot segments).
+        assert_eq!(r("/api").stripped_path("/api/%2%65%2%65/x"), None);
         assert_eq!(r("/api").stripped_path("/apix"), None);
         assert_eq!(r("/api").stripped_path("/other"), None);
         assert_eq!(r("/api").stripped_path("/api/%2e%2e/x"), None);

@@ -43,7 +43,10 @@ accept ── set TCP_NODELAY
        4. upstream.try_acquire()        None -> 503, else Admission
        5. rewrite request:
             strip hop-by-hop, join h2 cookies, Host from authority (route `rewrite_host`: upstream authority),
-            URI = upstream scheme+authority + original path+query,
+            URI = upstream scheme+authority + original path+query
+              (`strip_prefix` route: normalised remainder after the prefix,
+              re-checked, failing -> 400; then x-forwarded-prefix set last,
+              after the forwarded headers),
             version = HTTP/1.1, x-forwarded-for / -proto;
             forwarded headers per trusted_proxies: x-real-ip always set by
             ferryman; forwarded / x-forwarded-host / -ssl / -scheme / -prefix /
@@ -87,7 +90,10 @@ Prefixes match the normalised, case-sensitive path on a segment boundary.
 allocation, when the path is already normal): `%XX` of unreserved chars
 (`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, repeated
 `/` is merged. The proxy runs `bad_path` first, so normalisation never has
-to deal with dot segments, and still forwards the raw path. `%2f` stays
+to deal with dot segments, and still forwards the raw path. The exception
+is a route with `strip_prefix`: it forwards the normalised remainder after the
+prefix (re-checked with `bad_path`; a failing remainder is a 400) and sets
+`X-Forwarded-Prefix` after `apply_forwarded_headers`. `%2f` stays
 encoded (`/api%2fx` does not match `/api`) and case is significant, so
 routes are not access control: such variants fall to a less specific route
 (e.g. `/`) whose upstream may decode them into a more specific path.

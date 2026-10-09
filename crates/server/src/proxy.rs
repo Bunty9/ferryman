@@ -440,7 +440,15 @@ where
                 Some(q) => format!("{path}?{q}"),
                 None => path.clone(),
             };
-            pq.parse().ok()
+            match pq.parse() {
+                Ok(pq) => Some(pq),
+                Err(_) => {
+                    // Request-derived, so the client's fault.
+                    upstream.release(admission);
+                    record(started, &route_label, &upstream.name, 400);
+                    return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
+                }
+            }
         }
         None => parts.uri.path_and_query().cloned(),
     };

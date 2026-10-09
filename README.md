@@ -200,7 +200,7 @@ fail loudly instead of silently falling back to defaults.
 | `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
 | `[[routes]] health_path`         | `/health` | Health probe path: absolute, no `?` or `#`. Hot-reloads.                       |
 | `[[routes]] rewrite_host`        | `false` | `true` sends the upstream's `host[:port]` as `Host` (HTTP/1 and HTTP/2); default keeps the client's. |
-| `[[routes]] strip_prefix`        | `false` | `true` removes the matched prefix before forwarding (`/api/users?x=1` under `/api` becomes `/users?x=1`; `/api` becomes `/`) and sets `X-Forwarded-Prefix: /api`. The path is checked (`bad_path`) before and after stripping and is forwarded normalised; the query is untouched. A `/` route has nothing to strip. |
+| `[[routes]] strip_prefix`        | `false` | `true` removes the matched prefix before forwarding (`/api/users?x=1` under `/api` becomes `/users?x=1`; `/api` becomes `/`) and sets `X-Forwarded-Prefix: /api`. The path is checked (`bad_path`) before and after stripping and is forwarded normalised (repeated `/` merged, unreserved `%XX` decoded, other escapes' hex uppercased); the query is untouched. A `/` route has nothing to strip. |
 | `[[routes]] health_disabled`     | `false` | Skip active probing of this route's upstream (see "Health-driven recovery").     |
 
 All `*_secs` values must be between 1 and 86400 (one day). An upstream

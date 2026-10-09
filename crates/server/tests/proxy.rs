@@ -1456,3 +1456,32 @@ async fn strip_prefix_does_not_bypass_bad_path() {
         assert_eq!(st, 400, "{p}");
     }
 }
+
+#[tokio::test]
+async fn strip_prefix_rechecks_remainder_after_normalisation() {
+    use tokio::io::AsyncWriteExt;
+    // `%2%65` passes bad_path and lookup, then normalises to `%2e`: the
+    // stripped remainder would hold dot segments, so it must be a 400 that
+    // never reaches the upstream.
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |_req| {
+        let h = h.clone();
+        async move {
+            h.fetch_add(1, Ordering::SeqCst);
+            ok("hit")
+        }
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\nstrip_prefix = true\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"GET /api/%2%65%2%65/x HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let line = read_status_line(&mut s).await;
+    assert!(line.contains("400"), "{line}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}

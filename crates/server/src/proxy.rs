@@ -36,7 +36,8 @@ pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 /// it enforces `request_body_idle_timeout_secs` between frames and
 /// `request_body_timeout_secs` overall (an over-slow upload errors, which
 /// `handle_streaming` turns into 408), and it reports end-of-stream so `handle_streaming` can
-/// start the upstream timeout only once the whole body is sent. Never buffers.
+/// start the upstream timeout only once the whole body is sent. Trailer frames
+/// are discarded (client trailers are never forwarded). Never buffers.
 pub struct RequestBody {
     inner: Incoming,
     idle: Duration,
@@ -160,54 +161,59 @@ impl Body for RequestBody {
         if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
         }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                this.idle_sleep = None;
-                this.state.stall_ended();
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                // The last frame of a content-length body may not be followed
-                // by another poll, so check here as well as on `None`.
-                this.signal_if_done();
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                this.state.stall_ended();
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                Poll::Ready(Some(Err(e.into())))
-            }
-            Poll::Ready(None) => {
-                this.state.stall_ended();
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                if let Some(tx) = this.eos.take() {
-                    let _ = tx.send(());
+        loop {
+            return match Pin::new(&mut this.inner).poll_frame(cx) {
+                // Client trailers never reach the upstream: they could carry
+                // trust-governed header names. Keep polling for the next frame.
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
+                Poll::Ready(Some(Ok(frame))) => {
+                    this.idle_sleep = None;
+                    this.state.stall_ended();
+                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                    // The last frame of a content-length body may not be followed
+                    // by another poll, so check here as well as on `None`.
+                    this.signal_if_done();
+                    Poll::Ready(Some(Ok(frame)))
                 }
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                this.state.waiting_on_client.store(true, Ordering::Relaxed);
-                let now = this.state.now_ms() + 1;
-                let _ = this.state.stall_since.compare_exchange(
-                    0,
-                    now,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-                let idle = this.idle;
-                let idle_sleep = this
-                    .idle_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
-                if idle_sleep.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Some(Err(BodyIdleTimeout.into())));
+                Poll::Ready(Some(Err(e))) => {
+                    this.state.stall_ended();
+                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                    Poll::Ready(Some(Err(e.into())))
                 }
-                let deadline = this.deadline;
-                let total_sleep = this
-                    .total_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
-                if total_sleep.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
+                Poll::Ready(None) => {
+                    this.state.stall_ended();
+                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                    if let Some(tx) = this.eos.take() {
+                        let _ = tx.send(());
+                    }
+                    Poll::Ready(None)
                 }
-                Poll::Pending
-            }
+                Poll::Pending => {
+                    this.state.waiting_on_client.store(true, Ordering::Relaxed);
+                    let now = this.state.now_ms() + 1;
+                    let _ = this.state.stall_since.compare_exchange(
+                        0,
+                        now,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                    let idle = this.idle;
+                    let idle_sleep = this
+                        .idle_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                    if idle_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(BodyIdleTimeout.into())));
+                    }
+                    let deadline = this.deadline;
+                    let total_sleep = this
+                        .total_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+                    if total_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
+                    }
+                    Poll::Pending
+                }
+            };
         }
     }
 

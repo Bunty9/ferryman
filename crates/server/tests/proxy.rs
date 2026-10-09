@@ -1492,3 +1492,59 @@ async fn strip_prefix_rechecks_remainder_after_normalisation() {
     assert!(line.contains("400"), "{line}");
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn request_trailers_never_reach_the_upstream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The stub reports the trailers it received (none expected) in the body.
+    let upstream = spawn_stub(|req| async move {
+        let c = req.into_body().collect().await.unwrap();
+        let t = c.trailers().map(|t| format!("{t:?}")).unwrap_or_default();
+        ok(format!("data={} trailers={t}", c.to_bytes().len()))
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /svc-a HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\nte: trailers\r\ntrailer: x-real-ip\r\nconnection: close\r\n\r\n4\r\nabcd\r\n0\r\nx-real-ip: 6.6.6.6\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.contains("data=4 trailers="), "{out}");
+    assert!(!out.contains("6.6.6.6"), "{out}");
+}
+
+/// Dropping the trailer frame must still signal end-of-body, or the
+/// upstream timeout (which starts at body EOS) never fires.
+#[tokio::test]
+async fn chunked_upload_with_trailer_to_slow_upstream_is_504() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = spawn_stub(|req| async move {
+        let _ = req.into_body().collect().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        ok("too-slow")
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "upstream_timeout_secs = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /svc-a HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\nte: trailers\r\n\r\n4\r\nabcd\r\n0\r\nx-a: b\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    let st = read_status_line(&mut s).await;
+    assert!(st.starts_with("HTTP/1.1 504"), "{st}");
+    assert!(start.elapsed() < Duration::from_millis(2500));
+}

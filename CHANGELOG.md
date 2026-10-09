@@ -17,6 +17,11 @@ and `ferryman` are released together with the same version.
 
 ### Security
 
+- Request trailers are no longer forwarded: the proxied request body drops
+  trailer frames, so a client cannot deliver trust-governed names (`X-Real-IP`)
+  to the upstream as trailers. Data frames and timing are unchanged. Migration:
+  none (the `Trailer` header was already stripped as hop-by-hop).
+
 - Strip non-canonical spellings of proxy-asserted headers: any request header
   whose name maps onto a trust-governed one when every non-alphanumeric byte is
   read as `-` (`x.forwarded.for`, `X.Real.IP`, as well as the

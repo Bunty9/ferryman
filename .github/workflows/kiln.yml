@@ -1,0 +1,65 @@
+# Full test gate plus smokes on kiln (self-hosted: a fresh KVM VM per job on
+# the maintainer's box, https://github.com/Bunty9/kiln). Runs on the working
+# branch only, never on pull requests: this repo is public and fork code must
+# not run on self-hosted hardware. ci.yml (GitHub-hosted) stays the merge
+# gate; release.yml never runs here.
+name: kiln
+
+on:
+  push:
+    branches: [phase-1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kiln-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: [self-hosted, kiln]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        # ~/.cargo and ~/.rustup live on kiln's per-repo cache disk (written
+        # only by default-branch pushes), so this is usually a quick update.
+        run: curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy,rustfmt
+      - name: Format
+        run: . "$HOME/.cargo/env" && cargo fmt --all -- --check
+      - name: Clippy
+        run: . "$HOME/.cargo/env" && cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test (incl. doctests)
+        run: |
+          . "$HOME/.cargo/env"
+          cargo test --workspace --locked
+          cargo test --doc --workspace --locked
+      - name: Docs
+        run: . "$HOME/.cargo/env" && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+      - name: Bench compiles
+        run: . "$HOME/.cargo/env" && cargo bench -p ferryman-core --no-run --locked
+      - name: Dependency audit
+        run: |
+          . "$HOME/.cargo/env"
+          [ "$(cargo deny --version 2>/dev/null)" = "cargo-deny 0.20.2" ] || cargo install cargo-deny --locked --version 0.20.2
+          cargo deny --locked check
+      - name: Full-stack example (Compose)
+        # demo.sh polls readiness itself; it needs curl, jq and docker compose.
+        run: bash examples/full-stack/demo.sh --ci
+      - name: wrk2 smoke (non-blocking)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if ! command -v wrk2 >/dev/null; then
+            git clone --depth=1 https://github.com/giltene/wrk2 "$RUNNER_TEMP/wrk2"
+            make -C "$RUNNER_TEMP/wrk2" -j"$(nproc)"
+            export WRK2="$RUNNER_TEMP/wrk2/wrk"
+          fi
+          bash scripts/wrk2-smoke.sh

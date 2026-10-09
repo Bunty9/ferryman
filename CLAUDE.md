@@ -29,6 +29,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `build_table` validates everything before touching `prev` breakers; reload reuses the same `Arc<Breaker>` per `host:port`.
 - `lookup` ignores health: dead upstream = 503, never fall back to a shorter prefix.
 - Client-side body errors (`hyper::Error::is_user`) and stalled or over-long uploads (`request_body_idle_timeout_secs` / `request_body_timeout_secs`, 408) never trip the breaker. `upstream_timeout` starts at request-body EOS (immediately if bodyless); a 504 after that is recorded as a breaker failure, as is an upstream that stops reading the upload for a whole `upstream_timeout` window (hyper not polling the body while not waiting on the client).
+- A client that stalled its upload for >= theta = min(1s, `request_body_idle_timeout`/2) is never blamed for an upstream 502/503/504/transport error (ticket is `release`d, status unchanged); the 504 timer branch still counts.
 - Metric labels are config-bounded (`route` = prefix, `upstream` = host:port); never label with raw paths.
 - Gauges: exporter is installed before any gauge write; health loop republishes every tick (removed upstreams expire via `idle_timeout`).
 - `examples/*` crates are workspace members with `publish = false`.

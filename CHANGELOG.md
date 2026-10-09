@@ -7,6 +7,15 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Security
+
+- A client that stalled its upload could open the breaker for everyone: the
+  upstream's own body-read timeout produced a 502 (or a forwarded 502-504)
+  that was counted as an upstream failure, so three slow uploads yielded 503
+  for all clients. When the client left its upload idle for at least
+  min(1 s, `request_body_idle_timeout_secs` / 2), such a result now releases
+  the breaker ticket instead of counting; the response status is unchanged.
+
 ### Added
 
 - `ferryman_core::path` module: `bad_path` (moved from ferryman, same

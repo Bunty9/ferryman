@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -58,10 +58,34 @@ impl std::fmt::Debug for RequestBody {
 /// What `handle`'s timer can see of the body: whether hyper polled it, and
 /// whether the last poll was left waiting on the client (as opposed to hyper
 /// having stopped reading, e.g. an upstream whose receive buffer is full).
-#[derive(Default)]
 struct BodyState {
     polled: AtomicBool,
     waiting_on_client: AtomicBool,
+    origin: Instant,
+    /// Start of the current client stall, ms since `origin` + 1 (0 = none).
+    stall_since: AtomicU64,
+    /// Longest finished client stall so far, ms.
+    longest_stall: AtomicU64,
+}
+
+impl BodyState {
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+    fn stall_ended(&self) {
+        let since = self.stall_since.swap(0, Ordering::Relaxed);
+        if since != 0 {
+            let d = (self.now_ms() + 1).saturating_sub(since);
+            self.longest_stall.fetch_max(d, Ordering::Relaxed);
+        }
+    }
+    /// Did the client leave its upload idle for >= `theta` at any point (incl. now)?
+    fn client_stalled(&self, theta: Duration) -> bool {
+        let t = theta.as_millis() as u64;
+        let since = self.stall_since.load(Ordering::Relaxed);
+        self.longest_stall.load(Ordering::Relaxed) >= t
+            || (since != 0 && (self.now_ms() + 1).saturating_sub(since) >= t)
+    }
 }
 
 struct Eos {
@@ -94,7 +118,13 @@ impl std::error::Error for BodyTotalTimeout {}
 impl RequestBody {
     fn new(inner: Incoming, idle: Duration, total: Duration) -> (Self, Eos) {
         let (tx, rx) = oneshot::channel();
-        let state = Arc::new(BodyState::default());
+        let state = Arc::new(BodyState {
+            polled: AtomicBool::new(false),
+            waiting_on_client: AtomicBool::new(false),
+            origin: Instant::now(),
+            stall_since: AtomicU64::new(0),
+            longest_stall: AtomicU64::new(0),
+        });
         let mut b = Self {
             inner,
             idle,
@@ -133,6 +163,7 @@ impl Body for RequestBody {
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 this.idle_sleep = None;
+                this.state.stall_ended();
                 this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 // The last frame of a content-length body may not be followed
                 // by another poll, so check here as well as on `None`.
@@ -140,10 +171,12 @@ impl Body for RequestBody {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
+                this.state.stall_ended();
                 this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 Poll::Ready(Some(Err(e.into())))
             }
             Poll::Ready(None) => {
+                this.state.stall_ended();
                 this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 if let Some(tx) = this.eos.take() {
                     let _ = tx.send(());
@@ -152,6 +185,13 @@ impl Body for RequestBody {
             }
             Poll::Pending => {
                 this.state.waiting_on_client.store(true, Ordering::Relaxed);
+                let now = this.state.now_ms() + 1;
+                let _ = this.state.stall_since.compare_exchange(
+                    0,
+                    now,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 let idle = this.idle;
                 let idle_sleep = this
                     .idle_sleep
@@ -358,6 +398,11 @@ where
     let fwd = Request::from_parts(parts, body);
 
     let upstream_timeout = table.upstream_timeout;
+    // A client that left its upload idle for >= theta may have tripped the
+    // upstream's own body-read timeout; its 502/5xx then isn't evidence.
+    let theta = (table.request_body_idle_timeout() / 2).min(Duration::from_secs(1));
+    let stall = body_done.as_ref().map(|e| e.state.clone());
+    let client_stalled = || stall.as_ref().is_some_and(|s| s.client_stalled(theta));
     // Completes when the request must be failed as an upstream timeout (504).
     let timer = async move {
         let Some(Eos { mut rx, state }) = body_done else {
@@ -428,7 +473,11 @@ where
             ))
         }
         Some(Err(e)) => {
-            upstream.record_failure(admission);
+            if client_stalled() {
+                upstream.release(admission);
+            } else {
+                upstream.record_failure(admission);
+            }
             tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
             record(started, &route_label, &upstream.name, 502);
             Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
@@ -438,7 +487,11 @@ where
             // Health is judged on the response head; the body is streamed
             // afterwards with no timeout of its own.
             if matches!(status.as_u16(), 502..=504) {
-                upstream.record_failure(admission);
+                if client_stalled() {
+                    upstream.release(admission);
+                } else {
+                    upstream.record_failure(admission);
+                }
             } else {
                 upstream.record_success(admission);
             }

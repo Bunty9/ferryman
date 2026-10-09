@@ -272,6 +272,7 @@ hot reload.
 | Client's request body fails mid-upload                 | 400      | no                     |
 | Client stalls its upload for `request_body_idle_timeout_secs`, or exceeds `request_body_timeout_secs` in total | 408 | no |
 | Upstream stops reading the upload for a whole `upstream_timeout_secs` window | 504 | yes |
+| Connect / transport error or upstream 502/503/504, after the client left its upload idle for >= min(1 s, `request_body_idle_timeout_secs` / 2) | 502 / passed through | no |
 | Upstream answers 502/503/504                           | passed through | yes              |
 | Anything else from upstream                            | passed through | success          |
 

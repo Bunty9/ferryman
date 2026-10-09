@@ -167,7 +167,7 @@ fail loudly instead of silently falling back to defaults.
 | `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
 | `request_body_timeout_secs`      | 300     | Total time to receive a request body, 1-86400 (408 when exceeded).               |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
-| `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the raw, undecoded, case-sensitive request path (see "Routing and access control"). |
+| `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the normalised, case-sensitive request path (see "Routing and access control"). |
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
 | `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
 | `[[routes]] health_path`         | `/health` | Health probe path: absolute, no `?` or `#`. Hot-reloads.                       |
@@ -185,12 +185,15 @@ old table stays live.
 
 ### Routing and access control
 
-Prefixes match the raw, undecoded, case-sensitive request path on a
-segment boundary. A less specific route (especially `/`) can therefore
-receive paths that its upstream decodes or merges into a more specific
-prefix, e.g. `/%61pi/x` or `//api/x` reaching an upstream that treats
-them as `/api/x`. Routes are not access control: don't rely on a route to
-hide paths of an upstream that another route also reaches.
+Prefixes match the normalised, case-sensitive request path on a segment
+boundary. Normalisation, for matching only (the forwarded path stays raw):
+`%XX` escapes of unreserved characters (`A-Za-z0-9-._~`) are decoded, hex
+digits of the remaining escapes are uppercased, and repeated `/` are merged.
+Nothing else is decoded, so `/api%2fx` does not match `/api`, and `/API/x`
+does not either. Routes are still not access control: case variants and
+`%2f` variants fall to a less specific route (especially `/`) and may be
+decoded or merged into a more specific path by the upstream. Don't rely on
+a route to hide paths of an upstream that another route also reaches.
 
 ### Health-driven recovery
 

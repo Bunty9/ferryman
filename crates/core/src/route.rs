@@ -10,6 +10,7 @@ use crate::breaker::{Breaker, BreakerConfig};
 use crate::proxies::TrustedProxies;
 use crate::Error;
 use arc_swap::ArcSwap;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -200,8 +201,19 @@ impl RouteTable {
     /// `/svc-a` matches `/svc-a`, `/svc-a/`, `/svc-a/x`, but not `/svc-ab`.
     /// A prefix ending in `/` matches anything starting with it (including
     /// `/` itself, which acts as a catch-all).
+    ///
+    /// Pass the RAW request path: matching runs on a normalised copy
+    /// (`%XX` of unreserved chars decoded, other escapes' hex uppercased,
+    /// repeated `/` merged; case-sensitive, `%2f` stays encoded), so
+    /// `/%61pi/x` and `//api/x` match `/api`. The caller still forwards the
+    /// raw path. Precondition: the caller has already rejected dot segments
+    /// (the proxy's `bad_path`); normalisation never creates one, because
+    /// `%2e` is already rejected there.
     pub fn lookup(&self, path: &str) -> Option<&Route> {
-        self.routes.iter().find(|r| prefix_matches(&r.prefix, path))
+        let path = normalize(path);
+        self.routes
+            .iter()
+            .find(|r| prefix_matches(&r.prefix, &path))
     }
 
     /// Upstreams referenced by this table, deduplicated by name — routes
@@ -221,6 +233,67 @@ impl RouteTable {
             u.breaker.set_gauges();
         }
     }
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
+}
+
+fn is_unreserved(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~')
+}
+
+/// What to do at `b[i]`: `Some(n)` = consume `n` bytes and emit the
+/// normalised form, `None` = already normal.
+fn rewrite_at(b: &[u8], i: usize) -> Option<(usize, [u8; 3], usize)> {
+    match b[i] {
+        b'/' if b.get(i + 1) == Some(&b'/') => Some((1, [0; 3], 0)),
+        b'%' => {
+            let (h, l) = (hex_val(*b.get(i + 1)?)?, hex_val(*b.get(i + 2)?)?);
+            let c = h << 4 | l;
+            if is_unreserved(c) {
+                Some((3, [c, 0, 0], 1))
+            } else if b[i + 1].is_ascii_lowercase() || b[i + 2].is_ascii_lowercase() {
+                Some((
+                    3,
+                    [
+                        b'%',
+                        b[i + 1].to_ascii_uppercase(),
+                        b[i + 2].to_ascii_uppercase(),
+                    ],
+                    3,
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Matching-only normalisation; borrows when the path is already normal.
+fn normalize(path: &str) -> Cow<'_, str> {
+    let b = path.as_bytes();
+    let Some(first) = (0..b.len()).find(|&i| rewrite_at(b, i).is_some()) else {
+        return Cow::Borrowed(path);
+    };
+    let mut out = Vec::with_capacity(b.len());
+    out.extend_from_slice(&b[..first]);
+    let mut i = first;
+    while i < b.len() {
+        match rewrite_at(b, i) {
+            Some((n, bytes, len)) => {
+                out.extend_from_slice(&bytes[..len]);
+                i += n;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    // Only ASCII bytes were substituted, so this is always valid UTF-8.
+    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn prefix_matches(prefix: &str, path: &str) -> bool {
@@ -254,6 +327,55 @@ mod tests {
             })
             .collect();
         RouteTable::new(routes, Duration::from_secs(30))
+    }
+
+    fn route_of<'a>(t: &'a RouteTable, p: &str) -> Option<&'a str> {
+        t.lookup(p).map(|r| r.prefix.as_str())
+    }
+
+    #[test]
+    fn matches_on_normalised_path() {
+        let t = table(&["/", "/api", "/~x"]);
+        assert_eq!(route_of(&t, "/%61pi/x"), Some("/api"));
+        assert_eq!(route_of(&t, "//api/x"), Some("/api"));
+        assert_eq!(route_of(&t, "/api//x"), Some("/api"));
+        assert_eq!(route_of(&t, "///api"), Some("/api"));
+        assert_eq!(route_of(&t, "/%7ex"), Some("/~x"));
+        assert_eq!(route_of(&t, "/%7Ex/y"), Some("/~x"));
+        assert_eq!(route_of(&t, "/API/x"), Some("/"));
+        assert_eq!(route_of(&t, "/%41pi/x"), Some("/"));
+        assert_eq!(route_of(&t, "/api%2fx"), Some("/"));
+        assert_eq!(route_of(&t, "/api%2Fx"), Some("/"));
+        assert_eq!(route_of(&t, "/apix"), Some("/"));
+    }
+
+    #[test]
+    fn normalize_cases() {
+        for (raw, want) in [
+            ("/a%2fb", "/a%2Fb"),
+            ("/a%2Fb", "/a%2Fb"),
+            ("/%61%2f//b", "/a%2F/b"),
+            ("/a%zz", "/a%zz"),
+            ("/a%6", "/a%6"),
+            ("/a%e4%b8%ad", "/a%E4%B8%AD"),
+        ] {
+            assert_eq!(normalize(raw), want, "{raw}");
+        }
+        for p in ["/", "/api/x", "/a%2Fb", "/a%zz"] {
+            assert!(matches!(normalize(p), Cow::Borrowed(_)), "{p}");
+        }
+    }
+
+    /// Normalisation must not turn a path `bad_path` accepted into one with a
+    /// dot segment: `%2e` decodes to `.`, but `bad_path` rejects `%2e`-only
+    /// segments first, and a segment like `%2e%2e` never reaches lookup.
+    #[test]
+    fn decoding_dots_only_happens_inside_longer_segments() {
+        // `%2e` inside a longer segment stays a harmless filename.
+        assert_eq!(normalize("/api/a%2eb"), "/api/a.b");
+        // A pure-dot segment would be rejected by the proxy before lookup;
+        // lookup alone does not create a *new* one beyond what was there.
+        assert_eq!(normalize("/api/%2e%2e/x"), "/api/../x");
     }
 
     #[test]

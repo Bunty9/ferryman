@@ -159,6 +159,36 @@ async fn path_and_query_reach_upstream_intact() {
 }
 
 #[tokio::test]
+async fn routes_on_normalised_path_but_forwards_raw() {
+    let api =
+        spawn_stub(|req: Request<Incoming>| async move { ok(format!("api {}", req.uri())) }).await;
+    let root =
+        spawn_stub(|req: Request<Incoming>| async move { ok(format!("root {}", req.uri())) }).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{api}\"\n\
+         [[routes]]\nprefix = \"/\"\nupstream = \"http://{root}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let client = reqwest::Client::new();
+    for (path, want) in [
+        ("/%61pi/x", "api /%61pi/x"),
+        ("//api/x", "api //api/x"),
+        ("/api%2fx", "root /api%2fx"),
+        ("/API/x", "root /API/x"),
+    ] {
+        let body = client
+            .get(format!("http://{proxy}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, want);
+    }
+}
+
+#[tokio::test]
 async fn no_route_is_404() {
     let table = shared_table(parse_cfg(
         "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://127.0.0.1:1\"\n",

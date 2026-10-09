@@ -79,11 +79,15 @@ Lookup deliberately ignores health. If `/api/v1` is down, falling back to
 `/api` would send the request to a different service, so the answer is a
 503.
 
-Prefixes match the raw, undecoded, case-sensitive request path on a
-segment boundary. A less specific route (especially `/`) can receive paths
-that its upstream decodes or merges into a more specific prefix (e.g.
-`/%61pi/x`, `//api/x`). Routes are not access control: don't rely on a
-route to hide paths of an upstream that another route also reaches.
+Prefixes match the normalised, case-sensitive path on a segment boundary.
+`lookup` takes the raw path and normalises internally (borrowing, no
+allocation, when the path is already normal): `%XX` of unreserved chars
+(`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, repeated
+`/` is merged. The proxy runs `bad_path` first, so normalisation never has
+to deal with dot segments, and still forwards the raw path. `%2f` stays
+encoded (`/api%2fx` does not match `/api`) and case is significant, so
+routes are not access control: such variants fall to a less specific route
+(e.g. `/`) whose upstream may decode them into a more specific path.
 
 ## Circuit breaker
 

@@ -27,7 +27,11 @@ pub struct Upstream {
 impl Upstream {
     pub fn new(uri: http::Uri, cooldown: Duration, failure_threshold: u32) -> Self {
         let name = upstream_name(&uri);
-        let breaker = Arc::new(Breaker::new(name.clone(), cooldown, failure_threshold));
+        let breaker = Arc::new(Breaker::unchecked(
+            Some(name.clone()),
+            cooldown,
+            failure_threshold,
+        ));
         Self { uri, name, breaker }
     }
 

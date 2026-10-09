@@ -149,6 +149,7 @@ Reference examples live under [`examples/`](./examples) (index:
 | --- | --- |
 | [`examples/full-stack/`](./examples/full-stack) | Full Docker Compose deployment: ferryman, TLS, three demo upstreams, Prometheus + Grafana, an asserted `demo.sh` tour. |
 | [`examples/embedded/`](./examples/embedded) | Embedding `ferryman::serve` as a library inside your own async Rust app, with its own admin server. |
+| [`examples/embedded/src/guarded.rs`](./examples/embedded/src/guarded.rs) | A standalone `ferryman_core::Breaker` guarding a `reqwest` call. |
 | [`crates/core/examples/guarded_client.rs`](./crates/core/examples/guarded_client.rs) | `ferryman-core`'s circuit breaker guarding any fallible async call, no proxy involved. |
 
 ## Configuration

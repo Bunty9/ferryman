@@ -33,7 +33,7 @@ pub mod health;
 mod proxies;
 pub mod route;
 
-pub use breaker::CircuitState;
+pub use breaker::{Breaker, BreakerConfig, CircuitState};
 pub use config::{build_table, load_config, ConfigToml, RouteToml};
 pub use health::health_loop;
 pub use proxies::TrustedProxies;

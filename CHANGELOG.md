@@ -7,6 +7,19 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Added
+
+- `ferryman_core::Breaker` and `BreakerConfig` are public: a standalone
+  circuit breaker (`Breaker::new(config)?`, `try_acquire`, `record_success`,
+  `record_failure`, `state`) usable without a routing table. Defaults:
+  threshold 3, cooldown 30 s. `Breaker::new` rejects a cooldown under 1 ms
+  and a zero threshold. See `examples/embedded` (`guarded.rs`).
+
+### Changed (breaking)
+
+- `CircuitState` and `Admission` are now `#[non_exhaustive]`.
+  **Migration:** add a `_ =>` arm to any `match` on either enum.
+
 ## [0.2.3] - 2026-10-05
 
 ### Security

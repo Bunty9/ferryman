@@ -26,6 +26,7 @@ fn now_millis() -> u64 {
 /// Circuit breaker state. Mirrors the `ferryman_circuit_state` gauge values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum CircuitState {
     Closed = 0,
     Open = 1,
@@ -44,6 +45,7 @@ impl CircuitState {
 
 /// Why a request was let through. Pass it back when reporting the result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Admission {
     /// Ordinary request through a closed circuit. Its result only counts
     /// while the circuit is still closed.
@@ -53,10 +55,84 @@ pub enum Admission {
     Probe,
 }
 
-/// Lock-free circuit breaker for one upstream. Shared (via `Arc`) between
-/// every route that points at the backend, and across hot reloads.
-pub(crate) struct Breaker {
-    name: String,
+/// Circuit breaker settings. Build with [`Default`] and the `with_*` setters;
+/// [`Breaker::new`] validates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BreakerConfig {
+    /// Consecutive failures that open the circuit. Must be at least 1.
+    pub failure_threshold: u32,
+    /// How long the circuit stays open before one probe is let through.
+    /// Must be at least 1 ms.
+    pub cooldown: Duration,
+    /// Label for logs and metric gauges. Unnamed breakers publish no gauges.
+    pub name: Option<String>,
+}
+
+impl Default for BreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            cooldown: Duration::from_secs(30),
+            name: None,
+        }
+    }
+}
+
+impl BreakerConfig {
+    pub fn with_failure_threshold(mut self, failure_threshold: u32) -> Self {
+        self.failure_threshold = failure_threshold;
+        self
+    }
+
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = cooldown;
+        self
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Check the invariants [`Breaker::new`] relies on.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.failure_threshold < 1 {
+            anyhow::bail!("failure_threshold must be >= 1, got 0");
+        }
+        if self.cooldown < Duration::from_millis(1) {
+            anyhow::bail!("cooldown must be >= 1ms, got {:?}", self.cooldown);
+        }
+        Ok(())
+    }
+}
+
+/// Lock-free circuit breaker. Cheap to share (wrap in `Arc`); an upstream's
+/// breaker is shared between every route that points at the backend, and
+/// across hot reloads.
+///
+/// ```
+/// use ferryman_core::{Admission, Breaker, BreakerConfig, CircuitState};
+///
+/// let breaker = Breaker::new(BreakerConfig::default().with_failure_threshold(1))?;
+/// let ticket = breaker.try_acquire().expect("closed circuit admits");
+/// breaker.record_failure(ticket);
+/// // `CircuitState` and `Admission` are #[non_exhaustive]: keep a wildcard arm.
+/// let label = match breaker.state() {
+///     CircuitState::Closed => "closed",
+///     CircuitState::Open => "open",
+///     _ => "half-open or newer",
+/// };
+/// assert_eq!(label, "open");
+/// assert!(breaker.try_acquire().is_none());
+/// match Admission::Normal {
+///     Admission::Probe => {}
+///     _ => {}
+/// }
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub struct Breaker {
+    name: Option<String>,
     state: AtomicU8,
     consecutive_failures: AtomicU32,
     opened_at_millis: AtomicU64,
@@ -66,7 +142,22 @@ pub(crate) struct Breaker {
 }
 
 impl Breaker {
-    pub(crate) fn new(name: String, cooldown: Duration, failure_threshold: u32) -> Self {
+    /// Create a closed breaker. Fails if `config` is invalid.
+    pub fn new(config: BreakerConfig) -> anyhow::Result<Self> {
+        config.validate()?;
+        Ok(Self::unchecked(
+            config.name,
+            config.cooldown,
+            config.failure_threshold,
+        ))
+    }
+
+    /// No validation: `Upstream::new` has always accepted any values.
+    pub(crate) fn unchecked(
+        name: Option<String>,
+        cooldown: Duration,
+        failure_threshold: u32,
+    ) -> Self {
         let b = Self {
             name,
             state: AtomicU8::new(CircuitState::Closed as u8),
@@ -87,7 +178,7 @@ impl Breaker {
             .store(failure_threshold, Ordering::Relaxed);
     }
 
-    pub(crate) fn state(&self) -> CircuitState {
+    pub fn state(&self) -> CircuitState {
         CircuitState::from_u8(self.state.load(Ordering::Acquire))
     }
 
@@ -98,7 +189,7 @@ impl Breaker {
     /// [`Admission::Probe`]. `HalfOpen` refuses everyone else, unless the
     /// in-flight probe has been out longer than a cooldown (lost or
     /// cancelled), in which case a fresh probe is admitted.
-    pub(crate) fn try_acquire(&self) -> Option<Admission> {
+    pub fn try_acquire(&self) -> Option<Admission> {
         match self.state() {
             CircuitState::Closed => Some(Admission::Normal),
             CircuitState::Open => {
@@ -131,7 +222,7 @@ impl Breaker {
             .is_ok()
     }
 
-    pub(crate) fn record_success(&self, admission: Admission) {
+    pub fn record_success(&self, admission: Admission) {
         match admission {
             Admission::Probe => {
                 // A health check passing says nothing about whether real
@@ -157,7 +248,7 @@ impl Breaker {
         }
     }
 
-    pub(crate) fn record_failure(&self, admission: Admission) {
+    pub fn record_failure(&self, admission: Admission) {
         match (admission, self.state()) {
             (Admission::Probe, CircuitState::Open | CircuitState::HalfOpen) => {
                 // Stamp before publishing Open so no reader pairs the Open
@@ -193,25 +284,27 @@ impl Breaker {
 
     /// Only called after a state-changing CAS/swap, never on the hot path.
     fn log_transition(&self, from: CircuitState, to: CircuitState) {
+        let name = self.name.as_deref().unwrap_or("unnamed");
         if to == CircuitState::Open {
-            tracing::warn!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+            tracing::warn!(upstream = %name, ?from, ?to, "circuit breaker state change");
         } else {
-            tracing::info!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+            tracing::info!(upstream = %name, ?from, ?to, "circuit breaker state change");
         }
     }
 
     /// Publish the *current* state (not a transition target), so racing
     /// transitions can't leave the gauge showing a stale value.
     pub(crate) fn set_gauges(&self) {
+        let Some(name) = &self.name else { return };
         let state = self.state();
-        metrics::gauge!("ferryman_circuit_state", "upstream" => self.name.clone())
+        metrics::gauge!("ferryman_circuit_state", "upstream" => name.clone())
             .set(state as u8 as f64);
         let alive = if state == CircuitState::Closed {
             1.0
         } else {
             0.0
         };
-        metrics::gauge!("ferryman_upstream_alive", "upstream" => self.name.clone()).set(alive);
+        metrics::gauge!("ferryman_upstream_alive", "upstream" => name.clone()).set(alive);
     }
 }
 
@@ -225,8 +318,8 @@ mod tests {
     const P: Admission = Admission::Probe;
 
     fn breaker(cooldown_ms: u64, threshold: u32) -> Breaker {
-        Breaker::new(
-            "test:1".to_string(),
+        Breaker::unchecked(
+            Some("test:1".to_string()),
             Duration::from_millis(cooldown_ms),
             threshold,
         )

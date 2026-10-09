@@ -14,6 +14,7 @@
 //! as well as embeddable.
 
 mod admin;
+pub mod guarded;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;

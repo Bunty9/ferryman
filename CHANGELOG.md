@@ -42,7 +42,9 @@ and `ferryman` are released together with the same version.
   repeated `/` is merged. Requests such as `/%61pi/x` or `//api/x` may now
   match a more specific route than before (here `/api` instead of `/`).
   Matching stays case-sensitive and `%2f` stays encoded; the forwarded path
-  is unchanged.
+  is unchanged. **Migration:** write route prefixes in normalised form
+  (unreserved characters unescaped, uppercase hex, no `//`); non-normal
+  prefixes are rejected at load (`Error::NonCanonicalPrefix`).
 
 - `Error::Toml { path }` is now `Option<PathBuf>` (`None` for `from_str` /
   `from_table`). Migration: `path.display()` becomes `path.as_deref()`;

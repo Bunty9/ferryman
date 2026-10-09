@@ -162,6 +162,7 @@ impl ConfigToml {
 ///
 /// [`Error::InvalidConfig`] (out-of-range top-level key),
 /// [`Error::InvalidCidr`] (`trusted_proxies`), [`Error::InvalidPrefix`],
+/// [`Error::NonCanonicalPrefix`],
 /// [`Error::DuplicatePrefix`], [`Error::InvalidUpstream`],
 /// [`Error::InvalidCooldown`], [`Error::ConflictingCooldown`],
 /// [`Error::InvalidHealthPath`], [`Error::ConflictingHealth`] and
@@ -216,6 +217,18 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
     for r in cfg.routes {
         if !r.prefix.starts_with('/') {
             return Err(Error::InvalidPrefix { prefix: r.prefix });
+        }
+        let normal = crate::route::normalize(&r.prefix);
+        if !r.prefix.is_ascii() || normal != r.prefix {
+            let normal = if r.prefix.is_ascii() {
+                normal.into_owned()
+            } else {
+                "ASCII only (percent-encode non-ASCII bytes)".to_string()
+            };
+            return Err(Error::NonCanonicalPrefix {
+                prefix: r.prefix,
+                normal,
+            });
         }
         if !seen_prefixes.insert(r.prefix.clone()) {
             return Err(Error::DuplicatePrefix { prefix: r.prefix });
@@ -403,6 +416,15 @@ mod tests {
             request_body_timeout_secs: 300,
             routes,
         }
+    }
+
+    #[test]
+    fn non_normal_prefixes_are_rejected() {
+        for p in ["/%61dmin", "/a%2fb", "/x//y", "/中"] {
+            let r = build_table(cfg(vec![route(p, "http://h:1")]), None);
+            assert!(matches!(r, Err(Error::NonCanonicalPrefix { .. })), "{p}");
+        }
+        assert!(build_table(cfg(vec![route("/a%2Fb", "http://h:1")]), None).is_ok());
     }
 
     fn route(prefix: &str, upstream: &str) -> RouteToml {

@@ -138,6 +138,8 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
+    /// Does not validate prefixes; `build_table` does (they must already be in
+    /// normalised form, or they can never match).
     pub fn new(mut routes: Vec<Route>, upstream_timeout: Duration) -> Self {
         routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
         Self {
@@ -206,9 +208,11 @@ impl RouteTable {
     /// (`%XX` of unreserved chars decoded, other escapes' hex uppercased,
     /// repeated `/` merged; case-sensitive, `%2f` stays encoded), so
     /// `/%61pi/x` and `//api/x` match `/api`. The caller still forwards the
-    /// raw path. Precondition: the caller has already rejected dot segments
-    /// (the proxy's `bad_path`); normalisation never creates one, because
-    /// `%2e` is already rejected there.
+    /// raw path. Normalisation CAN produce dot segments (`%2e%2e` becomes
+    /// `..`); it is safe only because the caller (the proxy's `bad_path`)
+    /// rejects those on the raw path before calling `lookup`. Normalisation
+    /// runs exactly once and is not idempotent for malformed escapes
+    /// (`/%2%61` becomes `/%2a`).
     pub fn lookup(&self, path: &str) -> Option<&Route> {
         let path = normalize(path);
         self.routes
@@ -272,7 +276,10 @@ fn rewrite_at(b: &[u8], i: usize) -> Option<(usize, [u8; 3], usize)> {
 }
 
 /// Matching-only normalisation; borrows when the path is already normal.
-fn normalize(path: &str) -> Cow<'_, str> {
+pub(crate) fn normalize(path: &str) -> Cow<'_, str> {
+    if !path.contains('%') && !path.contains("//") {
+        return Cow::Borrowed(path);
+    }
     let b = path.as_bytes();
     let Some(first) = (0..b.len()).find(|&i| rewrite_at(b, i).is_some()) else {
         return Cow::Borrowed(path);
@@ -293,7 +300,7 @@ fn normalize(path: &str) -> Cow<'_, str> {
         }
     }
     // Only ASCII bytes were substituted, so this is always valid UTF-8.
-    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
+    Cow::Owned(String::from_utf8(out).expect("only ASCII substituted"))
 }
 
 fn prefix_matches(prefix: &str, path: &str) -> bool {
@@ -376,6 +383,18 @@ mod tests {
         // A pure-dot segment would be rejected by the proxy before lookup;
         // lookup alone does not create a *new* one beyond what was there.
         assert_eq!(normalize("/api/%2e%2e/x"), "/api/../x");
+    }
+
+    #[test]
+    fn escaped_prefix_and_trailing_slash_prefix() {
+        let t = table(&["/", "/a%2Fb", "/v/"]);
+        assert_eq!(route_of(&t, "/a%2fb"), Some("/a%2Fb"));
+        assert_eq!(route_of(&t, "/a%2Fb/x"), Some("/a%2Fb"));
+        assert_eq!(route_of(&t, "/v//x"), Some("/v/"));
+        assert_eq!(route_of(&t, "/v/a//x"), Some("/v/"));
+        let t = table(&["/api/", "/api/v1/"]);
+        assert_eq!(route_of(&t, "/api//"), Some("/api/"));
+        assert_eq!(route_of(&t, "/api/v1//x"), Some("/api/v1/"));
     }
 
     #[test]

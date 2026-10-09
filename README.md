@@ -189,7 +189,9 @@ Prefixes match the normalised, case-sensitive request path on a segment
 boundary. Normalisation, for matching only (the forwarded path stays raw):
 `%XX` escapes of unreserved characters (`A-Za-z0-9-._~`) are decoded, hex
 digits of the remaining escapes are uppercased, and repeated `/` are merged.
-Nothing else is decoded, so `/api%2fx` does not match `/api`, and `/API/x`
+Decoding is a single pass: double-encoded characters (`%2561`) are not
+decoded further. Prefixes must be written in this normalised form (rejected
+at load otherwise). Nothing else is decoded, so `/api%2fx` does not match `/api`, and `/API/x`
 does not either. Routes are still not access control: case variants and
 `%2f` variants fall to a less specific route (especially `/`) and may be
 decoded or merged into a more specific path by the upstream. Don't rely on

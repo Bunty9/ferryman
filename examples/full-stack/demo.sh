@@ -457,8 +457,8 @@ step "Prometheus: target up, histogram series, circuit-open alert fires"
 # Prometheus's scrape_interval is 5s and the tour above can outrun that
 # comfortably (cached-image runs finish steps 1-8 in well under 5s), so
 # poll rather than asserting on the first query.
-wait_until "Prometheus target job=ferryman is up" 15 prom_target_up
-wait_until "ferryman_request_duration_seconds_bucket has series" 15 prom_has_duration_buckets
+wait_until "Prometheus target job=ferryman is up" 60 prom_target_up
+wait_until "ferryman_request_duration_seconds_bucket has series" 60 prom_has_duration_buckets
 
 # orders-v2 is still down from step 8: poll here (while it's down) for the
 # FerrymanCircuitOpen alert (for: 30s) to go from pending to firing.

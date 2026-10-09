@@ -4,58 +4,107 @@
 use crate::route::RouteTable;
 
 /// Would an upstream that treats `%2F`/`%5C`/`\` as `/` and drops `;params`
-/// route `raw_path` differently from ferryman? True when that alternate
-/// reading selects a different route (or none versus some) than
+/// route `raw_path` differently from ferryman? True when any such reading
+/// selects a different route (or none versus some) than
 /// [`RouteTable::lookup`] on `raw_path`; callers answer 400.
+///
+/// Readings compared (each looked up like a raw path): separators flattened
+/// to `/`; then `;params` dropped per segment; `;params` dropped up to the
+/// next raw `/` first (Tomcat/Spring order); that, then flattened. The same
+/// readings are also derived from the normalised path, which exposes
+/// separators hidden behind odd escapes (`%2%46`, `%25%32%46`, which
+/// normalises to `%252F`).
 ///
 /// Takes the RAW path, like `lookup`, and requires [`bad_path`] to have
 /// accepted it first (dot segments are not re-checked here). Costs nothing
-/// unless the path contains `%2F`/`%5C` (any hex case), `\` or `;`. Encoded
-/// separators that do not change the selected route
-/// (`/api/v4/projects/group%2Fproject` under `/api`) stay allowed.
+/// unless the path contains `%2F`/`%5C` (any hex case), `\` or `;` (in the
+/// raw or normalised form). Encoded separators that do not change the
+/// selected route (`/api/v4/projects/group%2Fproject` under `/api`) stay
+/// allowed.
 ///
-/// Known limit: routes are case-sensitive, so an upstream that folds case
-/// (`/API/x`) is not detected.
+/// # Known limits
+///
+/// Routes are case-sensitive, so an upstream that folds case (`/API/x`) is
+/// not detected. Also not covered: overlong UTF-8 separators (`%c0%af`), `%3B`
+/// (not treated as `;`), and decoding beyond the forms above (triple
+/// encoding and the like).
 pub fn ambiguous_route(table: &RouteTable, raw_path: &str) -> bool {
-    let b = raw_path.as_bytes();
-    let suspicious = b.iter().enumerate().any(|(i, &c)| match c {
-        b'\\' | b';' => true,
-        b'%' => matches!(
-            b.get(i + 1..i + 3),
-            Some([b'2', b'f' | b'F'] | [b'5', b'c' | b'C'])
-        ),
-        _ => false,
-    });
-    if !suspicious {
+    let norm = crate::route::normalize(raw_path);
+    if !(suspicious(raw_path) || suspicious(&norm)) {
         return false;
     }
-    let mut flat = String::with_capacity(raw_path.len());
+    fn pick<'t>(t: &'t RouteTable, p: &str) -> Option<&'t str> {
+        t.lookup(p).map(|r| r.prefix.as_str())
+    }
+
+    let canon = pick(table, raw_path);
+    let ambiguous = [raw_path, &*norm].into_iter().any(|s| {
+        let stripped = strip_params(s);
+        [
+            flatten(s),
+            strip_params(&flatten(s)),
+            stripped.clone(),
+            flatten(&stripped),
+        ]
+        .iter()
+        .any(|r| pick(table, r) != canon)
+    });
+    ambiguous
+}
+
+fn suspicious(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| match c {
+        b'\\' | b';' => true,
+        b'%' => {
+            matches!(
+                b.get(i + 1..i + 3),
+                Some([b'2', b'f' | b'F'] | [b'5', b'c' | b'C'])
+            ) || matches!(
+                b.get(i + 1..i + 5),
+                Some([b'2', b'5', b'2', b'f' | b'F'] | [b'2', b'5', b'5', b'c' | b'C'])
+            )
+        }
+        _ => false,
+    })
+}
+
+/// `%2F`, `%5C` (any hex case) and `\` become `/`.
+fn flatten(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < b.len() {
         match b[i..] {
+            [b'%', b'2', b'5', b'2', b'f' | b'F', ..]
+            | [b'%', b'2', b'5', b'5', b'c' | b'C', ..] => {
+                out.push('/');
+                i += 5;
+            }
             [b'%', b'2', b'f' | b'F', ..] | [b'%', b'5', b'c' | b'C', ..] => {
-                flat.push('/');
+                out.push('/');
                 i += 3;
             }
             [b'\\', ..] => {
-                flat.push('/');
+                out.push('/');
                 i += 1;
             }
             _ => {
-                let n = raw_path[i..].chars().next().map_or(1, char::len_utf8);
-                flat.push_str(&raw_path[i..i + n]);
+                let n = s[i..].chars().next().map_or(1, char::len_utf8);
+                out.push_str(&s[i..i + n]);
                 i += n;
             }
         }
     }
-    let alt = flat
-        .split('/')
+    out
+}
+
+/// Drop `;...` up to the next literal `/`, per segment.
+fn strip_params(s: &str) -> String {
+    s.split('/')
         .map(|seg| seg.split(';').next().unwrap_or(""))
         .collect::<Vec<_>>()
-        .join("/");
-    // `lookup` merges repeated `/` and normalises escapes itself.
-    let prefix = |p: &str| table.lookup(p).map(|r| r.prefix.as_str());
-    prefix(raw_path) != prefix(&alt)
+        .join("/")
 }
 
 /// True if `path` could be read as a dot segment by a normalising
@@ -201,11 +250,19 @@ mod tests {
             "/api\\secret",
             "/api;x/secret",
             "/api;x",
+            "/api%2%46secret",
+            "/api%25%32%46secret",
         ] {
             assert!(ambiguous_route(&t, p), "{p}");
         }
         // some route vs none
         assert!(ambiguous_route(&table(&["/api"]), "/api%2Fx"));
+        // `;params` stripped up to the next raw `/` before decoding
+        let t = table(&["/", "/admin"]);
+        for p in ["/;%2Fx/admin", "/;x%2Fy/admin", "/;%5Cz/admin"] {
+            assert!(ambiguous_route(&t, p), "{p}");
+        }
+        assert!(ambiguous_route(&table(&["/", "/a", "/a/b"]), "/a/;x%2Fq/b"));
     }
 
     #[test]
@@ -216,10 +273,51 @@ mod tests {
             "/api/secret",
             "/other/a%2Fb;c",
             "/api/a;x/b",
+            "/api/x;jsessionid=1",
             "/",
         ] {
             assert!(!ambiguous_route(&t, p), "{p}");
         }
         assert!(!ambiguous_route(&table(&["/"]), "/files/a%2Fb"));
+    }
+
+    // Reference model: the four independent readings, written with plain
+    // string ops, over every short path built from a small token set.
+    #[test]
+    fn exhaustive_short_paths_match_reference_model() {
+        fn flat(s: &str) -> String {
+            ["%2F", "%2f", "%5C", "%5c", "\\"]
+                .iter()
+                .fold(s.to_string(), |s, k| s.replace(k, "/"))
+        }
+        fn strip(s: &str) -> String {
+            s.split('/')
+                .map(|g| g.split(';').next().unwrap())
+                .collect::<Vec<_>>()
+                .join("/")
+        }
+        let toks = ["a", "b", "/", ";", "%2F", "x", "\\"];
+        for routes in [
+            &["/", "/a", "/a/b", "/b"][..],
+            &["/a", "/a/b"][..],
+            &["/a/", "/a/b/", "/"][..],
+        ] {
+            let t = table(routes);
+            let pre = |p: &str| t.lookup(p).map(|r| r.prefix.clone());
+            let mut stack = vec![("/".to_string(), 0)];
+            while let Some((p, d)) = stack.pop() {
+                if d < 4 {
+                    stack.extend(toks.iter().map(|k| (format!("{p}{k}"), d + 1)));
+                }
+                if bad_path(&p) {
+                    continue;
+                }
+                let c = pre(&p);
+                let differs = [strip(&flat(&p)), flat(&strip(&p)), flat(&p), strip(&p)]
+                    .iter()
+                    .any(|r| pre(r) != c);
+                assert_eq!(ambiguous_route(&t, &p), differs, "{routes:?} {p}");
+            }
+        }
     }
 }

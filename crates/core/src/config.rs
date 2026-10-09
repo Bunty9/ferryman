@@ -234,6 +234,15 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 normal,
             });
         }
+        if r.prefix.contains([';', '\\']) || {
+            let u = r.prefix.to_ascii_uppercase();
+            u.contains("%2F") || u.contains("%5C")
+        } {
+            return Err(Error::NonCanonicalPrefix {
+                prefix: r.prefix,
+                normal: "prefixes may not contain ';', '\\', %2F or %5C (such requests are rejected as ambiguous)".to_string(),
+            });
+        }
         if !seen_prefixes.insert(r.prefix.clone()) {
             return Err(Error::DuplicatePrefix { prefix: r.prefix });
         }
@@ -438,7 +447,10 @@ mod tests {
             let r = build_table(cfg(vec![route(p, "http://h:1")]), None);
             assert!(matches!(r, Err(Error::NonCanonicalPrefix { .. })), "{p}");
         }
-        assert!(build_table(cfg(vec![route("/a%2Fb", "http://h:1")]), None).is_ok());
+        for p in ["/a%2Fb", "/a%5Cb", "/a;b", "/a\\b"] {
+            let r = build_table(cfg(vec![route(p, "http://h:1")]), None);
+            assert!(matches!(r, Err(Error::NonCanonicalPrefix { .. })), "{p}");
+        }
     }
 
     fn route(prefix: &str, upstream: &str) -> RouteToml {

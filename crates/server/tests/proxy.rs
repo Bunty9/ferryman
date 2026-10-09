@@ -1144,6 +1144,8 @@ async fn ambiguous_route_paths_get_400_and_never_reach_upstream() {
         "/api%5Csecret",
         "/api\\secret",
         "/api;x/secret",
+        "/;%2Fx/api/y",
+        "/api%25%32%46secret",
     ] {
         let out = get(p).await;
         assert!(out.starts_with("HTTP/1.1 400"), "{p}: {out}");

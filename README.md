@@ -264,7 +264,7 @@ hot reload.
 | ------------------------------------------------------ | -------- | ---------------------- |
 | No route matches                                       | 404      | —                      |
 | Path has a `.`/`..` segment (also `%2e`, `..;`, or after an encoded `%2f`/`%5c`/`\` separator), or contains `%00`, `%u`, or a double-encoded dot or slash (`%252e`, `%252f`) | 400 (`bad path`) | no |
-| Path whose reading as `%2F`/`%5C`/`\` = `/` with `;params` dropped selects a different route than the raw path (`/api%2Fsecret`, `/api;x/secret`; `group%2Fproject` under `/api` is fine). Routes are case-sensitive: case-folding upstreams are not detected | 400 (`bad path`) | no |
+| Path whose reading as `%2F`/`%5C`/`\` = `/` with `;params` dropped selects a different route than the raw path (`/api%2Fsecret`, `/api;x/secret`; `group%2Fproject` under `/api` is fine). `;params` are also dropped up to the next raw `/` before decoding. Routes are case-sensitive and `%c0%af`/`%3B` are not interpreted, so case-folding or overlong-UTF-8 upstreams are not detected. Route prefixes may not contain `;`, `\`, `%2F`, `%5C` | 400 (`bad path`) | no |
 | Circuit open                                           | 503      | —                      |
 | `Upgrade` / `CONNECT` (e.g. WebSocket)                 | 501      | —                      |
 | Connect / transport error                              | 502      | yes                    |

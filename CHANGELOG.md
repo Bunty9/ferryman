@@ -43,12 +43,17 @@ and `ferryman` are released together with the same version.
 
 ### Changed (breaking)
 
+- `build_table` rejects route prefixes containing `;`, `\`, `%2F` or `%5C`
+  (`Error::NonCanonicalPrefix`): every request to them would be 400.
 - `Route` is `#[non_exhaustive]` with a new pub `rewrite_host` field: replace
   struct literals with `Route::new(prefix, upstream)`.
 - Paths that are ambiguous between ferryman and an upstream that treats
   `%2F`/`%5C`/`\` as `/` or drops `;params` now get 400 `bad path` when that
   reading would select a different route (`/api%2Fsecret`, `/api;x/x`).
-  Migration: send plain `/` separators; encoded separators inside a segment
+  `;params` are dropped up to the next raw `/` before decoding (Tomcat and
+  Spring order) as well. `/app;jsessionid=X` where `/app` is a route now
+  gets 400 (it used to be routed to `/`); params after a later segment
+  (`/app/x;jsessionid=X`) still pass. Migration: send plain `/` separators; encoded separators inside a segment
   that do not change the route (`group%2Fproject`) still pass.
 - Route matching uses a normalised path: `%XX` of unreserved characters
   (`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, and

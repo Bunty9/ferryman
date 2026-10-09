@@ -34,7 +34,8 @@ pub enum Error {
     #[error("route prefix {prefix:?} must start with '/'")]
     InvalidPrefix { prefix: String },
     /// A route prefix is not in normalised form (unreserved characters
-    /// unescaped, uppercase hex, no `//`, ASCII only), so it could never match.
+    /// unescaped, uppercase hex, no `//`, ASCII only), so it could never match,
+    /// or contains `;`, `\`, `%2F` or `%5C` (every request would be rejected).
     #[error("route prefix {prefix:?} is not normalised; write it as {normal:?}")]
     NonCanonicalPrefix { prefix: String, normal: String },
     /// Two routes share a prefix.

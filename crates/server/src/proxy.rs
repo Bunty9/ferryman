@@ -320,6 +320,11 @@ where
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
     }
 
+    if bad_host(req.headers(), req.uri()) {
+        record(started, "none", "none", 400);
+        return Ok(error_response(StatusCode::BAD_REQUEST, "bad host\n"));
+    }
+
     let Some(route) = table.lookup(req.uri().path()) else {
         record(started, "none", "none", 404);
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
@@ -530,10 +535,35 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
         .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
         .collect();
     for name in named {
+        // The proxy relies on `Host`; a client must not delete it by naming
+        // it in `Connection` (applies to the response strip too).
+        if name == header::HOST {
+            continue;
+        }
         headers.remove(name);
     }
     for name in &HOP_BY_HOP_HEADERS {
         headers.remove(name);
+    }
+}
+
+/// More than one `Host`, or (when the request target has no authority, so the
+/// header is what gets forwarded) one that is empty or not a bare
+/// `host[:port]` (userinfo, list, path, obs-text). h2 `:authority` / absolute
+/// form still win over `Host`, which is then not judged beyond the count.
+fn bad_host(headers: &HeaderMap, uri: &http::Uri) -> bool {
+    let mut it = headers.get_all(header::HOST).iter();
+    match (it.next(), it.next()) {
+        (None, _) => false,
+        (Some(v), None) => {
+            uri.authority().is_none()
+                && (v
+                    .as_bytes()
+                    .iter()
+                    .any(|b| matches!(b, b'@' | b',' | b'/') || *b >= 0x80)
+                    || http::uri::Authority::try_from(v.as_bytes()).is_err())
+        }
+        _ => true,
     }
 }
 
@@ -710,6 +740,39 @@ fn full_body(body: impl Into<Bytes>) -> ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_validation() {
+        let h = |vals: &[&[u8]]| {
+            let mut m = HeaderMap::new();
+            for v in vals {
+                m.append("host", HeaderValue::from_bytes(v).unwrap());
+            }
+            m
+        };
+        let root: http::Uri = "/".parse().unwrap();
+        for bad in [&b"a, b"[..], b"u@x", b"x/y", b"", b"a\xe9.example"] {
+            assert!(bad_host(&h(&[bad]), &root), "{bad:?}");
+        }
+        assert!(bad_host(&h(&[b"a", b"b"]), &root));
+        for ok in ["a.example", "a.example:8443", "[::1]:8443", "LOCALHOST"] {
+            assert!(!bad_host(&h(&[ok.as_bytes()]), &root), "{ok}");
+        }
+        assert!(!bad_host(&HeaderMap::new(), &root));
+        let abs: http::Uri = "http://a.example/".parse().unwrap();
+        assert!(!bad_host(&h(&[b"u@x"]), &abs));
+        assert!(bad_host(&h(&[b"a", b"b"]), &abs));
+    }
+
+    #[test]
+    fn connection_cannot_delete_host() {
+        let mut m = HeaderMap::new();
+        m.insert("host", HeaderValue::from_static("a.example"));
+        m.insert("connection", HeaderValue::from_static("Host, x-other"));
+        m.insert("x-other", HeaderValue::from_static("1"));
+        strip_hop_by_hop(&mut m);
+        assert!(m.get("host").is_some() && m.get("x-other").is_none());
+    }
 
     fn tp(c: &[&str]) -> TrustedProxies {
         TrustedProxies::parse(c).unwrap()

@@ -1202,3 +1202,53 @@ async fn local_health_path_is_answered_without_touching_upstream() {
     assert_eq!(r.text().await.unwrap(), "up");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
+
+/// Malformed or repeated `Host` is a 400 before routing and never reaches the
+/// upstream; good ones pass; `Connection: host` cannot delete Host.
+#[tokio::test]
+async fn bad_host_headers_get_400_and_never_reach_upstream() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |req| {
+        h.fetch_add(1, Ordering::SeqCst);
+        echo(req)
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let get = |hosts: Vec<&'static [u8]>, extra: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut req = b"GET /api/x HTTP/1.1\r\n".to_vec();
+        for v in hosts {
+            req.extend_from_slice(b"host: ");
+            req.extend_from_slice(v);
+            req.extend_from_slice(b"\r\n");
+        }
+        req.extend_from_slice(format!("{extra}connection: close\r\n\r\n").as_bytes());
+        s.write_all(&req).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let bad: [Vec<&[u8]>; 5] = [
+        vec![b"a.example, b.example"],
+        vec![b"u@x"],
+        vec![b"x/y"],
+        vec![b"a\xe9.example"],
+        vec![b"a.example", b"b.example"],
+    ];
+    for hosts in bad {
+        let out = get(hosts.clone(), "").await;
+        assert!(out.starts_with("HTTP/1.1 400"), "{hosts:?}: {out}");
+        assert!(out.ends_with("bad host\n"), "{hosts:?}: {out}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let out = get(vec![b"example.com:8080"], "connection: host\r\n").await;
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.contains("host: example.com:8080"), "{out}");
+}

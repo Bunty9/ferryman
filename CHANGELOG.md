@@ -9,6 +9,17 @@ and `ferryman` are released together with the same version.
 
 ### Security
 
+- Host hardening (low severity, defence in depth): when the request target
+  has no authority, the `Host` header is now validated before routing and
+  must be a single bare `host[:port]` (no userinfo, comma list, path,
+  obs-text, or empty value); more than one `Host` is rejected even when an
+  authority is present. Failures are `400 bad host` (route/upstream `none`,
+  no breaker ticket). `host` named in `Connection` is no longer stripped
+  from requests or responses. Migration: clients sending malformed or
+  duplicate `Host` now get 400. h2 `:authority` and absolute-form targets
+  still take precedence over `Host`; `local_health_path` is answered before
+  this check.
+
 - A client that stalled its upload could open the breaker for everyone: the
   upstream's own body-read timeout produced a 502 (or a forwarded 502-504)
   that was counted as an upstream failure, so three slow uploads yielded 503

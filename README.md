@@ -151,8 +151,8 @@ atomically without dropping live connections.
   `subPath`, which never updates) and point `--config` at the file in it.
 - **SIGHUP (Unix).** Forces a reload of the config and the TLS certificate even
   if nothing changed. systemd: `ExecReload=/bin/kill -HUP $MAINPID`. With inline
-  `FERRYMAN_CONFIG_TOML` there is nothing to re-read and it logs "reload not
-  applicable". Windows has no SIGHUP; only the file watch applies. (Before 0.3,
+  `FERRYMAN_CONFIG_TOML` it logs "reload not applicable": the config is not
+  re-read, but TLS files still are. Windows has no SIGHUP; only the file watch applies. (Before 0.3,
   SIGHUP terminated the process.)
 - **TLS cert/key.** A changed `--tls-cert`/`--tls-key` pair (e.g. a cert-manager
   Secret renewal) is picked up the same way and used for *new* handshakes;
@@ -491,8 +491,9 @@ ferryman/
 - Upstreams are plain HTTP only; `https://` upstreams are rejected.
 - No WebSocket / `Upgrade` passthrough (501).
 - No per-upstream load balancing: one route, one upstream.
-- Kubernetes ConfigMap mounts update via a `..data` symlink swap that
-  the file watcher does not see; restart the pod after a ConfigMap edit.
+- Kubernetes ConfigMap/Secret mounts reload via the `..data` symlink swap, but
+  a `subPath` mount is never updated by the kubelet (restart the pod). Point
+  `--config` at the mount's top-level file, not at `…/..data/config.toml`.
 - The response body has no idle timeout once headers have arrived.
 
 ## Roadmap

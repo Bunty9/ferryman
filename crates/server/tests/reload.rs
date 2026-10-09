@@ -119,6 +119,8 @@ async fn unchanged_bytes_do_not_swap_the_table() {
     let _w = Reloader::new(Some(cfg.clone()), table.clone(), None)
         .watch()
         .unwrap();
+    // Let the watcher's startup re-check finish before writing in place.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let before = table.load_full();
 
     // Same bytes, written in place and via rename-replace.
@@ -170,6 +172,13 @@ fn sighup_reloads_instead_of_terminating() {
     let dir = tempdir("sighup");
     let cfg = dir.join("config.toml");
     std::fs::write(&cfg, "local_health_path = \"/up\"\n[[routes]]\nprefix = \"/\"\nupstream = \"http://127.0.0.1:1\"\n").unwrap();
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferryman"))
         .arg("--config")
         .arg(&cfg)
@@ -178,7 +187,9 @@ fn sighup_reloads_instead_of_terminating() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let stdout = child.stdout.take().unwrap();
+    let mut child = Kill(child);
+    let mut lines = BufReader::new(stdout).lines();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for l in lines.by_ref().map_while(Result::ok) {
@@ -198,7 +209,7 @@ fn sighup_reloads_instead_of_terminating() {
     };
     wait_for("admin listener bound");
     let hup = Command::new("kill")
-        .args(["-HUP", &child.id().to_string()])
+        .args(["-HUP", &child.0.id().to_string()])
         .status()
         .unwrap();
     assert!(hup.success());
@@ -206,10 +217,9 @@ fn sighup_reloads_instead_of_terminating() {
     wait_for("config reloaded");
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        child.try_wait().unwrap().is_none(),
+        child.0.try_wait().unwrap().is_none(),
         "SIGHUP killed ferryman"
     );
-    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -355,4 +365,37 @@ async fn bad_tls_files_keep_the_old_cert_and_a_later_good_pair_recovers() {
     install(&rig.dir, "test-cert-2.pem", "test-key-2.pem");
     wait_cert(rig.proxy, &cert2).await;
     let _ = std::fs::remove_dir_all(&rig.dir);
+}
+
+#[tokio::test]
+async fn busy_directory_cannot_starve_the_reload() {
+    let up = spawn_upstream().await;
+    let dir = tempdir("busy");
+    let cfg = dir.join("config.toml");
+    std::fs::write(&cfg, route("/a", up)).unwrap();
+    let table = table_from(&cfg);
+    let _w = Reloader::new(Some(cfg.clone()), table.clone(), None)
+        .watch()
+        .unwrap();
+    let proxy = start_proxy(table, None).await;
+
+    // An unrelated file in the same directory is written every 50 ms.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (s2, log) = (stop.clone(), dir.join("noise.log"));
+    let noise = std::thread::spawn(move || {
+        while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::write(&log, "x");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(&cfg, route("/a", up) + &route("/b", up)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while status(proxy, "/b").await != 200 {
+        assert!(Instant::now() < deadline, "reload starved by noise");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    noise.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

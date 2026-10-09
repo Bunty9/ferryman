@@ -30,19 +30,27 @@
 //! handshakes only. With inline `FERRYMAN_CONFIG_TOML` there is no file, so
 //! the config is not reloaded (the TLS files still are). On Windows there is
 //! no SIGHUP; the file watch is the only trigger.
+//!
+//! A directory reached through a symlink is watched at its target as of
+//! watch time. For a ConfigMap/Secret mount, point `--config` (and the TLS
+//! paths) at the mount's top-level file (`/etc/ferryman/config.toml`), not
+//! at `…/..data/config.toml` or a path through a directory symlink that
+//! gets retargeted. `subPath` mounts are never updated by the kubelet.
 
 use crate::tls::TlsReloader;
-use ferryman_core::{build_table, load_config, SharedTable};
+use ferryman_core::{build_table, SharedTable};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Quiet period after the last event before reloading.
 const DEBOUNCE: Duration = Duration::from_millis(200);
+/// Longest a reload may be postponed by a steady stream of events.
+const MAX_COALESCE: Duration = Duration::from_secs(2);
 
 /// Reloads the routing table (from `config`) and the TLS certificate (via
 /// `tls`) on demand or when the watched directories change.
@@ -77,10 +85,12 @@ impl Reloader {
     pub fn reload(&self, force: bool) {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(path) = &self.config {
-            let h = digest([path.as_path()]);
+            // Read once: the bytes hashed are the bytes parsed.
+            let raw = std::fs::read(path);
+            let h = hash_of(raw.as_ref().ok());
             if force || h != seen.0 {
                 seen.0 = h;
-                if let Some(new_table) = reload_once(path, &self.table) {
+                if let Some(new_table) = reload_once(path, raw, &self.table) {
                     self.table.store(Arc::new(new_table));
                     self.table.load().publish_gauges();
                     tracing::info!(path = %path.display(), "config reloaded");
@@ -130,9 +140,14 @@ impl Reloader {
         let this = self.clone();
         // Exits when the watcher (and with it `tx`) is dropped.
         std::thread::spawn(move || {
+            // Catch an edit made between the initial load and the watch start.
+            this.reload(false);
             while rx.recv().is_ok() {
-                loop {
-                    match rx.recv_timeout(DEBOUNCE) {
+                // Quiet period, but capped: unrelated writes in a watched
+                // directory must not postpone the reload forever.
+                let first = Instant::now();
+                while let Some(left) = MAX_COALESCE.checked_sub(first.elapsed()) {
+                    match rx.recv_timeout(DEBOUNCE.min(left)) {
                         Ok(()) => continue,
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => return,
@@ -170,23 +185,31 @@ fn digest<'a>(files: impl IntoIterator<Item = &'a Path>) -> u64 {
     h.finish()
 }
 
+fn hash_of(bytes: Option<&Vec<u8>>) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 /// Re-read and rebuild the routing table, keeping the old one on any error
 /// (config unreadable, unparsable, or failing validation). Returns `None`
 /// on error, having already logged the full error chain.
-fn reload_once(path: &Path, table: &SharedTable) -> Option<ferryman_core::RouteTable> {
-    let cfg = load_config(path)
-        // anyhow keeps the `{e:#}` cause chain (toml detail) that Error hides.
+fn reload_once(
+    path: &Path,
+    raw: std::io::Result<Vec<u8>>,
+    table: &SharedTable,
+) -> Option<ferryman_core::RouteTable> {
+    // anyhow keeps the `{e:#}` cause chain (toml detail) that Error hides.
+    let fail = |e: anyhow::Error| tracing::error!(path = %path.display(), error = %format!("{e:#}"), "config reload failed; keeping old table");
+    let cfg = raw
         .map_err(anyhow::Error::from)
-        .inspect_err(|e| {
-            tracing::error!(path = %path.display(), error = %format!("{e:#}"), "config reload failed; keeping old table")
-        })
+        .and_then(|b| Ok(String::from_utf8(b)?))
+        .and_then(|s| s.parse::<ferryman_core::ConfigToml>().map_err(Into::into))
+        .inspect_err(|e| fail(anyhow::anyhow!("{e:#}")))
         .ok()?;
     let prev = table.load_full();
     build_table(cfg, Some(&prev))
-        // anyhow keeps the `{e:#}` cause chain (toml detail) that Error hides.
         .map_err(anyhow::Error::from)
-        .inspect_err(|e| {
-            tracing::error!(path = %path.display(), error = %format!("{e:#}"), "config reload failed; keeping old table")
-        })
+        .inspect_err(|e| fail(anyhow::anyhow!("{e:#}")))
         .ok()
 }

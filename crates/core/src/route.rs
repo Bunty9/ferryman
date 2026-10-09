@@ -123,6 +123,9 @@ pub struct Route {
     /// `true`: send the upstream's own authority as `Host`. `false` (default):
     /// keep the client's `Host` (or the request authority, see the proxy docs).
     pub rewrite_host: bool,
+    /// `true`: remove the matched prefix from the path sent upstream (and set
+    /// `X-Forwarded-Prefix`). `false` (default): forward the path as received.
+    pub strip_prefix: bool,
 }
 
 impl Route {
@@ -132,7 +135,45 @@ impl Route {
             prefix: prefix.into(),
             upstream,
             rewrite_host: false,
+            strip_prefix: false,
         }
+    }
+
+    /// Set [`Route::strip_prefix`].
+    pub fn with_strip_prefix(mut self, strip: bool) -> Self {
+        self.strip_prefix = strip;
+        self
+    }
+
+    /// The prefix [`Route::strip_prefix`] removes: [`Route::prefix`] without
+    /// trailing slashes (`/api/` gives `/api`). Empty for a `/` route, which
+    /// has nothing to strip.
+    pub fn stripped_prefix(&self) -> &str {
+        self.prefix.trim_end_matches('/')
+    }
+
+    /// The path to forward for a `strip_prefix` route: what follows
+    /// [`Route::stripped_prefix`] on the NORMALISED `raw_path` (so a request
+    /// that matched through normalisation, like `/%61pi/x` for `/api`, is
+    /// stripped correctly), always starting with `/` (`/api` gives `/`).
+    /// Stripped routes therefore forward a normalised path. `None` when
+    /// the remainder fails the runtime check (not `/`-led, or `bad_path`;
+    /// callers answer 400). A `/` route has nothing to strip and returns the
+    /// raw path unchanged.
+    ///
+    /// `raw_path` must have passed `bad_path` and match this route. The
+    /// remainder is a suffix of that accepted path, so it holds no new dot
+    /// segments.
+    pub fn stripped_path(&self, raw_path: &str) -> Option<String> {
+        let prefix = self.stripped_prefix();
+        if prefix.is_empty() {
+            return Some(raw_path.to_string());
+        }
+        let norm = normalize(raw_path);
+        let rest = norm.strip_prefix(prefix)?;
+        let out = if rest.is_empty() { "/" } else { rest };
+        // Defence in depth: never hand upstream a path bad_path would refuse.
+        (out.starts_with('/') && !crate::path::bad_path(out)).then(|| out.to_string())
     }
 
     /// Set [`Route::rewrite_host`].
@@ -516,6 +557,45 @@ mod tests {
         let t = table(&["/svc-a/"]);
         assert!(t.lookup("/svc-a/x").is_some());
         assert!(t.lookup("/svc-a").is_none());
+    }
+
+    #[test]
+    fn stripped_path_remainders() {
+        let r = |p: &str| Route::new(p, upstream()).with_strip_prefix(true);
+        assert_eq!(
+            r("/api").stripped_path("/api/users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(r("/api").stripped_path("/api").as_deref(), Some("/"));
+        assert_eq!(r("/api").stripped_path("/api/").as_deref(), Some("/"));
+        assert_eq!(
+            r("/api/").stripped_path("/api/users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(r("/api/").stripped_path("/api/").as_deref(), Some("/"));
+        assert_eq!(r("/api/").stripped_prefix(), "/api");
+        assert_eq!(
+            r("/api").stripped_path("/%61pi/users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(
+            r("/api").stripped_path("//api//users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(
+            r("/api").stripped_path("/api/a%2fb").as_deref(),
+            Some("/a%2Fb")
+        );
+        assert_eq!(r("/").stripped_path("/x").as_deref(), Some("/x"));
+        // Unreachable via the proxy (lookup guarantees a boundary and
+        // bad_path runs first), so exercised directly: None means 400.
+        assert_eq!(r("/api").stripped_path("/apix"), None);
+        assert_eq!(r("/api").stripped_path("/other"), None);
+        assert_eq!(r("/api").stripped_path("/api/%2e%2e/x"), None);
+        for p in ["/api/a/b", "/api/%41", "/api/a%2Fb", "/api"] {
+            let out = r("/api").stripped_path(p).unwrap();
+            assert!(!crate::path::bad_path(&out), "{p} -> {out}");
+        }
     }
 
     #[test]

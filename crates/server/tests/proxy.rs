@@ -1385,3 +1385,74 @@ async fn bad_host_headers_get_400_and_never_reach_upstream() {
     assert!(out.starts_with("HTTP/1.1 400"), "{out}");
     assert_eq!(hits.load(Ordering::SeqCst), before + 2);
 }
+
+async fn strip_get(cfg_extra: &str, path: &str, hdrs: &[(&str, &str)]) -> String {
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "{cfg_extra}\n[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\nstrip_prefix = true\n\n\
+         [[routes]]\nprefix = \"/keep\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut rb = reqwest::Client::new().get(format!("http://{proxy}{path}"));
+    for (k, v) in hdrs {
+        rb = rb.header(*k, *v);
+    }
+    rb.send().await.unwrap().text().await.unwrap()
+}
+
+#[tokio::test]
+async fn strip_prefix_forwards_remainder_and_sets_forwarded_prefix() {
+    let body = strip_get("", "/api/users?x=1&y=%2F", &[]).await;
+    assert!(body.starts_with("GET /users?x=1&y=%2F\n"), "{body}");
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    let body = strip_get("", "/api", &[]).await;
+    assert!(body.starts_with("GET /\n"), "{body}");
+    // Matched through normalisation: the normalised remainder is forwarded.
+    let body = strip_get("", "/%61pi/users", &[]).await;
+    assert!(body.starts_with("GET /users\n"), "{body}");
+    // strip_prefix = false: path untouched, no header.
+    let body = strip_get("", "/keep/users", &[]).await;
+    assert!(body.starts_with("GET /keep/users\n"), "{body}");
+    assert!(!body.contains("x-forwarded-prefix"), "{body}");
+}
+
+#[tokio::test]
+async fn strip_prefix_replaces_forged_prefix_from_untrusted_peer() {
+    let body = strip_get("", "/api/u", &[("x-forwarded-prefix", "/evil")]).await;
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    assert_eq!(body.matches("x-forwarded-prefix").count(), 1, "{body}");
+    assert!(!body.contains("evil"), "{body}");
+}
+
+#[tokio::test]
+async fn strip_prefix_prepends_trusted_prefix() {
+    let trusted = "trusted_proxies = [\"127.0.0.1/32\"]";
+    let body = strip_get(trusted, "/api/u", &[("x-forwarded-prefix", "/outer/")]).await;
+    assert!(body.contains("x-forwarded-prefix: /outer/api\n"), "{body}");
+    // Not a plain path: replaced.
+    let body = strip_get(trusted, "/api/u", &[("x-forwarded-prefix", "/a, /b")]).await;
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    let body = strip_get(trusted, "/api/u", &[("x-forwarded-prefix", "/../x")]).await;
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    // Route without strip_prefix leaves a trusted value alone.
+    let body = strip_get(trusted, "/keep/u", &[("x-forwarded-prefix", "/outer")]).await;
+    assert!(body.contains("x-forwarded-prefix: /outer\n"), "{body}");
+}
+
+#[tokio::test]
+async fn strip_prefix_does_not_bypass_bad_path() {
+    // Dot segments hidden behind the prefix are rejected before stripping
+    // (reqwest would normalise a literal `%2e%2e`, so use forms it keeps).
+    for p in ["/api/..%2Fx", "/api%2f../x"] {
+        let upstream = spawn_stub(echo).await;
+        let table = shared_table(parse_cfg(&format!(
+            "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\nstrip_prefix = true\n"
+        )));
+        let proxy = start_proxy(table).await;
+        let st = reqwest::get(format!("http://{proxy}{p}"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(st, 400, "{p}");
+    }
+}

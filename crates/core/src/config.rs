@@ -144,6 +144,11 @@ pub struct RouteToml {
     /// (default `false`). Routes sharing an upstream may differ.
     #[serde(default)]
     pub rewrite_host: bool,
+    /// Remove the matched prefix from the path sent upstream (default
+    /// `false`) and set `X-Forwarded-Prefix` to it. The forwarded path is
+    /// then the normalised one.
+    #[serde(default)]
+    pub strip_prefix: bool,
 }
 
 /// Read and parse the TOML config at `path`. Shared by the server's initial
@@ -456,14 +461,21 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
             cooldown,
             breaker,
             health,
-            r.rewrite_host,
+            (r.rewrite_host, r.strip_prefix),
         ));
     }
 
     let mut upstreams_by_name: HashMap<String, Upstream> = HashMap::new();
     let mut routes = Vec::with_capacity(validated.len());
-    for (prefix, uri, name, cooldown, breaker, (health_path, health_disabled), rewrite_host) in
-        validated
+    for (
+        prefix,
+        uri,
+        name,
+        cooldown,
+        breaker,
+        (health_path, health_disabled),
+        (rewrite_host, strip_prefix),
+    ) in validated
     {
         let upstream = match upstreams_by_name.get(&name) {
             Some(u) => u.clone(),
@@ -484,7 +496,11 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 u
             }
         };
-        routes.push(Route::new(prefix, upstream).with_rewrite_host(rewrite_host));
+        routes.push(
+            Route::new(prefix, upstream)
+                .with_rewrite_host(rewrite_host)
+                .with_strip_prefix(strip_prefix),
+        );
     }
 
     Ok(RouteTable::new(routes, upstream_timeout)
@@ -543,6 +559,7 @@ mod tests {
             health_path: None,
             health_disabled: false,
             rewrite_host: false,
+            strip_prefix: false,
         }
     }
 

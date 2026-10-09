@@ -348,6 +348,19 @@ where
     let route_label = route.prefix.clone();
     let upstream = route.upstream.clone();
     let rewrite_host = route.rewrite_host;
+    // bad_path/ambiguous_route already accepted the raw path; strip only
+    // after them, on the normalised path, and re-check the result.
+    let strip = if route.strip_prefix {
+        match route.stripped_path(req.uri().path()) {
+            Some(p) => Some((p, route.stripped_prefix().to_string())),
+            None => {
+                record(started, "none", "none", 400);
+                return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
+            }
+        }
+    } else {
+        None
+    };
 
     // Upgrades (WebSocket etc.) need both hops spliced together, which this
     // proxy doesn't do; say so instead of forwarding a mangled plain GET.
@@ -421,7 +434,16 @@ where
     }
 
     let mut up_parts = upstream.uri.clone().into_parts();
-    up_parts.path_and_query = parts.uri.path_and_query().cloned();
+    up_parts.path_and_query = match &strip {
+        Some((path, _)) => {
+            let pq = match parts.uri.query() {
+                Some(q) => format!("{path}?{q}"),
+                None => path.clone(),
+            };
+            pq.parse().ok()
+        }
+        None => parts.uri.path_and_query().cloned(),
+    };
     parts.uri = match http::Uri::from_parts(up_parts) {
         Ok(uri) => uri,
         Err(e) => {
@@ -452,6 +474,11 @@ where
             xff: table.xff_mode(),
         },
     );
+
+    // After apply_forwarded_headers (it strips untrusted values).
+    if let Some((_, prefix)) = strip.as_ref().filter(|(_, p)| !p.is_empty()) {
+        set_forwarded_prefix(&mut parts.headers, prefix);
+    }
 
     let fwd = Request::from_parts(parts, body);
 
@@ -702,6 +729,29 @@ fn warn_private_peer_once() {
              sits behind a proxy or load balancer, add its address range to trusted_proxies, \
              otherwise client IP and scheme headers it sends are ignored"
         );
+    }
+}
+
+/// `X-Forwarded-Prefix` for a stripped route: a trusted hop's single plain
+/// path value (untrusted ones are already gone) is kept in front of ours
+/// (`/outer` + `/api` gives `/outer/api`); anything else is replaced.
+fn set_forwarded_prefix(headers: &mut HeaderMap, prefix: &str) {
+    let name = HeaderName::from_static("x-forwarded-prefix");
+    let mut all = headers.get_all(&name).iter();
+    let outer = match (all.next(), all.next()) {
+        (Some(v), None) => v.to_str().ok().map(|v| v.trim().trim_end_matches('/')),
+        _ => None,
+    }
+    .filter(|v| {
+        v.starts_with('/')
+            && v.bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b',' | b'?' | b'#'))
+            && !v.contains("//")
+            && !ferryman_core::path::bad_path(v)
+    })
+    .unwrap_or("");
+    if let Ok(v) = HeaderValue::from_str(&format!("{outer}{prefix}")) {
+        headers.insert(name, v);
     }
 }
 

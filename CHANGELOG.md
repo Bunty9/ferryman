@@ -7,6 +7,14 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Added
+
+- Per-route `strip_prefix` (default `false`; `RouteToml::strip_prefix`,
+  `Route::strip_prefix`, `Route::with_strip_prefix`) removes the matched prefix
+  from the path sent upstream and sets `X-Forwarded-Prefix`. The stripped path
+  is the normalised one; a remainder that fails `bad_path` answers 400.
+  Trusted peers' single plain-path `X-Forwarded-Prefix` is prepended.
+
 ### Security
 
 - Request headers whose name differs from a trust-governed header only by

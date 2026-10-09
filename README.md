@@ -200,6 +200,7 @@ fail loudly instead of silently falling back to defaults.
 | `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
 | `[[routes]] health_path`         | `/health` | Health probe path: absolute, no `?` or `#`. Hot-reloads.                       |
 | `[[routes]] rewrite_host`        | `false` | `true` sends the upstream's `host[:port]` as `Host` (HTTP/1 and HTTP/2); default keeps the client's. |
+| `[[routes]] strip_prefix`        | `false` | `true` removes the matched prefix before forwarding (`/api/users?x=1` under `/api` becomes `/users?x=1`; `/api` becomes `/`) and sets `X-Forwarded-Prefix: /api`. The path is checked (`bad_path`) before and after stripping and is forwarded normalised; the query is untouched. A `/` route has nothing to strip. |
 | `[[routes]] health_disabled`     | `false` | Skip active probing of this route's upstream (see "Health-driven recovery").     |
 
 All `*_secs` values must be between 1 and 86400 (one day). An upstream
@@ -389,7 +390,13 @@ What the upstream sees depends on whether the connecting peer is in
 | `X-Forwarded-Host`     | stripped                             | kept                                                                                           |
 | `X-Forwarded-Ssl`      | stripped                             | kept                                                                                           |
 | `X-Forwarded-Scheme`   | stripped                             | kept                                                                                           |
-| `X-Forwarded-Prefix`   | stripped                             | kept                                                                                           |
+| `X-Forwarded-Prefix`   | stripped; set to the prefix on `strip_prefix` routes | kept; on `strip_prefix` routes a single plain-path value is prepended (`/outer` + `/api` = `/outer/api`), anything else is replaced |
+
+Apps mounted under a prefix need `strip_prefix = true` plus their own
+setting to honour `X-Forwarded-Prefix`: FastAPI `root_path` (or
+`uvicorn --root-path`), Grafana `server.serve_from_sub_path = true` with a
+`root_url` ending in the prefix, Spring `server.forward-headers-strategy =
+framework` (`ForwardedHeaderFilter`).
 
 Without a known listener port (the deprecated `proxy::handle`, or
 `handle_streaming` called directly) `X-Forwarded-Port` is omitted for

@@ -18,7 +18,7 @@ contract (config keys, status codes, metrics) is in the
 |                  | `admin.rs`                              | `/metrics`, `/healthz`, `/readyz` server                         |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
 |                  | `reload.rs`                             | Debounced config file watcher                                    |
-|                  | `main.rs`                               | CLI, tracing, metrics recorder, signal handling                  |
+|                  | `main.rs`                               | CLI (`check`, `healthcheck` subcommands), tracing, metrics recorder, signals |
 
 `ferryman` is a library plus a thin binary so the end-to-end tests
 can drive the real `serve` loop on an ephemeral port.

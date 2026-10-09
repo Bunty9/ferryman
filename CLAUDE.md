@@ -8,6 +8,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `export PATH=$HOME/.cargo/bin:$PATH` - cargo is not on the default PATH here
 - `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings` - CI runs clippy with `-D warnings`
 - `cargo test --workspace` - unit + e2e tests across the workspace; ~10s because `idle_connection_is_dropped_after_deadline` waits out the real 10s deadline
+- `cargo run -p ferryman -- check --config X` validates config+TLS without binding; `... -- healthcheck [--url]` GETs the admin `/healthz` (Docker HEALTHCHECK, no curl in image)
 - `cargo deny check` - must stay clean (CI job); installed at `~/.cargo/bin/cargo-deny`
 - `cargo bench -p ferryman-core --no-run` - criterion lookup bench must compile
 - `cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8001` - local upstream stub

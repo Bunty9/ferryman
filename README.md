@@ -247,7 +247,9 @@ CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
 - `ferryman check [--config PATH]` validates the config (parse, route table,
   and TLS cert/key when `--tls-cert`/`--tls-key` are set) without binding
   anything. Prints `config ok: N routes` or the error chain to stderr; exit 0
-  or 1. Use it as a CI gate before deploying a config.
+  or 1. Use it as a CI gate before deploying a config. It checks the config
+  file and TLS files only; bind addresses are parsed by clap, not tested for
+  availability.
 - `ferryman healthcheck [--url URL]` does an HTTP/1 GET (3 s budget) on
   `http://127.0.0.1:<--metrics-bind port>/healthz` and exits 0 on 2xx, else 1.
   The Docker image has no shell or curl, so this is its `HEALTHCHECK`

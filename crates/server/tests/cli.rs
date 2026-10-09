@@ -91,3 +91,72 @@ async fn healthcheck_up_and_down() {
     assert_eq!(run(&["healthcheck", "--url", &url]).status.code(), Some(1));
     assert!(t.elapsed() < Duration::from_secs(4));
 }
+
+async fn admin_on(addr: &str) -> Option<std::net::SocketAddr> {
+    let l = tokio::net::TcpListener::bind(addr).await.ok()?;
+    let a = l.local_addr().unwrap();
+    let handle = PrometheusBuilder::new().build_recorder().handle();
+    tokio::spawn(ferryman::admin::serve_admin(
+        l,
+        handle,
+        Arc::new(AtomicBool::new(false)),
+    ));
+    Some(a)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn healthcheck_default_url_uses_bind_ip() {
+    // Specific IPv4 bind (and IPv6 loopback when the host has it).
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        let Some(a) = admin_on(bind).await else {
+            continue;
+        };
+        let a = a.to_string();
+        assert_eq!(
+            run(&["healthcheck", "--metrics-bind", &a]).status.code(),
+            Some(0),
+            "{a}"
+        );
+    }
+    // Wildcard bind maps to loopback.
+    let a = admin_on("127.0.0.1:0").await.unwrap();
+    let wild = format!("0.0.0.0:{}", a.port());
+    assert_eq!(
+        run(&["healthcheck", "--metrics-bind", &wild]).status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn check_tls_branches() {
+    let ok = write_cfg(
+        "tls",
+        "[[routes]]\nprefix = \"/\"\nupstream = \"http://127.0.0.1:1\"\n",
+    );
+    let certs = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/full-stack/certs/"
+    );
+    let (cert, key) = (
+        format!("{certs}server.pem"),
+        format!("{certs}server-key.pem"),
+    );
+    let o = run(&[
+        "check",
+        "--config",
+        &ok,
+        "--tls-cert",
+        &cert,
+        "--tls-key",
+        &key,
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let o = run(&["check", "--config", &ok, "--tls-cert", &cert]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("both be set"));
+}

@@ -75,8 +75,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Healthcheck { url }) => {
             let url = url.clone().unwrap_or_else(|| {
-                // Wildcard binds are not connectable on every OS: use loopback.
-                format!("http://127.0.0.1:{}/healthz", args.metrics_bind.port())
+                // Probe the bind IP itself; only wildcard binds map to loopback.
+                let mut a = args.metrics_bind;
+                if a.ip().is_unspecified() {
+                    a.set_ip(if a.is_ipv4() {
+                        std::net::Ipv4Addr::LOCALHOST.into()
+                    } else {
+                        std::net::Ipv6Addr::LOCALHOST.into()
+                    });
+                }
+                format!("http://{a}/healthz")
             });
             std::process::exit(report(healthcheck(&url).await, |()| {}));
         }

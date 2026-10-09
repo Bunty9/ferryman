@@ -9,6 +9,14 @@ and `ferryman` are released together with the same version.
 
 ### Security
 
+- Request headers whose name differs from a trust-governed header only by
+  `_` instead of `-` (`X_Real_IP`, `X_Forwarded_For`, `X_Forwarded_Prefix`,
+  `X_Forwarded_Proto`/`-Host`/`-Port`/`-Ssl`/`-Scheme`, `Forwarded`) are now
+  removed for every peer, trusted or not. CGI-style backends (WSGI/Werkzeug,
+  Rack/Puma, PHP-FPM) fold `_` and `-` together, so such a header could
+  otherwise reach the app as the real one. Migration: none unless a client
+  deliberately sent these spellings.
+
 - Untrusted peers can no longer forge `X-Forwarded-Ssl`, `X-Forwarded-Scheme`,
   `X-Forwarded-Port` or `X-Forwarded-Prefix`: all instances are stripped
   (`X-Forwarded-Port` is then set by ferryman, see Added). Trusted peers keep

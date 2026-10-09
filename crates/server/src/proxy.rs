@@ -710,6 +710,35 @@ const UNTRUSTED_STRIPPED: [&str; 6] = [
     "x-forwarded-prefix",
 ];
 
+/// Names (with `_` folded to `-`) that CGI-style backends (WSGI, Rack, PHP-FPM)
+/// would confuse with the trust-governed headers below.
+const TRUST_GOVERNED: [&str; 9] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-forwarded-prefix",
+    "x-real-ip",
+];
+
+/// Remove, for every peer, underscore spellings (`X_Real_IP`) of trust-governed headers.
+fn strip_underscore_spellings(headers: &mut HeaderMap) {
+    let bad: Vec<HeaderName> = headers
+        .keys()
+        .filter(|k| {
+            k.as_str().contains('_')
+                && TRUST_GOVERNED.contains(&k.as_str().replace('_', "-").as_str())
+        })
+        .cloned()
+        .collect();
+    for k in bad {
+        headers.remove(k);
+    }
+}
+
 /// Rightmost comma-separated token across all lines of `name`.
 fn rightmost<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -755,6 +784,7 @@ fn apply_forwarded_headers(
     proto: &'static str,
     cfg: &FwdCfg<'_>,
 ) {
+    strip_underscore_spellings(headers);
     let trusted = cfg.trusted;
     let xfp = HeaderName::from_static("x-forwarded-proto");
     let xport = HeaderName::from_static("x-forwarded-port");
@@ -1373,6 +1403,25 @@ mod tests {
         // off by default: untrusted Forwarded just stripped
         let m = run_with(&[], "1.2.3.4", None, false, XffMode::Append, &h);
         assert_eq!(get(&m, "forwarded"), None);
+    }
+
+    #[test]
+    fn underscore_spellings_are_stripped_for_every_peer() {
+        let h = [
+            ("x_real_ip", "6.6.6.6"),
+            ("x_forwarded_prefix", "/evil"),
+            ("X_Forwarded_For", "6.6.6.6"),
+            ("forwarded", "for=1.1.1.1"),
+            ("x_custom", "keep"),
+        ];
+        for trusted in [&[][..], &["10.0.0.0/8"][..]] {
+            let m = run_with(trusted, "10.1.2.3", None, false, XffMode::Append, &h);
+            for k in ["x_real_ip", "x_forwarded_prefix", "x_forwarded_for"] {
+                assert_eq!(get(&m, k), None, "{k}");
+            }
+            assert_eq!(get(&m, "x_custom"), Some("keep"));
+            assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
+        }
     }
 
     #[test]

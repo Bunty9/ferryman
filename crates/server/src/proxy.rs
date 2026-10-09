@@ -393,14 +393,18 @@ where
     // way. With `rewrite_host`, the upstream's own authority wins over both.
     // The client's effective host, for `Forwarded host=`; captured before
     // `rewrite_host` can overwrite it.
-    let client_host: Option<String> = match parts.uri.authority() {
-        Some(a) => Some(a.as_str().rsplit('@').next().unwrap_or("").to_string()),
-        None => parts
-            .headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
-    };
+    let client_host: Option<String> = table
+        .forwarded_header()
+        .then(|| match parts.uri.authority() {
+            Some(a) => a.as_str().rsplit('@').next().unwrap_or("").to_string(),
+            None => parts
+                .headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .filter(|h| !h.is_empty());
     let authority = if rewrite_host {
         upstream.uri.authority()
     } else {

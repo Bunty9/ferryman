@@ -135,7 +135,9 @@ and `ferryman` are released together with the same version.
 
 - Untrusted peers' `X-Forwarded-Ssl`, `X-Forwarded-Scheme` and
   `X-Forwarded-Prefix` are now stripped; see the Security note above for the
-  migration.
+  migration. An untrusted client's `X-Forwarded-Port` is now replaced by the
+  listener port (omitted when ferryman is embedded via `handle_streaming` /
+  `handle`, which know no port).
 - SIGHUP no longer terminates the process: it reloads the config and TLS
   certificate (see Added). Migration: anything that used SIGHUP to stop or
   restart ferryman must send SIGTERM (or SIGINT) instead.

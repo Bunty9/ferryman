@@ -965,6 +965,44 @@ async fn legacy_handle_and_proxy_client_still_work() {
     assert_eq!(resp.text().await.unwrap(), "legacy");
 }
 
+/// The legacy handler has no listener port: an untrusted client's `Host`
+/// port must not turn into `X-Forwarded-Port`.
+#[tokio::test]
+#[allow(deprecated)]
+async fn legacy_handle_never_derives_forwarded_port_from_host() {
+    use hyper_util::rt::TokioExecutor;
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let client: ferryman::ProxyClient =
+        hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let svc = service_fn(move |req| {
+            ferryman::proxy::handle(table.clone(), client.clone(), peer, "http", req)
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), svc)
+            .await;
+    });
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/svc-a"))
+        .header("host", "x:443")
+        .header("x-forwarded-port", "4443")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("host: x:443"), "{body}");
+    assert!(!body.contains("x-forwarded-port"), "{body}");
+}
+
 #[tokio::test]
 async fn dot_segments_get_400_and_never_reach_upstream() {
     use std::sync::atomic::AtomicUsize;

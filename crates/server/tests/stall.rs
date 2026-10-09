@@ -164,7 +164,7 @@ async fn get(proxy: SocketAddr) -> String {
 /// 3 concurrent stalled uploads (failure_threshold = 3, default idle timeout 30 s),
 /// then one innocent GET. Returns (attack statuses, innocent GET status).
 async fn attack(on: OnStall) -> (Vec<String>, String) {
-    let up = spawn_raw_stub(Duration::from_secs(1), on).await;
+    let up = spawn_raw_stub(Duration::from_millis(1500), on).await;
     let proxy = start_proxy(table("", up)).await;
     assert!(get(proxy).await.contains(" 200"), "baseline");
     let hs: Vec<_> = (0..3)
@@ -219,7 +219,7 @@ async fn stalled_upload_504_on_stall_is_forwarded_and_not_counted() {
 /// no innocent success lands in between (consecutive-failure counter).
 #[tokio::test]
 async fn sequential_three_stalls_do_not_open_breaker() {
-    let up = spawn_raw_stub(Duration::from_secs(1), OnStall::Close).await;
+    let up = spawn_raw_stub(Duration::from_millis(1500), OnStall::Close).await;
     let proxy = start_proxy(table("", up)).await;
     for _ in 0..3 {
         let (s, _) = stalled_upload(proxy).await;
@@ -232,7 +232,7 @@ async fn sequential_three_stalls_do_not_open_breaker() {
 /// write timeout. Upstream closes mid-body; breaker must stay closed.
 #[tokio::test]
 async fn client_not_reading_response_does_not_count() {
-    let up = spawn_raw_stub(Duration::from_secs(1), OnStall::Close).await;
+    let up = spawn_raw_stub(Duration::from_millis(1500), OnStall::Close).await;
     let proxy = start_proxy(table("", up)).await;
     let mut hs = Vec::new();
     for _ in 0..3 {
@@ -283,4 +283,74 @@ async fn pause_below_theta_still_counts() {
     let after = get(proxy).await;
     eprintln!("short pause: innocent GET -> {after}");
     assert!(after.contains(" 503"), "{after}");
+}
+
+/// an upstream that stops reading a FAST client's upload, then
+/// resets, must still count (hyper backpressure must not look like a stall).
+#[tokio::test]
+async fn backpressure_then_reset_still_counts() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut b = [0u8; 4096];
+                let n = s.read(&mut b).await.unwrap_or(0);
+                if n > 4 && b.starts_with(b"GET") {
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await; // stop reading
+                let _ = s.set_linger(Some(Duration::ZERO));
+            });
+        }
+    });
+    let proxy = start_proxy(table("", up)).await;
+    let mut hs = Vec::new();
+    for _ in 0..3 {
+        hs.push(tokio::spawn(async move {
+            let s = TcpStream::connect(proxy).await.unwrap();
+            let (mut r, mut w) = s.into_split();
+            tokio::spawn(async move {
+                let _ = w
+                    .write_all(
+                        b"POST /svc/u HTTP/1.1\r\nhost: x\r\ncontent-length: 268435456\r\n\r\n",
+                    )
+                    .await;
+                let block = vec![b'y'; 65536];
+                for _ in 0..4096 {
+                    if w.write_all(&block).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(10), r.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap_or(0);
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        }));
+    }
+    for h in hs {
+        let st = h.await.unwrap();
+        assert!(st.contains(" 502"), "{st}");
+    }
+    let after = get(proxy).await;
+    eprintln!("backpressure: innocent GET -> {after}");
+    assert!(
+        after.contains(" 503"),
+        "fast client + upstream that stops reading must count: {after}"
+    );
 }

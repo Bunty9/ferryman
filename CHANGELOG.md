@@ -14,7 +14,8 @@ and `ferryman` are released together with the same version.
   that was counted as an upstream failure, so three slow uploads yielded 503
   for all clients. When the client left its upload idle for at least
   min(1 s, `request_body_idle_timeout_secs` / 2), such a result now releases
-  the breaker ticket instead of counting; the response status is unchanged.
+  the breaker ticket instead of counting; the response status is unchanged (`handle_streaming` only; the deprecated
+  `handle` is unchanged).
 
 ### Added
 

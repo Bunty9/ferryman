@@ -262,7 +262,7 @@ pub async fn handle_streaming(
 /// the whole request including the body upload, no body idle timeout, and a
 /// timeout counts against the breaker only for bodyless requests. It shares
 /// the core with `handle_streaming`, so it still gets the forwarded-header and
-/// bad-path fixes.
+/// bad-path fixes. It does not get the client-stall protection (`handle_streaming` only).
 #[deprecated(
     since = "0.2.3",
     note = "long uploads can 504; use `handle_streaming` with a `StreamingClient`"

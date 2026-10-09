@@ -87,6 +87,13 @@ jobs:
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
 
+      # Packages and builds the exact crates `publish` uploads (the
+      # workspace dry run resolves ferryman-core's not-yet-published
+      # version through a local overlay registry). This is what makes
+      # `cargo publish --no-verify` in `publish` safe.
+      - name: cargo publish --workspace --dry-run --locked
+        run: cargo publish --workspace --dry-run --locked
+
   # Publishes both crates. `id-token: write` mints the crates.io Trusted
   # Publishing token; `contents: read` (never `write`) because `cargo
   # publish` also runs dependency build scripts. Each crate's publish is
@@ -126,14 +133,22 @@ jobs:
           pkg_version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="ferryman") | .version')
           # ferryman depends on ferryman-core, so it must publish first.
+          # 200 = already published (skip), 404 = publish, else fail.
+          # --no-verify: `verify` already ran `cargo publish --workspace
+          # --dry-run --locked` on this same commit.
           for crate in ferryman-core ferryman; do
-            if curl -fsS -A "ferryman-release (github.com/Bunty9/ferryman)" \
-                "https://crates.io/api/v1/crates/${crate}/${pkg_version}" >/dev/null 2>&1; then
-              echo "$crate $pkg_version is already on crates.io, skipping"
-            else
-              echo "publishing $crate $pkg_version"
-              cargo publish -p "$crate" --locked
-            fi
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "ferryman-release (github.com/Bunty9/ferryman)" \
+              "https://crates.io/api/v1/crates/${crate}/${pkg_version}")
+            case "$code" in
+              200) echo "$crate $pkg_version is already on crates.io, skipping" ;;
+              404)
+                echo "publishing $crate $pkg_version"
+                cargo publish -p "$crate" --locked --no-verify ;;
+              *)
+                echo "::error::crates.io returned HTTP $code for $crate $pkg_version"
+                exit 1 ;;
+            esac
           done
 
   # Release binaries, tier 1: required. `publish` needs this job, so
@@ -151,11 +166,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { tier: 1, os: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { tier: 1, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-          - { tier: 1, os: macos-latest, target: x86_64-apple-darwin }
-          - { tier: 1, os: macos-latest, target: aarch64-apple-darwin }
-          - { tier: 1, os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
     env:
       TARGET: ${{ matrix.target }}
     steps:
@@ -234,12 +249,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { tier: 2, os: ubuntu-latest, target: armv7-unknown-linux-musleabihf, builder: cross }
-          - { tier: 2, os: ubuntu-latest, target: arm-unknown-linux-musleabihf, builder: cross }
-          - { tier: 2, os: ubuntu-latest, target: i686-unknown-linux-musl, builder: cross }
-          - { tier: 2, os: ubuntu-latest, target: riscv64gc-unknown-linux-gnu, builder: cross }
-          - { tier: 2, os: ubuntu-latest, target: x86_64-unknown-freebsd, builder: cross }
-          - { tier: 2, os: windows-latest, target: aarch64-pc-windows-msvc, builder: cargo }
+          - { os: ubuntu-latest, target: armv7-unknown-linux-musleabihf, builder: cross }
+          - { os: ubuntu-latest, target: arm-unknown-linux-musleabihf, builder: cross }
+          - { os: ubuntu-latest, target: i686-unknown-linux-musl, builder: cross }
+          - { os: ubuntu-latest, target: riscv64gc-unknown-linux-gnu, builder: cross }
+          - { os: ubuntu-latest, target: x86_64-unknown-freebsd, builder: cross }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, builder: cargo }
     env:
       TARGET: ${{ matrix.target }}
     steps:
@@ -253,10 +268,6 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.builder == 'cargo' && matrix.target || '' }}
-
-      - name: Install musl-tools
-        if: matrix.builder == 'cargo' && contains(matrix.target, 'linux-musl')
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Install cross
         if: matrix.builder == 'cross'

@@ -84,7 +84,7 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 
 `.github/workflows/release.yml` exists in the repo already. On a tag push
 (`v[0-9]+.[0-9]+.[0-9]+` or prerelease `v[0-9]+.[0-9]+.[0-9]+-*`) it
-runs five jobs, each with only the permissions and checkout it needs
+runs six jobs (`verify`, `binaries`, `binaries-extra`, `attest`, `publish`, `release`), each with only the permissions and checkout it needs
 (see "why separate jobs" below). Graph: `verify` -> `binaries` ->
 `attest` -> `publish` -> `release`, with `binaries-extra` (best effort) alongside:
 
@@ -94,7 +94,9 @@ runs five jobs, each with only the permissions and checkout it needs
    `[workspace.package]` version and that the `ferryman-core` entry in
    `[workspace.dependencies]` agrees, extracts the matching
    `CHANGELOG.md` section into `release-notes.md` and uploads it as a
-   build artifact, then runs `cargo test --workspace --locked`.
+   build artifact, runs `cargo test --workspace --locked`, then
+   `cargo publish --workspace --dry-run --locked` (packages and builds the
+   exact crates `publish` uploads; this is what makes `--no-verify` safe).
 2. **`attest`** (needs `verify` and `binaries`; `id-token: write`,
    `attestations: write`, `contents: read`; no checkout, no cargo) —
    downloads the tier-1 `bin-t1-*` archives and runs
@@ -107,8 +109,10 @@ runs five jobs, each with only the permissions and checkout it needs
    authenticates via `rust-lang/crates-io-auth-action@v1` (Trusted
    Publishing, no long-lived token), then publishes `ferryman-core` and
    `ferryman`, **in that order, one crate at a time**: for each, it first
-   checks whether that exact `name/version` already exists on crates.io
-   and skips it if so, otherwise runs `cargo publish -p <name> --locked`.
+   queries the crates.io API for that exact `name/version` (with a
+   User-Agent) and acts on the HTTP status: 200 skips, 404 runs
+   `cargo publish -p <name> --locked --no-verify`, anything else fails the
+   job with the status in the error (never publishes on an unclear answer).
    This makes the job idempotent — see "recovering from a half-published
    release" below.
 4. **`release`** (needs `verify`, `publish`, `binaries`, `binaries-extra`,
@@ -181,7 +185,7 @@ follows), so it cannot leave a half-published
 release; only transient failures after publish starts can.
 
 Because each crate's publish step checks crates.io for that exact
-`name/version` before publishing, **re-running the failed jobs** from the
+`name/version` before publishing (200 skip / 404 publish / other fail), **re-running the failed jobs** from the
 Actions UI (don't re-push the tag) picks up where it left off: `ferryman-core`
 is found to already exist and is skipped, `ferryman` gets published, and
 the `release` job then creates the GitHub release (it still requires

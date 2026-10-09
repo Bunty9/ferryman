@@ -103,6 +103,7 @@ pub async fn serve(
                     }
                 };
                 let _ = stream.set_nodelay(true);
+                let local_port = stream.local_addr().ok().map(|a| a.port());
                 let table = table.clone();
                 let client = client.clone();
                 let tls = tls.clone();
@@ -141,7 +142,7 @@ pub async fn serve(
                     let seen = seen_request.clone();
                     let svc = service_fn(move |req| {
                         seen.store(true, Ordering::Relaxed);
-                        proxy::handle_streaming(table.clone(), client.clone(), peer, proto, req)
+                        proxy::handle_streaming_at(table.clone(), client.clone(), peer, local_port, proto, req)
                     });
                     let conn = watcher.watch(builder.serve_connection(io, svc));
                     tokio::pin!(conn);

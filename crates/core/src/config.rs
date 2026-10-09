@@ -63,7 +63,28 @@ pub struct ConfigToml {
     /// the listener closes, in seconds (0..=86400). Default 0.
     #[serde(default)]
     pub shutdown_delay_secs: u64,
+    /// Also emit an RFC 7239 `Forwarded` element (`for`, `proto`, `host`).
+    /// Default false.
+    #[serde(default)]
+    pub forwarded_header: bool,
+    /// How `X-Forwarded-For` is built: `"append"` (default) adds the peer to
+    /// the incoming list; `"replace"` sets it to the single client address
+    /// that goes into `X-Real-IP`.
+    #[serde(default)]
+    pub xff: XffMode,
     pub routes: Vec<RouteToml>,
+}
+
+/// `xff` config key: how the upstream-bound `X-Forwarded-For` is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum XffMode {
+    /// Append the peer address to the incoming list.
+    #[default]
+    Append,
+    /// Replace the list with the client address (as in `X-Real-IP`).
+    Replace,
 }
 
 fn default_health_interval() -> u64 {
@@ -473,6 +494,8 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
         .with_drain_timeout(Duration::from_secs(cfg.drain_timeout_secs))
         .with_shutdown_delay(Duration::from_secs(cfg.shutdown_delay_secs))
         .with_trusted_proxies(trusted_proxies)
+        .with_forwarded_header(cfg.forwarded_header)
+        .with_xff_mode(cfg.xff)
         .with_local_health_path(cfg.local_health_path))
 }
 
@@ -494,6 +517,8 @@ mod tests {
             local_health_path: None,
             drain_timeout_secs: 25,
             shutdown_delay_secs: 0,
+            forwarded_header: false,
+            xff: XffMode::Append,
             routes,
         }
     }
@@ -761,6 +786,17 @@ mod tests {
         r.cooldown_secs = Some(86_401);
         let err = build_table(cfg(vec![r]), None).err().unwrap();
         assert!(err.to_string().contains("cooldown_secs"), "{err}");
+    }
+
+    #[test]
+    fn forwarding_keys_parse() {
+        let t = parse("").unwrap();
+        assert!(!t.forwarded_header());
+        assert_eq!(t.xff_mode(), XffMode::Append);
+        let t = parse("forwarded_header = true\nxff = \"replace\"").unwrap();
+        assert!(t.forwarded_header());
+        assert_eq!(t.xff_mode(), XffMode::Replace);
+        assert!(toml::from_str::<ConfigToml>("xff = \"nope\"\nroutes = []").is_err());
     }
 
     #[test]

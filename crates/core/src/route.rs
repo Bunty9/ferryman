@@ -158,6 +158,8 @@ pub struct RouteTable {
     drain_timeout: Duration,
     shutdown_delay: Duration,
     trusted_proxies: TrustedProxies,
+    forwarded_header: bool,
+    xff_mode: crate::config::XffMode,
     local_health_path: Option<String>,
 }
 
@@ -175,6 +177,8 @@ impl RouteTable {
             drain_timeout: Duration::from_secs(crate::config::DEFAULT_DRAIN_SECS),
             shutdown_delay: Duration::ZERO,
             trusted_proxies: TrustedProxies::default(),
+            forwarded_header: false,
+            xff_mode: crate::config::XffMode::default(),
             local_health_path: None,
         }
     }
@@ -242,6 +246,28 @@ impl RouteTable {
     pub fn with_trusted_proxies(mut self, t: TrustedProxies) -> Self {
         self.trusted_proxies = t;
         self
+    }
+
+    /// Emit an RFC 7239 `Forwarded` element (config `forwarded_header`; default false).
+    pub fn with_forwarded_header(mut self, on: bool) -> Self {
+        self.forwarded_header = on;
+        self
+    }
+
+    /// Set how `X-Forwarded-For` is built (config `xff`; default append).
+    pub fn with_xff_mode(mut self, m: crate::config::XffMode) -> Self {
+        self.xff_mode = m;
+        self
+    }
+
+    /// Whether an RFC 7239 `Forwarded` element is added.
+    pub fn forwarded_header(&self) -> bool {
+        self.forwarded_header
+    }
+
+    /// How `X-Forwarded-For` is built.
+    pub fn xff_mode(&self) -> crate::config::XffMode {
+        self.xff_mode
     }
 
     /// HTTP/1 keep-alive idle timeout.

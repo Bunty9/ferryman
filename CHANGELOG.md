@@ -9,6 +9,14 @@ and `ferryman` are released together with the same version.
 
 ### Security
 
+- Untrusted peers can no longer forge `X-Forwarded-Ssl`, `X-Forwarded-Scheme`,
+  `X-Forwarded-Port` or `X-Forwarded-Prefix`: all instances are stripped
+  (`X-Forwarded-Port` is then set by ferryman, see Added). Trusted peers keep
+  them. Migration: an app behind ferryman that relied on a client-supplied
+  `X-Forwarded-Ssl` / `-Scheme` / `-Prefix` arriving from an untrusted hop now
+  sees them removed; if a proxy or load balancer in front of ferryman sets
+  them, add its range to `trusted_proxies`.
+
 - Host hardening (low severity, defence in depth): when the request target
   has no authority, the `Host` header is now validated before routing and
   must be a single bare `host[:port]` (no userinfo, comma list, path,
@@ -31,6 +39,17 @@ and `ferryman` are released together with the same version.
   `handle` is unchanged).
 
 ### Added
+
+- Trust model completion: `X-Forwarded-Port` (the listener's port for
+  untrusted peers; trusted peers' rightmost valid value is kept, else the
+  listener port), optional RFC 7239 `Forwarded` output (`forwarded_header =
+  true`, default false; `for=<peer>;proto=;host=`, IPv6 quoted and bracketed),
+  `xff = "append" | "replace"` (default append), and a one-time warning when
+  `trusted_proxies` is empty and a private/loopback/link-local peer connects.
+  New public items: `XffMode`, `RouteTable::{with_forwarded_header,
+  forwarded_header, with_xff_mode, xff_mode}`, `proxy::handle_streaming_at`
+  (takes the local port; `serve` uses it; `handle_streaming` and the
+  deprecated `handle` take the port from `Host`, if any).
 
 - Reload model. The watcher now watches the config file's directory and
   reacts to any event there, so Kubernetes ConfigMap mounts (an atomic

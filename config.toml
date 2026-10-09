@@ -54,6 +54,11 @@ default_cooldown_secs = 30
 # "::/0" does not trust them; host bits are ignored (10.0.0.1/8 = 10.0.0.0/8).
 # trusted_proxies = ["10.0.0.0/8", "fd00::/8"]
 
+# Optional RFC 7239 `Forwarded: for=;proto=;host=` output (default false) and
+# X-Forwarded-For mode: "append" (default) or "replace" (only the client IP).
+# forwarded_header = false
+# xff = "append"
+
 # Shutdown (SIGTERM/SIGINT). /readyz goes 503 immediately; ferryman keeps
 # serving for shutdown_delay_secs (0..=86400, default 0) so a load balancer
 # can deregister it, then stops accepting and waits up to drain_timeout_secs

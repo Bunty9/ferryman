@@ -287,6 +287,11 @@ async fn forged_headers_echo(extra_cfg: &str) -> String {
         .header("x-forwarded-proto", "https")
         .header("X-Forwarded-Proto", "https")
         .header("x-forwarded-for", "6.6.6.6")
+        .header("x-forwarded-ssl", "on")
+        .header("X-Forwarded-Scheme", "https")
+        .header("x-forwarded-prefix", "/evil")
+        .header("X-Forwarded-Prefix", "/evil2")
+        .header("x-forwarded-port", "4443")
         .send()
         .await
         .unwrap()
@@ -311,6 +316,13 @@ async fn untrusted_peer_cannot_forge_forwarded_headers() {
         assert!(!body.contains("x-forwarded-host"), "{body}");
         assert!(!body.contains("evil.example"), "{body}");
         assert!(body.contains("x-forwarded-proto: http\n"), "{body}");
+        for h in ["ssl", "scheme", "prefix"] {
+            assert!(!body.contains(&format!("x-forwarded-{h}")), "{h}: {body}");
+        }
+        assert!(!body.contains("evil"), "{body}");
+        assert!(!body.contains("4443"), "{body}");
+        assert_eq!(body.matches("x-forwarded-port:").count(), 1, "{body}");
+        assert!(!body.contains("x-forwarded-port: 4443"), "{body}");
         // 0.2.2 behaviour: XFF is appended to, not replaced.
         assert!(
             body.contains("x-forwarded-for: 6.6.6.6, 127.0.0.1"),
@@ -324,6 +336,10 @@ async fn trusted_peer_forwarded_headers_are_preserved() {
     let body = forged_headers_echo("trusted_proxies = [\"127.0.0.1/32\"]").await;
     assert!(body.contains("x-forwarded-proto: https\n"), "{body}");
     assert!(body.contains("x-forwarded-host: evil.example"), "{body}");
+    assert!(body.contains("x-forwarded-ssl: on"), "{body}");
+    assert!(body.contains("x-forwarded-scheme: https"), "{body}");
+    assert!(body.contains("x-forwarded-prefix: /evil"), "{body}");
+    assert!(body.contains("x-forwarded-port: 4443"), "{body}");
     // Derived from XFF (rightmost untrusted = 6.6.6.6), never the forged header.
     assert!(body.contains("x-real-ip: 6.6.6.6"), "{body}");
     assert!(!body.contains("x-real-ip: 7.7.7.7"), "{body}");
@@ -336,6 +352,26 @@ async fn trusted_peer_forwarded_headers_are_preserved() {
         body.contains("x-forwarded-for: 6.6.6.6, 127.0.0.1"),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn forwarded_port_is_the_listener_port_and_forwarded_header_is_opt_in() {
+    let body = forged_headers_echo("").await;
+    assert!(!body.contains("\nforwarded:"), "{body}");
+    let body = forged_headers_echo("forwarded_header = true\nxff = \"replace\"").await;
+    let port = body
+        .lines()
+        .find_map(|l| l.strip_prefix("x-forwarded-port: "))
+        .expect(&body);
+    assert_ne!(port, "4443", "{body}");
+    assert!(
+        body.contains(&format!(
+            "forwarded: for=127.0.0.1;proto=http;host=\"127.0.0.1:{port}\""
+        )),
+        "{body}"
+    );
+    assert!(!body.contains("6.6.6.6"), "{body}");
+    assert!(body.contains("x-forwarded-for: 127.0.0.1\n"), "{body}");
 }
 
 #[tokio::test]

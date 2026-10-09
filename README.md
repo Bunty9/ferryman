@@ -192,6 +192,8 @@ fail loudly instead of silently falling back to defaults.
 | `drain_timeout_secs`             | 25      | After the listener closes on shutdown, how long to wait for in-flight requests before cutting them, 1-86400. Delay + drain must stay under the platform kill timeout. |
 | `shutdown_delay_secs`            | 0       | On SIGTERM/SIGINT, `/readyz` flips to 503 at once and ferryman keeps accepting for this long (0-86400) before the drain starts. Read at shutdown, so a reload applies. |
 | `local_health_path`              | none    | Path the proxy answers itself (`GET`/`HEAD` -> `200 ok`, no upstream, no breaker; metric `route="local_health"`), for PaaS platforms that only probe the serving port. Absolute, no `?`/`#`; rejected if equal to a route prefix; shadows a route prefix it falls under (e.g. `/up` under a `/` catch-all). Hot-reloads. |
+| `forwarded_header`               | `false` | Also add an RFC 7239 `Forwarded` element `for=<peer>;proto=<scheme>;host=<Host>` (IPv6 as `for="[2001:db8::1]"`). Untrusted peer: a fresh element; trusted: appended to the incoming list. Hot-reloads. |
+| `xff`                            | `"append"` | `"append"`: peer added to the incoming `X-Forwarded-For`. `"replace"`: set to the single client address ferryman puts in `X-Real-IP`. Hot-reloads. |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
 | `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the normalised, case-sensitive request path (see "Routing and access control"). |
 | `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
@@ -377,13 +379,26 @@ then stops accepting and drains in-flight connections for up to
 What the upstream sees depends on whether the connecting peer is in
 `trusted_proxies` (an empty list means every peer is untrusted):
 
-| Header              | Untrusted peer                       | Trusted peer                                                                                   |
-| ------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `X-Forwarded-Proto` | set from the connection              | incoming kept (rightmost value); set from the connection if absent                                 |
-| `X-Forwarded-For`   | peer IP appended                     | peer IP appended                                                                               |
-| `X-Real-IP`         | overwritten with the peer IP         | always overwritten: the rightmost `X-Forwarded-For` entry that is not a trusted proxy (`ip:port` / `[v6]:port` tolerated; an unparsable entry stops the walk), else the peer |
-| `Forwarded`         | stripped                             | kept                                                                                           |
-| `X-Forwarded-Host`  | stripped                             | kept                                                                                           |
+| Header                 | Untrusted peer                       | Trusted peer                                                                                   |
+| ---------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `X-Forwarded-Proto`    | set from the connection              | incoming kept (rightmost value); set from the connection if absent                             |
+| `X-Forwarded-Port`     | client values stripped; set to the listener's port | rightmost incoming value kept if a valid port, else the listener's port        |
+| `X-Forwarded-For`      | peer IP appended (`xff = "replace"`: only the peer) | peer IP appended (`xff = "replace"`: only the derived client)       |
+| `X-Real-IP`            | overwritten with the peer IP         | always overwritten: the rightmost `X-Forwarded-For` entry that is not a trusted proxy (`ip:port` / `[v6]:port` tolerated; an unparsable entry stops the walk), else the peer |
+| `Forwarded`            | stripped; with `forwarded_header = true` a fresh `for=peer;proto;host` element | kept; with `forwarded_header = true` the element is appended |
+| `X-Forwarded-Host`     | stripped                             | kept                                                                                           |
+| `X-Forwarded-Ssl`      | stripped                             | kept                                                                                           |
+| `X-Forwarded-Scheme`   | stripped                             | kept                                                                                           |
+| `X-Forwarded-Prefix`   | stripped                             | kept                                                                                           |
+
+Without a known listener port (the deprecated `proxy::handle`, or
+`handle_streaming` called directly) the port comes from the request's `Host`
+header and `X-Forwarded-Port` is omitted if there is none. With
+`rewrite_host = true` the `host=` of `Forwarded` is the upstream's authority.
+
+If `trusted_proxies` is empty and a request arrives from a private, loopback
+or link-local peer, ferryman logs one warning (per process) suggesting
+`trusted_proxies`, in case it sits behind a proxy or load balancer.
 
 ferryman does not add `X-Forwarded-Host` itself; the `Host` header is
 unchanged. Before 0.2.3 clients could forge `X-Real-IP`, `Forwarded` and

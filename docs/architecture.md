@@ -46,8 +46,8 @@ accept ── set TCP_NODELAY
             URI = upstream scheme+authority + original path+query,
             version = HTTP/1.1, x-forwarded-for / -proto;
             forwarded headers per trusted_proxies: x-real-ip always set by
-            ferryman; forwarded / x-forwarded-host stripped for untrusted
-            peers; x-forwarded-proto from the connection unless trusted
+            ferryman; forwarded / x-forwarded-host / -ssl / -scheme / -prefix /
+            -port stripped for untrusted peers (port set from the listener); x-forwarded-proto from the connection unless trusted
        6. client.request(); body wrapped in RequestBody (idle timeout
           between frames, signals EOS). upstream_timeout (to response
           headers) starts at body EOS, or immediately if bodyless

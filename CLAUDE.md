@@ -21,7 +21,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 
 ## Invariants (don't regress)
 
-- Request path order in `handle_inner`: `path::bad_path` -> `path::ambiguous_route` -> `bad_host` (single bare `host[:port]` when no URI authority; >1 Host always 400) -> `lookup` -> admission. `local_health_path` is answered first. Path checks take the RAW path and run before any breaker ticket; the forwarded path is never rewritten.
+- Request path order in `handle_inner`: `path::bad_path` -> `path::ambiguous_route` -> `bad_host` (single bare `host[:port]`, valid port, present on 1.1, when no URI authority; >1 Host always 400) -> `lookup` -> admission. `local_health_path` is answered first. Path checks take the RAW path and run before any breaker ticket; the forwarded path is never rewritten.
 - Breaker results go through `Admission` tickets: only `Probe` may leave open/half-open; `Normal` results only count while closed.
 - Health loop reports as `Probe`; a probe success while closed is a no-op (must not reset request failure counts). A probe failure while Open is a no-op too (no `opened_at` re-stamp); only HalfOpen -> Open stamps, so a broken health endpoint can't starve the request-path half-open probe.
 - `release(Probe)` only re-arms the probe slot while HalfOpen, at most once per cooldown, and never changes state or counts; client-side failures (408, client body error, URI-rebuild 502) `release`, they never `record_*`.

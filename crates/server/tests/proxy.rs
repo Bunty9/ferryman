@@ -1235,7 +1235,10 @@ async fn bad_host_headers_get_400_and_never_reach_upstream() {
         s.read_to_end(&mut out).await.unwrap();
         String::from_utf8_lossy(&out).into_owned()
     };
-    let bad: [Vec<&[u8]>; 5] = [
+    let bad: [Vec<&[u8]>; 8] = [
+        vec![b"a:b"],
+        vec![b"x:99999"],
+        vec![b"*"],
         vec![b"a.example, b.example"],
         vec![b"u@x"],
         vec![b"x/y"],
@@ -1251,4 +1254,34 @@ async fn bad_host_headers_get_400_and_never_reach_upstream() {
     let out = get(vec![b"example.com:8080"], "connection: host\r\n").await;
     assert!(out.starts_with("HTTP/1.1 200"), "{out}");
     assert!(out.contains("host: example.com:8080"), "{out}");
+
+    // Missing Host: HTTP/1.1 is 400, HTTP/1.0 is forwarded.
+    let raw = |req: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    };
+    let before = hits.load(Ordering::SeqCst);
+    let out = raw("GET /api/x HTTP/1.1\r\nconnection: close\r\n\r\n").await;
+    assert!(
+        out.starts_with("HTTP/1.1 400") && out.ends_with("bad host\n"),
+        "{out}"
+    );
+    let out = raw("GET /api/x HTTP/1.0\r\n\r\n").await;
+    assert!(out.contains(" 200"), "{out}");
+    // Absolute form: authority wins over a bad Host, but duplicates are 400.
+    let out =
+        raw("GET http://a.example/api/x HTTP/1.1\r\nhost: u@x\r\nconnection: close\r\n\r\n").await;
+    assert!(
+        out.contains(" 200") && out.contains("host: a.example"),
+        "{out}"
+    );
+    let out = raw(
+        "GET http://a.example/api/x HTTP/1.1\r\nhost: a\r\nhost: b\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    assert_eq!(hits.load(Ordering::SeqCst), before + 2);
 }

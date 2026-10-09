@@ -320,7 +320,7 @@ where
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
     }
 
-    if bad_host(req.headers(), req.uri()) {
+    if bad_host(req.headers(), req.uri(), req.version()) {
         record(started, "none", "none", 400);
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad host\n"));
     }
@@ -548,20 +548,37 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 /// More than one `Host`, or (when the request target has no authority, so the
-/// header is what gets forwarded) one that is empty or not a bare
-/// `host[:port]` (userinfo, list, path, obs-text). h2 `:authority` / absolute
-/// form still win over `Host`, which is then not judged beyond the count.
-fn bad_host(headers: &HeaderMap, uri: &http::Uri) -> bool {
+/// header is what gets forwarded) a missing one on HTTP/1.1 or one that is
+/// empty, `*`, or not a bare `host[:port]` (userinfo, list, path, obs-text,
+/// port not 1-5 digits <= 65535). h2 `:authority` / absolute form still win
+/// over `Host`, which is then not judged beyond the count. HTTP/1.0 without
+/// `Host` stays allowed.
+fn bad_host(headers: &HeaderMap, uri: &http::Uri, version: http::Version) -> bool {
     let mut it = headers.get_all(header::HOST).iter();
     match (it.next(), it.next()) {
-        (None, _) => false,
-        (Some(v), None) => {
-            uri.authority().is_none()
-                && (v
-                    .as_bytes()
-                    .iter()
-                    .any(|b| matches!(b, b'@' | b',' | b'/') || *b >= 0x80)
-                    || http::uri::Authority::try_from(v.as_bytes()).is_err())
+        (None, _) => uri.authority().is_none() && version == http::Version::HTTP_11,
+        (Some(v), None) => uri.authority().is_none() && !plain_authority(v.as_bytes()),
+        _ => true,
+    }
+}
+
+fn plain_authority(b: &[u8]) -> bool {
+    if b == b"*"
+        || b.iter()
+            .any(|c| matches!(c, b'@' | b',' | b'/') || *c >= 0x80)
+    {
+        return false;
+    }
+    if http::uri::Authority::try_from(b).is_err() {
+        return false;
+    }
+    // A port part after the host (not inside `[v6]`) must be 1-5 digits <= 65535.
+    match b.iter().rposition(|c| *c == b':') {
+        Some(i) if !b[i..].contains(&b']') => {
+            let p = &b[i + 1..];
+            !p.is_empty()
+                && p.iter().all(u8::is_ascii_digit)
+                && std::str::from_utf8(p).is_ok_and(|p| p.parse::<u16>().is_ok())
         }
         _ => true,
     }
@@ -750,18 +767,43 @@ mod tests {
             }
             m
         };
+        use http::Version as V;
         let root: http::Uri = "/".parse().unwrap();
-        for bad in [&b"a, b"[..], b"u@x", b"x/y", b"", b"a\xe9.example"] {
-            assert!(bad_host(&h(&[bad]), &root), "{bad:?}");
+        for bad in [
+            &b"a, b"[..],
+            b"u@x",
+            b"x/y",
+            b"",
+            b"a\xe9.example",
+            b"a:b",
+            b"x:99999",
+            b"x:",
+            b"[::1]:",
+            b"[::1]:x",
+            b"x:+80",
+            b"*",
+        ] {
+            assert!(bad_host(&h(&[bad]), &root, V::HTTP_11), "{bad:?}");
         }
-        assert!(bad_host(&h(&[b"a", b"b"]), &root));
-        for ok in ["a.example", "a.example:8443", "[::1]:8443", "LOCALHOST"] {
-            assert!(!bad_host(&h(&[ok.as_bytes()]), &root), "{ok}");
+        assert!(bad_host(&h(&[b"a", b"b"]), &root, V::HTTP_11));
+        for ok in [
+            "a.example",
+            "a.example:8443",
+            "a:65535",
+            "[::1]",
+            "[::1]:80",
+            "[::1]:8443",
+            "LOCALHOST",
+        ] {
+            assert!(!bad_host(&h(&[ok.as_bytes()]), &root, V::HTTP_11), "{ok}");
         }
-        assert!(!bad_host(&HeaderMap::new(), &root));
+        // No Host: 1.1 is bad, 1.0 allowed.
+        assert!(bad_host(&HeaderMap::new(), &root, V::HTTP_11));
+        assert!(!bad_host(&HeaderMap::new(), &root, V::HTTP_10));
         let abs: http::Uri = "http://a.example/".parse().unwrap();
-        assert!(!bad_host(&h(&[b"u@x"]), &abs));
-        assert!(bad_host(&h(&[b"a", b"b"]), &abs));
+        assert!(!bad_host(&HeaderMap::new(), &abs, V::HTTP_11));
+        assert!(!bad_host(&h(&[b"u@x"]), &abs, V::HTTP_11));
+        assert!(bad_host(&h(&[b"a", b"b"]), &abs, V::HTTP_11));
     }
 
     #[test]
@@ -772,6 +814,12 @@ mod tests {
         m.insert("x-other", HeaderValue::from_static("1"));
         strip_hop_by_hop(&mut m);
         assert!(m.get("host").is_some() && m.get("x-other").is_none());
+        // Same on a response strip.
+        let mut r = HeaderMap::new();
+        r.insert("host", HeaderValue::from_static("upstream"));
+        r.insert("connection", HeaderValue::from_static("host"));
+        strip_hop_by_hop(&mut r);
+        assert!(r.get("host").is_some() && r.get("connection").is_none());
     }
 
     fn tp(c: &[&str]) -> TrustedProxies {

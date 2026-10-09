@@ -12,10 +12,12 @@ and `ferryman` are released together with the same version.
 - Host hardening (low severity, defence in depth): when the request target
   has no authority, the `Host` header is now validated before routing and
   must be a single bare `host[:port]` (no userinfo, comma list, path,
-  obs-text, or empty value); more than one `Host` is rejected even when an
+  obs-text, empty value, `*`, or a port that is not 1-5 digits <= 65535); an HTTP/1.1
+  request with neither `Host` nor an authority is rejected too (HTTP/1.0
+  without `Host` is still forwarded); more than one `Host` is rejected even when an
   authority is present. Failures are `400 bad host` (route/upstream `none`,
   no breaker ticket). `host` named in `Connection` is no longer stripped
-  from requests or responses. Migration: clients sending malformed or
+  from requests or responses. Migration: clients sending malformed, missing (1.1) or
   duplicate `Host` now get 400. h2 `:authority` and absolute-form targets
   still take precedence over `Host`; `local_health_path` is answered before
   this check.

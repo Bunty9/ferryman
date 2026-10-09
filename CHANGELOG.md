@@ -23,6 +23,12 @@ and `ferryman` are released together with the same version.
   threshold 3, cooldown 30 s. `Breaker::new` rejects a cooldown under 1 ms
   and a zero threshold. See `examples/embedded` (`guarded.rs`).
 
+- `Breaker::release` / `Upstream::release`: hand back a ticket that ended
+  without a verdict on the upstream. A `Probe` re-arms the half-open slot
+  immediately; `Normal` is a no-op. `ferryman` calls it on client-side
+  failures (408, client body error, bad request) so a client hanging up
+  while holding the half-open probe no longer blocks recovery for a cooldown.
+
 ### Changed (breaking)
 
 - `CircuitState` and `Admission` are now `#[non_exhaustive]`.

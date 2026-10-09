@@ -310,6 +310,21 @@ impl Breaker {
             .is_ok()
     }
 
+    /// Hand back a ticket whose request ended without a verdict on the
+    /// upstream (client hung up, bad request, timeout that isn't the
+    /// upstream's fault). A `Probe` re-arms the half-open slot at once, so
+    /// the next caller can probe instead of waiting out another cooldown; a
+    /// `Normal` ticket is a no-op. Never changes the state or the failure
+    /// count. Call at most once per ticket and not after `record_*` for it
+    /// (harmless then: it only acts while the circuit is half-open).
+    pub fn release(&self, admission: Admission) {
+        if admission == Admission::Probe && self.state() == CircuitState::HalfOpen {
+            let cooldown = self.cooldown_millis.load(Ordering::Relaxed);
+            self.opened_at_millis
+                .store(now_millis().saturating_sub(cooldown), Ordering::Release);
+        }
+    }
+
     pub fn record_success(&self, admission: Admission) {
         match admission {
             Admission::Probe => {
@@ -500,6 +515,41 @@ mod tests {
         assert_eq!(b.try_acquire(), Some(P), "cooldown must have elapsed");
         b.record_success(P);
         assert_eq!(b.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn release_probe_rearms_slot_immediately() {
+        let b = breaker(10_000, 1);
+        b.record_failure(N);
+        b.reconfigure(Duration::from_millis(200), 1);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(b.try_acquire(), Some(P));
+        assert_eq!(b.try_acquire(), None, "probe is out");
+        b.release(P);
+        assert_eq!(b.state(), CircuitState::HalfOpen, "state unchanged");
+        assert_eq!(b.try_acquire(), Some(P), "slot re-armed at once");
+        assert_eq!(b.try_acquire(), None);
+    }
+
+    #[test]
+    fn release_normal_and_stale_release_are_noops() {
+        // The monotonic base starts at first use; make `now` exceed the
+        // cooldown so a wrongly re-armed slot cannot hide behind saturation.
+        thread::sleep(Duration::from_millis(250));
+        let b = breaker(200, 2);
+        b.record_failure(N);
+        b.release(N);
+        b.release(P); // closed: nothing
+        assert_eq!(b.state(), CircuitState::Closed);
+        b.record_failure(N); // opens (2nd failure)
+        assert_eq!(b.state(), CircuitState::Open);
+        b.release(N);
+        b.release(P); // open: must not shorten the cooldown
+        assert_eq!(b.try_acquire(), None);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(b.try_acquire(), Some(P));
+        b.release(N); // no-op: slot stays taken
+        assert_eq!(b.try_acquire(), None);
     }
 
     #[test]

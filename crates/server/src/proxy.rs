@@ -327,6 +327,7 @@ where
     parts.uri = match http::Uri::from_parts(up_parts) {
         Ok(uri) => uri,
         Err(e) => {
+            upstream.release(admission);
             record(started, &route_label, &upstream.name, 502);
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
@@ -389,6 +390,8 @@ where
             // upstream's fault; the legacy path can't tell for bodies.
             if counts_timeout {
                 upstream.record_failure(admission);
+            } else {
+                upstream.release(admission);
             }
             record(started, &route_label, &upstream.name, 504);
             Ok(error_response(
@@ -398,6 +401,7 @@ where
         }
         Some(Err(e)) if is_body_idle_timeout(&e) => {
             // The client stalled or over-ran its upload: 408, no breaker effect.
+            upstream.release(admission);
             tracing::debug!("client request body idle timeout");
             record(started, &route_label, &upstream.name, 408);
             Ok(error_response(
@@ -408,6 +412,7 @@ where
         Some(Err(e)) if is_client_body_error(&e) => {
             // The client's request body failed (e.g. it hung up mid-upload).
             // Not the upstream's fault, so the breaker stays out of it.
+            upstream.release(admission);
             tracing::debug!(error = %e, "client request body failed");
             record(started, &route_label, &upstream.name, 400);
             Ok(error_response(

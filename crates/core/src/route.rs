@@ -70,6 +70,11 @@ impl Upstream {
         self.breaker.try_acquire()
     }
 
+    /// See [`Breaker::release`].
+    pub fn release(&self, admission: Admission) {
+        self.breaker.release(admission)
+    }
+
     pub fn record_success(&self, admission: Admission) {
         self.breaker.record_success(admission)
     }

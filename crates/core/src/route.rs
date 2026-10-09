@@ -5,9 +5,10 @@
 //! tens of routes typical of a self-hosted edge, a linear scan beats a trie
 //! on cache behaviour and is trivial to reason about.
 
-use crate::breaker::Breaker;
 pub use crate::breaker::{Admission, CircuitState};
+use crate::breaker::{Breaker, BreakerConfig};
 use crate::proxies::TrustedProxies;
+use crate::Error;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,15 +26,15 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn new(uri: http::Uri, cooldown: Duration, failure_threshold: u32) -> Self {
+    /// Create an upstream with its own closed breaker. Fails with
+    /// [`Error::InvalidBreakerConfig`] if `breaker` has a cooldown under
+    /// 1 ms or a zero threshold. The breaker is labelled with the upstream's
+    /// `host:port` name (`breaker.name` is ignored) and writes the
+    /// `ferryman_*` gauges.
+    pub fn new(uri: http::Uri, breaker: BreakerConfig) -> Result<Self, Error> {
         let name = upstream_name(&uri);
-        let breaker = Arc::new(Breaker::unchecked(
-            Some(name.clone()),
-            true,
-            cooldown,
-            failure_threshold,
-        ));
-        Self { uri, name, breaker }
+        let breaker = Arc::new(Breaker::for_upstream(name.clone(), &breaker)?);
+        Ok(Self { uri, name, breaker })
     }
 
     /// May this request be sent to the upstream right now? Returns the
@@ -201,11 +202,7 @@ mod tests {
     use super::*;
 
     fn upstream() -> Upstream {
-        Upstream::new(
-            "http://localhost:8001".parse().unwrap(),
-            Duration::from_secs(30),
-            3,
-        )
+        Upstream::new("http://localhost:8001".parse().unwrap(), Default::default()).unwrap()
     }
 
     fn table(prefixes: &[&str]) -> RouteTable {

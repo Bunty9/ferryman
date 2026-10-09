@@ -10,6 +10,7 @@
 //! move the breaker out of open/half-open; results of ordinary requests that
 //! finish after the circuit opened are late news and are ignored.
 
+use crate::Error;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -127,12 +128,16 @@ impl BreakerConfig {
     }
 
     /// Check the invariants [`Breaker::new`] relies on.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), Error> {
         if self.failure_threshold < 1 {
-            anyhow::bail!("failure_threshold must be >= 1, got 0");
+            return Err(Error::InvalidBreakerConfig {
+                reason: "failure_threshold must be >= 1, got 0".into(),
+            });
         }
         if self.cooldown < Duration::from_millis(1) {
-            anyhow::bail!("cooldown must be >= 1ms, got {:?}", self.cooldown);
+            return Err(Error::InvalidBreakerConfig {
+                reason: format!("cooldown must be >= 1ms, got {:?}", self.cooldown),
+            });
         }
         Ok(())
     }
@@ -160,7 +165,7 @@ impl BreakerConfig {
 ///     Admission::Probe => {}
 ///     _ => {}
 /// }
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), ferryman_core::Error>(())
 /// ```
 pub struct Breaker {
     name: Option<String>,
@@ -193,7 +198,7 @@ impl std::fmt::Debug for Breaker {
 
 impl Breaker {
     /// Create a closed breaker. Fails if `config` is invalid.
-    pub fn new(config: BreakerConfig) -> anyhow::Result<Self> {
+    pub fn new(config: BreakerConfig) -> Result<Self, Error> {
         config.validate()?;
         Ok(Self::unchecked(
             config.name,
@@ -203,7 +208,18 @@ impl Breaker {
         ))
     }
 
-    /// No validation: `Upstream::new` has always accepted any values.
+    /// Validated breaker that writes the per-upstream gauges.
+    pub(crate) fn for_upstream(name: String, config: &BreakerConfig) -> Result<Self, Error> {
+        config.validate()?;
+        Ok(Self::unchecked(
+            Some(name),
+            true,
+            config.cooldown,
+            config.failure_threshold,
+        ))
+    }
+
+    /// No validation; callers validate (or, in tests, want odd values).
     pub(crate) fn unchecked(
         name: Option<String>,
         gauges: bool,

@@ -32,11 +32,14 @@ fn bits(ip: IpAddr) -> (u128, u8) {
 
 impl TrustedProxies {
     /// Parse CIDR strings. Errors name the offending entry.
-    pub fn parse<S: AsRef<str>>(cidrs: &[S]) -> anyhow::Result<Self> {
+    pub fn parse<S: AsRef<str>>(cidrs: &[S]) -> Result<Self, crate::Error> {
         let mut nets = Vec::with_capacity(cidrs.len());
         for raw in cidrs {
             let raw = raw.as_ref();
-            let bad = |why: &str| anyhow::anyhow!("trusted_proxies entry {raw:?}: {why}");
+            let bad = |why: &str| crate::Error::InvalidCidr {
+                entry: raw.to_string(),
+                reason: why.to_string(),
+            };
             let (addr, prefix) = match raw.split_once('/') {
                 Some((a, p)) => (a, Some(p)),
                 None => (raw, None),

@@ -16,7 +16,7 @@ pub enum GuardedError {
 
 /// Breaker for calls to one downstream: opens after 3 consecutive failures,
 /// retries after 30 s (the library defaults, spelled out).
-pub fn client_breaker(name: &str) -> anyhow::Result<Breaker> {
+pub fn client_breaker(name: &str) -> Result<Breaker, ferryman_core::Error> {
     Breaker::new(
         BreakerConfig::default()
             .with_failure_threshold(3)

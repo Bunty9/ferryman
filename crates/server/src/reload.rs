@@ -91,12 +91,14 @@ fn watch_dir(config_path: &Path) -> PathBuf {
 /// on error, having already logged the full error chain.
 fn reload_once(path: &Path, table: &SharedTable) -> Option<RouteTable> {
     let cfg = load_config(path)
+        .map_err(anyhow::Error::from)
         .inspect_err(|e| {
             tracing::error!(path = %path.display(), error = %format!("{e:#}"), "config reload failed; keeping old table")
         })
         .ok()?;
     let prev = table.load_full();
     build_table(cfg, Some(&prev))
+        .map_err(anyhow::Error::from)
         .inspect_err(|e| {
             tracing::error!(path = %path.display(), error = %format!("{e:#}"), "config reload failed; keeping old table")
         })

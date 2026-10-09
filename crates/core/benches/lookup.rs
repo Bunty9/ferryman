@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ferryman_core::{Route, RouteTable, Upstream};
+use ferryman_core::{BreakerConfig, Route, RouteTable, Upstream};
 use std::time::Duration;
 
 fn build_table() -> RouteTable {
@@ -8,9 +8,9 @@ fn build_table() -> RouteTable {
             prefix: format!("/svc-{i}"),
             upstream: Upstream::new(
                 format!("http://localhost:{}", 9000 + i).parse().unwrap(),
-                Duration::from_secs(30),
-                3,
-            ),
+                BreakerConfig::default(),
+            )
+            .unwrap(),
         })
         .collect();
     // A deep, specific prefix nested under one of the shallow ones, so
@@ -20,9 +20,9 @@ fn build_table() -> RouteTable {
         prefix: "/svc-25/api/v1/users".to_string(),
         upstream: Upstream::new(
             "http://localhost:9999".parse().unwrap(),
-            Duration::from_secs(30),
-            3,
-        ),
+            BreakerConfig::default(),
+        )
+        .unwrap(),
     });
     RouteTable::new(routes, Duration::from_secs(30))
 }

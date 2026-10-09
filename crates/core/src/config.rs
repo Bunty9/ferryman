@@ -5,9 +5,10 @@
 //! events, calls [`build_table`], and atomically swaps the result into the
 //! `SharedTable`.
 
+use crate::error::Error;
 use crate::proxies::TrustedProxies;
 use crate::route::{Route, RouteTable, Upstream};
-use anyhow::{bail, Context};
+use crate::BreakerConfig;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -90,10 +91,15 @@ pub struct RouteToml {
 
 /// Read and parse the TOML config at `path`. Shared by the server's initial
 /// boot and its hot-reload watcher so both get the same error context.
-pub fn load_config(path: &Path) -> anyhow::Result<ConfigToml> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config file {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
+pub fn load_config(path: &Path) -> Result<ConfigToml, Error> {
+    let raw = std::fs::read_to_string(path).map_err(|source| Error::ReadConfig {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&raw).map_err(|source| Error::Toml {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Build a [`RouteTable`] from a parsed [`ConfigToml`], validating routes
@@ -101,12 +107,12 @@ pub fn load_config(path: &Path) -> anyhow::Result<ConfigToml> {
 /// (matched by `host:port` name) share its circuit breaker, so a hot reload
 /// neither resets an open circuit nor strands results from in-flight
 /// requests on an orphaned breaker. Fails without side effects.
-pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result<RouteTable> {
+pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTable, Error> {
     if cfg.failure_threshold < 1 {
-        bail!(
-            "failure_threshold must be >= 1, got {}",
-            cfg.failure_threshold
-        );
+        return Err(Error::InvalidConfig {
+            key: "failure_threshold",
+            reason: format!("must be >= 1, got {}", cfg.failure_threshold),
+        });
     }
     for (key, v) in [
         ("health_interval_secs", cfg.health_interval_secs),
@@ -120,10 +126,16 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
         ("request_body_timeout_secs", cfg.request_body_timeout_secs),
     ] {
         if v == 0 {
-            bail!("{key} must be >= 1");
+            return Err(Error::InvalidConfig {
+                key,
+                reason: "must be >= 1".into(),
+            });
         }
         if v > MAX_SECS {
-            bail!("{key} must be <= {MAX_SECS}, got {v}");
+            return Err(Error::InvalidConfig {
+                key,
+                reason: format!("must be <= {MAX_SECS}, got {v}"),
+            });
         }
     }
     let trusted_proxies = TrustedProxies::parse(&cfg.trusted_proxies)?;
@@ -143,59 +155,67 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
 
     for r in cfg.routes {
         if !r.prefix.starts_with('/') {
-            bail!("route prefix {:?} must start with '/'", r.prefix);
+            return Err(Error::InvalidPrefix { prefix: r.prefix });
         }
         if !seen_prefixes.insert(r.prefix.clone()) {
-            bail!("duplicate route prefix {:?}", r.prefix);
+            return Err(Error::DuplicatePrefix { prefix: r.prefix });
         }
 
-        let uri: http::Uri = r.upstream.parse().with_context(|| {
-            format!(
-                "route {:?}: invalid upstream URI {:?}",
-                r.prefix, r.upstream
-            )
-        })?;
+        let bad = |reason: String, source| Error::InvalidUpstream {
+            route: r.prefix.clone(),
+            upstream: r.upstream.clone(),
+            reason,
+            source,
+        };
+        let uri: http::Uri = r
+            .upstream
+            .parse()
+            .map_err(|e| bad(format!("invalid upstream URI {:?}", r.upstream), Some(e)))?;
 
         match uri.scheme_str() {
             Some("http") => {}
-            Some(other) => bail!(
-                "route {:?}: upstream {:?} has scheme {:?} — https upstreams are not supported",
-                r.prefix,
-                r.upstream,
-                other
-            ),
-            None => bail!(
-                "route {:?}: upstream {:?} has no scheme (expected e.g. http://host:port)",
-                r.prefix,
-                r.upstream
-            ),
+            Some(other) => {
+                return Err(bad(
+                    format!(
+                        "upstream {:?} has scheme {:?} — https upstreams are not supported",
+                        r.upstream, other
+                    ),
+                    None,
+                ))
+            }
+            None => {
+                return Err(bad(
+                    format!(
+                        "upstream {:?} has no scheme (expected e.g. http://host:port)",
+                        r.upstream
+                    ),
+                    None,
+                ))
+            }
         }
         // Also catches an empty IPv6 literal (`http://[]:80`).
         if uri
             .host()
             .is_none_or(|h| h.trim_matches(['[', ']']).is_empty())
         {
-            bail!(
-                "route {:?}: upstream {:?} has no host",
-                r.prefix,
-                r.upstream
-            );
+            return Err(bad(format!("upstream {:?} has no host", r.upstream), None));
         }
         if let Some(pq) = uri.path_and_query() {
             if pq.query().is_some() {
-                bail!(
-                    "route {:?}: upstream {:?} must not include a query string",
-                    r.prefix,
-                    r.upstream
-                );
+                return Err(bad(
+                    format!("upstream {:?} must not include a query string", r.upstream),
+                    None,
+                ));
             }
             if !pq.path().is_empty() && pq.path() != "/" {
-                bail!(
-                    "route {:?}: upstream {:?} must not include a path (got {:?})",
-                    r.prefix,
-                    r.upstream,
-                    pq.path()
-                );
+                return Err(bad(
+                    format!(
+                        "upstream {:?} must not include a path (got {:?})",
+                        r.upstream,
+                        pq.path()
+                    ),
+                    None,
+                ));
             }
         }
 
@@ -205,42 +225,50 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
             .map(Duration::from_secs)
             .unwrap_or(default_cooldown);
         if cooldown.is_zero() {
-            bail!("route {:?}: cooldown_secs must be >= 1", r.prefix);
+            return Err(Error::InvalidCooldown {
+                route: r.prefix,
+                reason: "must be >= 1".into(),
+            });
         }
         if cooldown.as_secs() > MAX_SECS {
-            bail!(
-                "route {:?}: cooldown_secs must be <= {MAX_SECS}, got {}",
-                r.prefix,
-                cooldown.as_secs()
-            );
+            return Err(Error::InvalidCooldown {
+                route: r.prefix,
+                reason: format!("must be <= {MAX_SECS}, got {}", cooldown.as_secs()),
+            });
         }
         let first = *cooldown_by_name.entry(name.clone()).or_insert(cooldown);
         if first != cooldown {
-            bail!(
-                "route {:?}: upstream {name} is shared with another route but has a \
-                 different cooldown ({}s vs {}s); routes to one upstream share one breaker",
-                r.prefix,
-                cooldown.as_secs(),
-                first.as_secs()
-            );
+            return Err(Error::ConflictingCooldown {
+                route: r.prefix,
+                upstream: name,
+                cooldown_secs: cooldown.as_secs(),
+                other_secs: first.as_secs(),
+            });
         }
         validated.push((r.prefix, uri, name, cooldown));
     }
 
     let mut upstreams_by_name: HashMap<String, Upstream> = HashMap::new();
-    let routes = validated
-        .into_iter()
-        .map(|(prefix, uri, name, cooldown)| {
-            let upstream = upstreams_by_name
-                .entry(name)
-                .or_insert_with_key(|name| match prev_by_name.get(name.as_str()) {
+    let mut routes = Vec::with_capacity(validated.len());
+    for (prefix, uri, name, cooldown) in validated {
+        let upstream = match upstreams_by_name.get(&name) {
+            Some(u) => u.clone(),
+            None => {
+                let u = match prev_by_name.get(name.as_str()) {
                     Some(prev_u) => prev_u.reuse(cooldown, cfg.failure_threshold),
-                    None => Upstream::new(uri, cooldown, cfg.failure_threshold),
-                })
-                .clone();
-            Route { prefix, upstream }
-        })
-        .collect();
+                    None => Upstream::new(
+                        uri,
+                        BreakerConfig::default()
+                            .with_cooldown(cooldown)
+                            .with_failure_threshold(cfg.failure_threshold),
+                    )?,
+                };
+                upstreams_by_name.insert(name, u.clone());
+                u
+            }
+        };
+        routes.push(Route { prefix, upstream });
+    }
 
     Ok(RouteTable::new(routes, upstream_timeout)
         .with_keepalive_timeout(Duration::from_secs(cfg.keepalive_timeout_secs))
@@ -410,7 +438,7 @@ mod tests {
         assert_eq!(t.upstreams().count(), 1);
     }
 
-    fn parse(extra: &str) -> anyhow::Result<RouteTable> {
+    fn parse(extra: &str) -> Result<RouteTable, Error> {
         let raw = format!("{extra}\n[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n");
         build_table(toml::from_str(&raw).unwrap(), None)
     }

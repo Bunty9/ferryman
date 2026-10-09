@@ -3,7 +3,7 @@
 //! race a thread-local subscriber.
 
 use ferryman_core::Admission::{Normal, Probe};
-use ferryman_core::Upstream;
+use ferryman_core::{BreakerConfig, Upstream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,9 +29,11 @@ fn transitions_log_once_and_noops_do_not() {
         .init();
     let u = Upstream::new(
         "http://test:1".parse().unwrap(),
-        Duration::from_millis(200),
-        1,
-    );
+        BreakerConfig::default()
+            .with_cooldown(Duration::from_millis(200))
+            .with_failure_threshold(1),
+    )
+    .unwrap();
     u.record_failure(Normal); // closed -> open
     u.record_failure(Normal); // late normal result: no change
     u.record_failure(Probe); // probe failure while open: re-stamp only

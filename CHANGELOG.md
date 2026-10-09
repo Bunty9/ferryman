@@ -19,6 +19,26 @@ and `ferryman` are released together with the same version.
 
 - `CircuitState` and `Admission` are now `#[non_exhaustive]`.
   **Migration:** add a `_ =>` arm to any `match` on either enum.
+- `ferryman_core::Error` (new, `#[non_exhaustive]`, `std::error::Error +
+  Send + Sync + 'static`) replaces `anyhow::Error` in every public
+  `ferryman-core` signature: `build_table`, `load_config`,
+  `TrustedProxies::parse`, `Breaker::new`, `BreakerConfig::validate`.
+  Variants are matchable by category (`InvalidConfig`, `InvalidPrefix`,
+  `DuplicatePrefix`, `InvalidUpstream`, `InvalidCooldown`,
+  `ConflictingCooldown`, `InvalidCidr`, `InvalidBreakerConfig`,
+  `ReadConfig`, `Toml`). `Display` messages are unchanged; `ReadConfig` and
+  `Toml` expose the cause via `source()`, so print the chain with
+  `anyhow::Error::from(e)` and `{:#}`. `ferryman-core` no longer depends on
+  `anyhow` (it now uses `thiserror`). **Migration:** `?` into
+  `anyhow::Result` keeps working; code naming `anyhow` types for these
+  results, or relying on `{:#}` of the raw error to show the cause, must
+  change. `ferryman::serve` still returns `anyhow::Result<()>`.
+- `Upstream::new(uri, BreakerConfig) -> Result<Upstream, Error>` replaces
+  `Upstream::new(uri, cooldown, failure_threshold) -> Upstream` and now
+  rejects a cooldown under 1 ms or a zero threshold
+  (`Error::InvalidBreakerConfig`). **Migration:**
+  `Upstream::new(uri, BreakerConfig::default().with_cooldown(c).with_failure_threshold(n))?`.
+  `BreakerConfig::name` is ignored here (the breaker is named `host:port`).
 
 ## [0.2.3] - 2026-10-05
 

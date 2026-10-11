@@ -10,7 +10,7 @@ per request.
 | Header | Untrusted peer | Trusted peer |
 | --- | --- | --- |
 | `X-Forwarded-Proto` | set from the connection | incoming kept (rightmost value); set from the connection if absent |
-| `X-Forwarded-Port` | client values stripped; set to the listener's port | rightmost incoming value kept if a valid port, else the listener's port |
+| `X-Forwarded-Port` | client values stripped; none added | rightmost incoming value kept if a valid port, else none |
 | `X-Forwarded-For` | peer IP appended (`xff = "replace"`: only the peer) | peer IP appended (`xff = "replace"`: only the derived client) |
 | `X-Real-IP` | overwritten with the peer IP | always overwritten: the rightmost `X-Forwarded-For` entry that is not a trusted proxy (`ip:port` / `[v6]:port` tolerated; an unparsable entry stops the walk), else the peer |
 | `Forwarded` | stripped; with `forwarded_header = true` a fresh `for=peer;proto;host` element | kept; with `forwarded_header = true` the element is appended |
@@ -29,9 +29,9 @@ Request headers that differ from a trust-governed header only by `_` for `-`
 - In `Forwarded`, `for=` is the connecting peer, `proto=` is this hop's
   connection scheme and `host=` is the client's own host (URI authority, else
   `Host`), also with `rewrite_host = true`.
-- `X-Forwarded-Port` is never derived from `Host`. Without a known listener
-  port (the deprecated `proxy::handle`, or `handle_streaming` called
-  directly) it is omitted for untrusted peers.
+- ferryman never writes `X-Forwarded-Port`: not from the listener port (with
+  port mapping such as 80 to 8080 that would make apps build `:8080` URLs) and
+  not from `Host`. It is only passed through from a trusted peer.
 - If `trusted_proxies` is empty and a request arrives from a private,
   loopback or link-local peer, ferryman logs one warning per process
   suggesting `trusted_proxies`, in case it sits behind a proxy or load

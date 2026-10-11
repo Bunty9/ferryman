@@ -258,26 +258,11 @@ pub async fn handle_streaming(
     proto: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    handle_streaming_at(table, client, peer, None, proto, req).await
-}
-
-/// [`handle_streaming`] plus the listener's local port, used for
-/// `X-Forwarded-Port`. `serve` calls this; without a port
-/// (`handle_streaming`) `X-Forwarded-Port` is omitted for untrusted peers
-/// (never derived from the client's `Host`).
-pub async fn handle_streaming_at(
-    table: SharedTable,
-    client: StreamingClient,
-    peer: SocketAddr,
-    local_port: Option<u16>,
-    proto: &'static str,
-    req: Request<Incoming>,
-) -> Result<Response<ResponseBody>, Infallible> {
     let wrap = |body, idle, total| {
         let (b, eos) = RequestBody::new(body, idle, total);
         (b, Some(eos))
     };
-    handle_inner(table, client, peer, local_port, proto, req, wrap).await
+    handle_inner(table, client, peer, proto, req, wrap).await
 }
 
 /// The 0.2.2 handler, kept for compatibility: `upstream_timeout_secs` covers
@@ -297,7 +282,7 @@ pub async fn handle(
     proto: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    handle_inner(table, client, peer, None, proto, req, |b, _, _| (b, None)).await
+    handle_inner(table, client, peer, proto, req, |b, _, _| (b, None)).await
 }
 
 /// Per-request state for the access log line (`None` = `access_log = false`).
@@ -376,7 +361,6 @@ async fn handle_inner<B>(
     table: SharedTable,
     client: Client<HttpConnector, B>,
     peer: SocketAddr,
-    local_port: Option<u16>,
     proto: &'static str,
     mut req: Request<Incoming>,
     wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
@@ -432,7 +416,7 @@ where
         tracing::Span::none()
     };
     let cx = Cx { started, log };
-    let Ok(mut resp) = handle_core(table, client, peer, local_port, proto, req, wrap, &cx)
+    let Ok(mut resp) = handle_core(table, client, peer, proto, req, wrap, &cx)
         .instrument(span)
         .await;
     // Only with `request_id = true`; a client-supplied id is never echoed otherwise.
@@ -453,7 +437,6 @@ async fn handle_core<B>(
     table: Arc<RouteTable>,
     client: Client<HttpConnector, B>,
     peer: SocketAddr,
-    local_port: Option<u16>,
     proto: &'static str,
     req: Request<Incoming>,
     wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
@@ -624,7 +607,6 @@ where
     apply_forwarded_headers(
         &mut parts.headers,
         peer.ip(),
-        local_port,
         proto,
         client_host.as_deref(),
         &FwdCfg {
@@ -767,7 +749,8 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     for name in named {
         // The proxy relies on `Host`; a client must not delete it by naming
         // it in `Connection` (applies to the response strip too).
-        if name == header::HOST {
+        // `ensure_request_id` ran first; the generated id must survive too.
+        if name == header::HOST || name == "x-request-id" {
             continue;
         }
         headers.remove(name);
@@ -1006,15 +989,15 @@ fn forwarded_node(ip: IpAddr) -> String {
 /// Decide the forwarding headers the upstream sees (pure; unit-tested).
 ///
 /// Untrusted peer (every peer when `trusted_proxies` is empty): `x-forwarded-proto`
-/// is set from the connection, `x-forwarded-port` from the listener port,
+/// is set from the connection,
 /// `x-forwarded-for` gets the peer appended, `x-real-ip` is overwritten with
-/// the peer, and client `forwarded`, `x-forwarded-host`, `-ssl`, `-scheme`
-/// and `-prefix` are stripped.
+/// the peer, and client `forwarded`, `x-forwarded-host`, `-ssl`, `-scheme`,
+/// `-prefix` and `-port` are stripped. `x-forwarded-port` is never synthesised.
 ///
 /// Trusted peer: incoming `x-forwarded-proto` / `x-forwarded-port`
 /// (rightmost value, port must be valid), `x-forwarded-host`, `-ssl`,
 /// `-scheme`, `-prefix` and `forwarded` are kept; a missing or invalid proto
-/// or port comes from the connection / listener. `x-real-ip` is always
+/// comes from the connection, a missing or invalid port is dropped. `x-real-ip` is always
 /// overwritten with the rightmost `x-forwarded-for` entry that is not a
 /// trusted proxy (`:port` suffixes tolerated; an unparsable entry stops the
 /// walk), else the peer. `x-forwarded-for` gets the peer appended
@@ -1022,13 +1005,11 @@ fn forwarded_node(ip: IpAddr) -> String {
 ///
 /// With `forwarded_header`, a `for=<peer>;proto=;host=` element is appended
 /// to `forwarded` (fresh for untrusted peers, whose value was stripped).
-/// `local_port` None: `x-forwarded-port` is omitted unless a trusted peer sent a
-/// valid one (never derived from `Host`). `proto=` is this hop's connection scheme;
+/// `proto=` is this hop's connection scheme;
 /// `host=` is the client's effective host (URI authority, else `Host`).
 fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     peer: IpAddr,
-    local_port: Option<u16>,
     proto: &'static str,
     client_host: Option<&str>,
     cfg: &FwdCfg<'_>,
@@ -1049,13 +1030,11 @@ fn apply_forwarded_headers(
             })
             .and_then(|v| HeaderValue::from_str(v).ok());
         headers.insert(&xfp, scheme.unwrap_or(HeaderValue::from_static(proto)));
-        let port = rightmost(headers, &xport)
-            .and_then(|v| {
-                v.parse::<u16>()
-                    .ok()
-                    .filter(|p| *p != 0 && v.bytes().all(|b| b.is_ascii_digit()))
-            })
-            .or(local_port);
+        let port = rightmost(headers, &xport).and_then(|v| {
+            v.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0 && v.bytes().all(|b| b.is_ascii_digit()))
+        });
         set_port(headers, &xport, port);
         // Always derived, never taken from the client: cloud LBs pass a
         // client's X-Real-IP through untouched.
@@ -1079,7 +1058,7 @@ fn apply_forwarded_headers(
         for h in UNTRUSTED_STRIPPED {
             headers.remove(h);
         }
-        set_port(headers, &xport, local_port);
+        headers.remove(&xport);
         peer
     };
     set_real_ip(headers, client);
@@ -1307,7 +1286,6 @@ mod tests {
         apply_forwarded_headers(
             &mut m,
             peer.parse().unwrap(),
-            None,
             proto,
             None,
             &cfg(&tp(trusted), false, XffMode::Append),
@@ -1330,7 +1308,6 @@ mod tests {
     fn run_with(
         trusted: &[&str],
         peer: &str,
-        port: Option<u16>,
         fh: bool,
         xff: XffMode,
         h: &[(&str, &str)],
@@ -1346,7 +1323,6 @@ mod tests {
         apply_forwarded_headers(
             &mut m,
             peer.parse().unwrap(),
-            port,
             "http",
             host_of(h),
             &cfg(&t, fh, xff),
@@ -1476,7 +1452,6 @@ mod tests {
         apply_forwarded_headers(
             &mut m,
             "10.1.2.3".parse().unwrap(),
-            None,
             "http",
             None,
             &cfg(&tp(&["10.0.0.0/8"]), false, XffMode::Append),
@@ -1489,7 +1464,6 @@ mod tests {
         apply_forwarded_headers(
             &mut m,
             "10.1.2.3".parse().unwrap(),
-            None,
             "http",
             None,
             &cfg(&tp(&["10.0.0.0/8"]), false, XffMode::Append),
@@ -1565,7 +1539,7 @@ mod tests {
         let mut h = HOP.to_vec();
         h.push(("x-forwarded-prefix", "/evil2"));
         h.push(("x-forwarded-port", "1"));
-        let m = run_with(&[], "1.2.3.4", Some(8080), false, XffMode::Append, &h);
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
         for k in [
             "x-forwarded-ssl",
             "x-forwarded-scheme",
@@ -1573,23 +1547,12 @@ mod tests {
         ] {
             assert_eq!(m.get_all(k).iter().count(), 0, "{k}");
         }
-        assert_eq!(m.get_all("x-forwarded-port").iter().count(), 1);
-        assert_eq!(get(&m, "x-forwarded-port"), Some("8080"));
-        // no listener port: nothing forged survives
-        let m = run_with(&[], "1.2.3.4", None, false, XffMode::Append, &h);
-        assert_eq!(get(&m, "x-forwarded-port"), None);
+        assert_eq!(m.get_all("x-forwarded-port").iter().count(), 0);
     }
 
     #[test]
     fn trusted_keeps_ssl_scheme_prefix_and_valid_port() {
-        let m = run_with(
-            &["10.0.0.0/8"],
-            "10.1.2.3",
-            Some(8080),
-            false,
-            XffMode::Append,
-            &HOP,
-        );
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Append, &HOP);
         assert_eq!(get(&m, "x-forwarded-ssl"), Some("on"));
         assert_eq!(get(&m, "x-forwarded-scheme"), Some("https"));
         assert_eq!(get(&m, "x-forwarded-prefix"), Some("/evil"));
@@ -1598,46 +1561,25 @@ mod tests {
             ("x-forwarded-port", "80"),
             ("x-forwarded-port", "443, 8443"),
         ];
-        let m = run_with(
-            &["10.0.0.0/8"],
-            "10.1.2.3",
-            Some(8080),
-            false,
-            XffMode::Append,
-            &h,
-        );
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Append, &h);
         assert_eq!(get(&m, "x-forwarded-port"), Some("8443"));
         for bad in ["abc", "0", "70000", "-1", "+80", " "] {
             let h = [("x-forwarded-port", bad)];
-            let m = run_with(
-                &["10.0.0.0/8"],
-                "10.1.2.3",
-                Some(8080),
-                false,
-                XffMode::Append,
-                &h,
-            );
-            assert_eq!(get(&m, "x-forwarded-port"), Some("8080"), "{bad:?}");
+            let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Append, &h);
+            assert_eq!(get(&m, "x-forwarded-port"), None, "{bad:?}");
         }
     }
 
     #[test]
     fn xff_replace_sets_client_only() {
         let h = [("x-forwarded-for", "6.6.6.6, 5.5.5.5")];
-        let m = run_with(&[], "1.2.3.4", None, false, XffMode::Replace, &h);
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Replace, &h);
         assert_eq!(get(&m, "x-forwarded-for"), Some("1.2.3.4"));
         assert_eq!(m.get_all("x-forwarded-for").iter().count(), 1);
-        let m = run_with(
-            &["10.0.0.0/8"],
-            "10.1.2.3",
-            None,
-            false,
-            XffMode::Replace,
-            &h,
-        );
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Replace, &h);
         assert_eq!(get(&m, "x-forwarded-for"), Some("5.5.5.5"));
         assert_eq!(get(&m, "x-real-ip"), Some("5.5.5.5"));
-        let m = run_with(&[], "1.2.3.4", None, false, XffMode::Append, &h);
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
         assert_eq!(
             get(&m, "x-forwarded-for"),
             Some("6.6.6.6, 5.5.5.5, 1.2.3.4")
@@ -1647,35 +1589,35 @@ mod tests {
     #[test]
     fn forwarded_header_output() {
         let host = [("host", "app.example")];
-        let m = run_with(&[], "1.2.3.4", None, true, XffMode::Append, &host);
+        let m = run_with(&[], "1.2.3.4", true, XffMode::Append, &host);
         assert_eq!(
             get(&m, "forwarded"),
             Some("for=1.2.3.4;proto=http;host=app.example")
         );
         // untrusted: client Forwarded is stripped, element is fresh
         let h = [("host", "app.example:8080"), ("forwarded", "for=6.6.6.6")];
-        let m = run_with(&[], "1.2.3.4", None, true, XffMode::Append, &h);
+        let m = run_with(&[], "1.2.3.4", true, XffMode::Append, &h);
         assert_eq!(
             get(&m, "forwarded"),
             Some("for=1.2.3.4;proto=http;host=\"app.example:8080\"")
         );
         // trusted: appended to the list; proto= is this hop's connection scheme
         let h = [("forwarded", "for=6.6.6.6"), ("x-forwarded-proto", "https")];
-        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", None, true, XffMode::Append, &h);
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", true, XffMode::Append, &h);
         assert_eq!(
             get(&m, "forwarded"),
             Some("for=6.6.6.6, for=10.1.2.3;proto=http")
         );
         // IPv6 quoted + bracketed (RFC 7239 section 6); v4-mapped shown as v4
-        let m = run_with(&[], "2001:db8::1", None, true, XffMode::Append, &[]);
+        let m = run_with(&[], "2001:db8::1", true, XffMode::Append, &[]);
         assert_eq!(
             get(&m, "forwarded"),
             Some("for=\"[2001:db8::1]\";proto=http")
         );
-        let m = run_with(&[], "::ffff:1.2.3.4", None, true, XffMode::Append, &[]);
+        let m = run_with(&[], "::ffff:1.2.3.4", true, XffMode::Append, &[]);
         assert_eq!(get(&m, "forwarded"), Some("for=1.2.3.4;proto=http"));
         // off by default: untrusted Forwarded just stripped
-        let m = run_with(&[], "1.2.3.4", None, false, XffMode::Append, &h);
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
         assert_eq!(get(&m, "forwarded"), None);
     }
 
@@ -1702,7 +1644,7 @@ mod tests {
             ("x_forwarded_proto", "https"),
         ];
         for trusted in [&[][..], &["10.0.0.0/8"][..]] {
-            let m = run_with(trusted, "10.1.2.3", None, false, XffMode::Append, &h);
+            let m = run_with(trusted, "10.1.2.3", false, XffMode::Append, &h);
             for k in ["x_real_ip", "x_forwarded_prefix", "x_forwarded_for"] {
                 assert_eq!(get(&m, k), None, "{k}");
             }
@@ -1741,7 +1683,6 @@ mod tests {
         apply_forwarded_headers(
             &mut m,
             "1.2.3.4".parse().unwrap(),
-            None,
             "http",
             Some("client.example"),
             &cfg(&t, true, XffMode::Append),
@@ -1753,9 +1694,21 @@ mod tests {
     }
 
     #[test]
-    fn no_listener_port_never_uses_host() {
+    fn connection_header_cannot_strip_host_or_request_id() {
+        let mut h = HeaderMap::new();
+        h.insert("connection", "x-request-id, host, x-other".parse().unwrap());
+        h.insert("host", "a".parse().unwrap());
+        h.insert("x-request-id", "abc".parse().unwrap());
+        h.insert("x-other", "1".parse().unwrap());
+        strip_hop_by_hop(&mut h);
+        assert!(h.contains_key("host") && h.contains_key("x-request-id"));
+        assert!(!h.contains_key("x-other") && !h.contains_key("connection"));
+    }
+
+    #[test]
+    fn forwarded_port_never_derived_from_host() {
         let h = [("host", "x:443")];
-        let m = run_with(&[], "1.2.3.4", None, false, XffMode::Append, &h);
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
         assert_eq!(get(&m, "x-forwarded-port"), None);
     }
 

@@ -56,8 +56,7 @@ Notes:
   directory watcher, content-hash de-dup and failed-reload-keeps-old-table
   behaviour as the binary.
 - `proxy::handle_streaming` is the per-request handler, if you want your own
-  accept loop; `handle_streaming_at` also takes the listener port for
-  `X-Forwarded-Port`. The older `proxy::handle` is deprecated.
+  accept loop. The older `proxy::handle` is deprecated.
 
 [`examples/embedded/`](https://github.com/Bunty9/ferryman/tree/main/examples/embedded)
 is a complete, tested version: proxy, health loop and reload watcher as tasks

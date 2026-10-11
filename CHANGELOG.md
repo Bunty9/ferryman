@@ -101,7 +101,7 @@ and `ferryman` are released together with the same version.
 
 - Untrusted peers can no longer forge `X-Forwarded-Ssl`, `X-Forwarded-Scheme`,
   `X-Forwarded-Port` or `X-Forwarded-Prefix`: all instances are stripped
-  (`X-Forwarded-Port` is then set by ferryman, see Added). Trusted peers keep
+  (ferryman never sets `X-Forwarded-Port` itself, see Added). Trusted peers keep
   them. Migration: an app behind ferryman that relied on a client-supplied
   `X-Forwarded-Ssl` / `-Scheme` / `-Prefix` arriving from an untrusted hop now
   sees them removed; if a proxy or load balancer in front of ferryman sets
@@ -130,17 +130,14 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
-- Trust model completion: `X-Forwarded-Port` (the listener's port for
-  untrusted peers; trusted peers' rightmost valid value is kept, else the
-  listener port), optional RFC 7239 `Forwarded` output (`forwarded_header =
+- Trust model completion: `X-Forwarded-Port` (never synthesised: untrusted
+  peers' values are stripped and none is added; a trusted peer's rightmost
+  valid value is kept, else none), optional RFC 7239 `Forwarded` output (`forwarded_header =
   true`, default false; `for=<peer>;proto=;host=`, IPv6 quoted and bracketed),
   `xff = "append" | "replace"` (default append), and a one-time warning when
   `trusted_proxies` is empty and a private/loopback/link-local peer connects.
   New public items: `XffMode`, `RouteTable::{with_forwarded_header,
-  forwarded_header, with_xff_mode, xff_mode}`, `proxy::handle_streaming_at`
-  (takes the local port; `serve` uses it; `handle_streaming` and the
-  deprecated `handle` have no port, so `X-Forwarded-Port` is omitted for
-  untrusted peers).
+  forwarded_header, with_xff_mode, xff_mode}`,.
 
 - Reload model. The watcher now watches the config file's directory and
   reacts to any event there, so Kubernetes ConfigMap mounts (an atomic
@@ -217,9 +214,8 @@ and `ferryman` are released together with the same version.
 
 - Untrusted peers' `X-Forwarded-Ssl`, `X-Forwarded-Scheme` and
   `X-Forwarded-Prefix` are now stripped; see the Security note above for the
-  migration. An untrusted client's `X-Forwarded-Port` is now replaced by the
-  listener port (omitted when ferryman is embedded via `handle_streaming` /
-  `handle`, which know no port).
+  migration. An untrusted client's `X-Forwarded-Port` is now stripped and
+  not replaced.
 - SIGHUP no longer terminates the process: it reloads the config and TLS
   certificate (see Added). Migration: anything that used SIGHUP to stop or
   restart ferryman must send SIGTERM (or SIGINT) instead.

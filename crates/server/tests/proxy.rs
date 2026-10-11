@@ -333,8 +333,7 @@ async fn untrusted_peer_cannot_forge_forwarded_headers() {
             "{body}"
         );
         assert!(!body.contains("4443"), "{body}");
-        assert_eq!(body.matches("x-forwarded-port:").count(), 1, "{body}");
-        assert!(!body.contains("x-forwarded-port: 4443"), "{body}");
+        assert!(!body.contains("x-forwarded-port"), "{body}");
         // 0.2.2 behaviour: XFF is appended to, not replaced.
         assert!(
             body.contains("x-forwarded-for: 6.6.6.6, 127.0.0.1"),
@@ -373,7 +372,7 @@ async fn forwarded_header_is_opt_in() {
 }
 
 #[tokio::test]
-async fn forwarded_port_and_host_come_from_the_listener_and_client() {
+async fn forwarded_port_is_never_synthesised_and_host_is_the_clients() {
     let upstream = spawn_stub(echo).await;
     let table = shared_table(parse_cfg(&format!(
         "forwarded_header = true\nxff = \"replace\"\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\nrewrite_host = true\n"
@@ -390,10 +389,7 @@ async fn forwarded_port_and_host_come_from_the_listener_and_client() {
         .await
         .unwrap();
     let port = proxy.port();
-    assert!(
-        body.contains(&format!("x-forwarded-port: {port}\n")),
-        "{body}"
-    );
+    assert!(!body.contains("x-forwarded-port"), "{body}");
     assert!(!body.contains("4443"), "{body}");
     // host= is the client's host even though Host was rewritten to the upstream's.
     assert!(

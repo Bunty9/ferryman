@@ -1,0 +1,53 @@
+[Unit]
+Description=ferryman L7 reverse proxy
+Documentation=https://github.com/Bunty9/ferryman
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# ferryman sends READY=1 once the proxy and admin listeners are bound.
+# On systemd >= 253 you may use Type=notify-reload and drop ExecReload
+# (ferryman answers the SIGHUP with RELOADING=1 / READY=1 either way).
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/ferryman --config /etc/ferryman/config.toml \
+    --tls-cert %d/tls.crt --tls-key %d/tls.key
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+# shutdown_delay_secs + drain (default 25 s) + margin.
+TimeoutStopSec=35s
+
+# Config lives in /etc/ferryman (read-only to the service).
+ConfigurationDirectory=ferryman
+# Copied into a private tmpfs at %d; ferryman re-reads them on reload.
+# Drop these two lines and the --tls-* flags for plain HTTP.
+LoadCredential=tls.crt:/etc/ferryman/tls.crt
+LoadCredential=tls.key:/etc/ferryman/tls.key
+Environment=FERRYMAN_BIND=0.0.0.0:8080 FERRYMAN_METRICS_BIND=127.0.0.1:9090
+
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

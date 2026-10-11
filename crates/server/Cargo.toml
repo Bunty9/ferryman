@@ -39,13 +39,16 @@ required-features = ["bin"]
 name = "paas"
 required-features = ["bin"]
 [[test]]
+name = "systemd"
+required-features = ["bin"]
+[[test]]
 name = "access_log"
 required-features = ["bin"]
 
 [features]
 default = ["bin"]
 # The `ferryman` binary: CLI, log setup, and everything it wires together.
-bin = ["admin", "reload", "dep:clap", "dep:tracing-subscriber", "dep:metrics-util"]
+bin = ["admin", "reload", "dep:clap", "dep:tracing-subscriber", "dep:metrics-util", "dep:libc"]
 # `ferryman::admin` (admin HTTP server: /metrics, /healthz, /readyz); its API
 # takes a `metrics_exporter_prometheus::PrometheusHandle`.
 admin = ["dep:metrics-exporter-prometheus"]
@@ -71,6 +74,9 @@ tracing-subscriber = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["http2"] }

@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+mod sd_notify;
+
 #[derive(Parser, Debug)]
 #[command(name = "ferryman", about = "ferryman L7 reverse proxy", version)]
 struct Args {
@@ -133,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
+    let notify = Arc::new(sd_notify::Notifier::from_env());
     let fmt = tracing_subscriber::fmt().with_env_filter(
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     );
@@ -191,6 +194,8 @@ async fn main() -> anyhow::Result<()> {
         Some(reloader.watch()?)
     };
     #[cfg(unix)]
+    let sighup_notify = notify.clone();
+    #[cfg(unix)]
     tokio::spawn(async move {
         while sighup.recv().await.is_some() {
             tracing::info!("received SIGHUP, reloading");
@@ -198,7 +203,10 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("reload not applicable: config is inline (FERRYMAN_CONFIG_TOML)");
             }
             let r = reloader.clone();
+            // Success or kept-old, the service is ready again afterwards.
+            sighup_notify.reloading();
             let _ = tokio::task::spawn_blocking(move || r.reload(true)).await;
+            sighup_notify.ready("serving");
         }
     });
     // No SIGHUP on Windows: the file watch is the only reload trigger.
@@ -220,12 +228,15 @@ async fn main() -> anyhow::Result<()> {
     ));
     tracing::info!(addr = %admin_addr, "admin listener bound (/metrics, /healthz, /readyz)");
 
+    notify.ready("serving");
+
     let table = shared.clone();
     let signalled = Arc::new(tokio::sync::Notify::new());
     let first = signalled.clone();
     let shutdown = async move {
         shutdown_signal().await;
         first.notify_one();
+        notify.stopping();
         // Readiness flips first; /readyz stays up (503) through the delay and
         // the drain. The proxy keeps accepting until the delay elapses.
         draining.store(true, Ordering::Relaxed);

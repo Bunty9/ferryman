@@ -163,6 +163,34 @@ atomically without dropping live connections.
   table stays live. Bind addresses, the metrics bind and `health_interval_secs`
   need a restart.
 
+### systemd
+
+`deploy/systemd/ferryman.service` is a hardened unit (`DynamicUser`,
+`ProtectSystem=strict`, only `CAP_NET_BIND_SERVICE`, `@system-service` syscalls).
+
+```sh
+sudo install -m755 ferryman /usr/local/bin/ferryman
+sudo install -d /etc/ferryman && sudo cp config.toml /etc/ferryman/
+sudo cp deploy/systemd/ferryman.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ferryman
+```
+
+- **Notify.** With `NOTIFY_SOCKET` set (`Type=notify`) ferryman sends `READY=1`
+  once the proxy and admin listeners are bound, `RELOADING=1` +
+  `MONOTONIC_USEC` / `READY=1` around each SIGHUP reload (also when the reload
+  is rejected and the old config is kept), and `STOPPING=1` when shutdown
+  begins. It is a no-op when the variable is unset. File-watch reloads are not
+  announced; watchdog (`WATCHDOG=1`) is not implemented.
+- **Reload.** `systemctl reload ferryman` runs `kill -HUP $MAINPID`. On systemd
+  253+ you can use `Type=notify-reload` instead and drop `ExecReload`.
+- **TLS.** `LoadCredential=` copies the cert and key into a private directory;
+  the unit passes them as `--tls-cert %d/tls.crt --tls-key %d/tls.key`.
+  Renewing `/etc/ferryman/tls.*` takes effect with `systemctl reload`.
+- **Stopping.** `TimeoutStopSec=35s` covers the default 25 s drain; raise it if
+  you raise `shutdown_delay_secs` or the drain.
+- **Logs.** JSON on stdout lands in the journal: `journalctl -u ferryman -o cat | jq .`
+  (or `--log-format text`).
+
 ## Examples
 
 Reference examples live under [`examples/`](./examples) (index:

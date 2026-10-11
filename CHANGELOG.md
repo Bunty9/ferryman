@@ -9,6 +9,10 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- systemd support: `deploy/systemd/ferryman.service` (hardened, `Type=notify`,
+  `LoadCredential` TLS) and `sd_notify` over `$NOTIFY_SOCKET` (`READY=1`,
+  `RELOADING=1` + `MONOTONIC_USEC` around SIGHUP reloads, `STOPPING=1`);
+  no-op when unset. See the README "systemd" section.
 - Access log: one `ferryman::access` info line per request (method, host,
   path without query, route, upstream, status, `bytes_out` when
   `Content-Length` is known, `duration_ms` to response headers, request id,

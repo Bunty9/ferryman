@@ -47,6 +47,7 @@ impl Notifier {
         self.send(&format!("READY=1\nSTATUS={status}"));
     }
 
+    #[cfg(unix)]
     pub fn reloading(&self) {
         self.send(&format!("RELOADING=1\nMONOTONIC_USEC={}", monotonic_usec()));
     }
@@ -65,11 +66,6 @@ fn monotonic_usec() -> u64 {
     // SAFETY: valid out-pointer; CLOCK_MONOTONIC always exists on Unix.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
-}
-
-#[cfg(not(unix))]
-fn monotonic_usec() -> u64 {
-    0
 }
 
 #[cfg(all(test, unix))]

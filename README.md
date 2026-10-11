@@ -83,7 +83,7 @@ Required targets: `x86_64`/`aarch64-unknown-linux-musl` (static),
 `aarch64-pc-windows-msvc`, `x86_64-unknown-freebsd`.
 
 ```bash
-v=0.2.3   # or the latest release (binaries ship from 0.2.2 on)
+v=0.2.4   # or the latest release (binaries ship from 0.2.2 on)
 t=x86_64-unknown-linux-musl
 base=https://github.com/Bunty9/ferryman/releases/download/v$v
 curl -fsSLO $base/ferryman-v$v-$t.tar.gz -O $base/SHA256SUMS

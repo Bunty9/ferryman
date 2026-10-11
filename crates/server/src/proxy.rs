@@ -950,7 +950,13 @@ const TRUST_GOVERNED: [&str; 9] = [
 /// either canonical or unrelated. Runs of separators are collapsed and
 /// the ends trimmed (`x__real_ip`, `-x-real-ip` -> `x-real-ip`).
 fn is_noncanonical_spelling(name: &str) -> bool {
-    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+    // Already normal (no leading/trailing `-`, no `--`): protected iff an exact
+    // match, and exact matches are canonical, hence kept.
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+    {
         return false;
     }
     // Fold every non-alphanumeric byte to `-`, collapse runs, trim the ends.
@@ -1686,6 +1692,11 @@ mod tests {
             ("x-forwarded.proto", "https"),
             ("x__forwarded_for", "6.6.6.6"),
             ("x-.forwarded.for", "6.6.6.6"),
+            ("-x-real-ip", "6.6.6.6"),
+            ("x-forwarded-for--", "6.6.6.6"),
+            ("x--forwarded--for-", "6.6.6.6"),
+            ("-forwarded", "for=6.6.6.6"),
+            ("x--custom", "keep"),
             ("x.custom", "keep"),
         ];
         for trusted in [&[][..], &["10.0.0.0/8"][..]] {
@@ -1696,11 +1707,19 @@ mod tests {
             for k in ["x.forwarded.for", "x.real.ip", "x-forwarded.proto"] {
                 assert_eq!(get(&m, k), None, "{k}");
             }
-            for k in ["x__forwarded_for", "x-.forwarded.for"] {
+            for k in [
+                "x__forwarded_for",
+                "x-.forwarded.for",
+                "-x-real-ip",
+                "x-forwarded-for--",
+                "x--forwarded--for-",
+                "-forwarded",
+            ] {
                 assert_eq!(get(&m, k), None, "{k}");
             }
             assert_eq!(get(&m, "x.custom"), Some("keep"));
             assert_eq!(get(&m, "x_custom"), Some("keep"));
+            assert_eq!(get(&m, "x--custom"), Some("keep"));
             assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
         }
     }

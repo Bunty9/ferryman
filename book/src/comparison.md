@@ -9,7 +9,7 @@ better. This page tries to be straight about both.
 
 ## Current limitations
 
-These are real as of 0.3 and are the usual reasons to pick something else:
+Competitor facts on this page were checked against their official docs in October 2026. These limitations are real as of 0.3 and are the usual reasons to pick something else:
 
 - Upstreams are plain HTTP only; `https://` upstreams are rejected.
 - No WebSocket / `Upgrade` passthrough (answered with 501).
@@ -26,11 +26,11 @@ These are real as of 0.3 and are the usual reasons to pick something else:
 
 | | Where it is better than ferryman | Where ferryman is the better fit |
 | --- | --- | --- |
-| **Caddy** | Automatic HTTPS (ACME), multiple upstreams with load-balancing policies, retries, WebSocket, HTTP/3, a large module ecosystem, virtual hosts, https upstreams, a mature Caddyfile. Its passive health tracking and active health checks cover most needs. | You want a half-open circuit breaker rather than a failure-window mark-down, a single static binary with a tiny config surface, readable code, an admin plane with Prometheus metrics by default, or to embed the breaker or proxy in a Rust program. |
-| **Traefik** | Dynamic configuration from Docker, Kubernetes and other providers; ACME; middlewares (rate limiting, auth, retry); weighted load balancing; a dashboard; WebSocket and gRPC. It also ships a circuit-breaker middleware. | Static, reviewable TOML instead of provider discovery; a much smaller footprint and codebase; per-upstream breakers wired to health checks by default; no controller to operate. |
-| **NGINX** | Decades of production use, the widest feature set (caching, rate limiting, stream/TCP, load balancing, many modules), the best-understood tuning, and enormous community knowledge. Active health checks are a commercial (NGINX Plus) feature, which is a gap ferryman fills. | Active health checks and a circuit breaker out of the box in the open-source binary; hot reload that cannot take down a working config; memory-safe implementation; config that is a handful of lines. |
-| **rpxy** | The closest peer: also Rust and hyper-based, with built-in ACME, HTTP/3, host-based routing, and load balancing across several upstreams. | Per-upstream circuit breaking with health-driven recovery, trusted-proxy header handling, drain/readiness behaviour tuned for orchestrators and PaaS, and a standalone embeddable breaker crate. |
-| **Pingora** | A framework for building proxies, not a proxy: far more capable and flexible, used at very large scale, with caching, load balancing, connection pooling control and TLS options. If you need to build a custom proxy, start there. | You want a finished, small, configured-by-TOML proxy and not a framework to build one. ferryman is deliberately "Pingora-pattern at miniature scale". |
+| **Caddy** | Automatic HTTPS (ACME), multiple upstreams with load-balancing policies, retries, WebSocket, HTTP/3, a large module ecosystem, virtual hosts, https upstreams, a mature Caddyfile. It has no circuit breaker; passive health tracking (`fail_duration`, off by default) and opt-in active health checks cover most needs. | You want a half-open circuit breaker rather than a failure-window mark-down, a single static binary with a tiny config surface, readable code, an admin plane with Prometheus metrics by default, or to embed the breaker or proxy in a Rust program. |
+| **Traefik** | Dynamic configuration from Docker, Kubernetes and other providers; ACME; middlewares (rate limiting, auth, retry); weighted load balancing; a dashboard; WebSocket and gRPC. It also ships a circuit-breaker middleware (closed, open and a gradual "recovering" state, driven by an expression over error ratio, status codes or latency, not by health checks). | Static, reviewable TOML instead of provider discovery; a much smaller footprint and codebase; per-upstream breakers wired to health checks by default; no controller to operate. |
+| **NGINX** | Decades of production use, the widest feature set (caching, rate limiting, stream/TCP, load balancing, many modules), the best-understood tuning, and enormous community knowledge. Open-source NGINX has only passive failure tracking (`max_fails` / `fail_timeout`); active health checks are an NGINX Plus feature, which is a gap ferryman fills. | Active health checks and a circuit breaker out of the box in the open-source binary; automatic reload when the config file changes (NGINX also keeps the old config on a failed `nginx -s reload`, but needs the signal); memory-safe implementation; config that is a handful of lines. |
+| **rpxy** | The closest peer: also Rust and hyper-based, with built-in ACME (TLS-ALPN-01), experimental HTTP/3, host-based routing, https upstreams, forwarding-header handling with trusted proxies, and round-robin, random or sticky load balancing across several upstreams. Its README does not mention health checks or a circuit breaker. | Per-upstream circuit breaking with health-driven recovery, admin `/healthz` / `/readyz` endpoints and a drain sequence aimed at orchestrators and PaaS, and a standalone embeddable breaker crate. |
+| **Pingora** | A framework for building proxies, not a proxy: far more capable and flexible, used at very large scale, with HTTP/1 and HTTP/2 proxying, gRPC and WebSocket, caching, load balancing and failover, connection pooling control and several TLS backends (rustls is experimental). It is a library: there is no stock proxy binary. If you need to build a custom proxy, start there. | You want a finished, small, configured-by-TOML proxy and not a framework to build one. ferryman is deliberately "Pingora-pattern at miniature scale". |
 
 Pick something else outright if you need WebSocket today, https upstreams,
 several upstreams per route, host-based routing, or automatic certificates.
@@ -67,12 +67,18 @@ What maps to what:
   true`. `proxy_pass http://host;` (no URI) forwards the path unchanged, which
   is the default. ferryman matches on segment boundaries, so `/api` also
   covers `/api/x` and never `/apix`; write the prefix without a trailing
-  slash.
+  slash. One difference: with `location /api/`, NGINX answers a bare `/api`
+  with a 301 redirect to `/api/`, while ferryman forwards `/api` as `/`.
+  ferryman also adds `X-Forwarded-Prefix: /api` on `strip_prefix` routes.
 - **`Host`.** `proxy_set_header Host $host` keeps the client's `Host`: that is
-  ferryman's default. NGINX's *default* (no `proxy_set_header`) sends the
-  upstream's name: use `rewrite_host = true` for that behaviour.
+  ferryman's default (NGINX's `$host` drops the port; ferryman forwards the
+  client's `Host` verbatim). NGINX's *default* (no `proxy_set_header`) sends
+  `$proxy_host`, the name and port from `proxy_pass`: use `rewrite_host = true`
+  for that behaviour.
 - **`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`.** ferryman sets all
-  three itself, so delete those lines. `X-Real-IP` is always derived and
+  three itself, so delete those lines. By default (`xff = "append"`) ferryman
+  appends the peer to an incoming `X-Forwarded-For` from untrusted clients,
+  like `$proxy_add_x_forwarded_for`; use `xff = "replace"` to discard it. `X-Real-IP` is always derived and
   cannot be forged by clients. If NGINX itself sits in front of ferryman, put
   its address in `trusted_proxies` so its `X-Forwarded-Proto` is honoured.
 - **Timeouts.** `proxy_read_timeout` (gap between reads) is closest to
@@ -124,14 +130,20 @@ What maps to what:
 - **Automatic HTTPS.** Not built in. Provide a certificate and key
   (certbot/lego/cert-manager) and renew them in place: ferryman reloads them
   for new handshakes.
-- **`Host`.** Caddy keeps the client's `Host` by default, like ferryman. A
-  `header_up Host {upstream_hostport}` becomes `rewrite_host = true`.
-- **`X-Forwarded-*`.** Both set them. Caddy trusts `trusted_proxies` from its
-  global options; ferryman's `trusted_proxies` is the same idea (default:
-  trust nobody).
-- **Health.** `health_uri` becomes `health_path`; `health_interval` becomes
-  `health_interval_secs` (global in ferryman, not per route). Passive
-  `fail_duration` / `max_fails` map loosely to `default_cooldown_secs` /
+- **`Host`.** Caddy passes the client's `Host` through unchanged for http
+  upstreams, like ferryman. A `header_up Host {upstream_hostport}` becomes
+  `rewrite_host = true`.
+- **`X-Forwarded-*`.** Both set them, and both distrust incoming values by
+  default; `trusted_proxies` (Caddy: global `servers` option) is the same
+  idea in each. Differences: Caddy discards an untrusted client's incoming
+  `X-Forwarded-For`, while ferryman appends to it unless `xff = "replace"`;
+  Caddy sets `X-Forwarded-Host`, ferryman does not (the `Host` header is
+  unchanged); ferryman also sets `X-Real-IP`, Caddy does not.
+- **Path edges.** `handle_path /api/*` does not match a bare `/api`; ferryman's
+  `/api` prefix does (forwarded as `/`).
+- **Health.** `health_uri` becomes `health_path`; `health_interval` (Caddy default 30s) becomes
+  `health_interval_secs` (global in ferryman, default 5s, not per route). Passive
+  `fail_duration` / `max_fails` (off unless `fail_duration` is set) map loosely to `default_cooldown_secs` /
   `failure_threshold`, with a half-open probe instead of a time window.
 - **`lb_policy` with several upstreams, `lb_try_duration`, `encode`, `file_server`,
   `basicauth`.** No equivalent.

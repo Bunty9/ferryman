@@ -7,6 +7,132 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-11
+
+### Security
+
+- Includes the 0.2.4 security fixes.
+
+- Dot segments hidden behind mixed encodings (`/api/%2%65%2%65/x`,
+  `/api/%%32%65%%32%65/x`, which normalise to `%2e%2e`) are now rejected with
+  400: the path check also runs on the normalised path. New
+  `ferryman_core::path::bad_path_normalized`; `bad_path` is unchanged.
+  Migration: none.
+
+- Request trailers are no longer forwarded: the proxied request body drops
+  trailer frames, so a client cannot deliver trust-governed names (`X-Real-IP`)
+  to the upstream as trailers. Data frames and timing are unchanged. Migration:
+  none (the `Trailer` header was already stripped as hop-by-hop).
+
+- Untrusted peers can no longer forge `X-Forwarded-Ssl`, `X-Forwarded-Scheme`,
+  `X-Forwarded-Port` or `X-Forwarded-Prefix`: all instances are stripped
+  (ferryman never sets `X-Forwarded-Port` itself, see Added). Trusted peers keep
+  them. Migration: an app behind ferryman that relied on a client-supplied
+  `X-Forwarded-Ssl` / `-Scheme` / `-Prefix` arriving from an untrusted hop now
+  sees them removed; if a proxy or load balancer in front of ferryman sets
+  them, add its range to `trusted_proxies`.
+
+- Host hardening (low severity, defence in depth): when the request target
+  has no authority, the `Host` header is now validated before routing and
+  must be a single bare `host[:port]` (no userinfo, comma list, path,
+  obs-text, empty value, `*`, or a port that is not 1-5 digits <= 65535); an HTTP/1.1
+  request with neither `Host` nor an authority is rejected too (HTTP/1.0
+  without `Host` is still forwarded); more than one `Host` is rejected even when an
+  authority is present. Failures are `400 bad host` (route/upstream `none`,
+  no breaker ticket). `host` named in `Connection` is no longer stripped
+  from requests or responses. Migration: clients sending malformed, missing (1.1) or
+  duplicate `Host` now get 400. h2 `:authority` and absolute-form targets
+  still take precedence over `Host`; `local_health_path` is answered before
+  this check.
+
+### Changed (breaking)
+
+- The Docker image now runs as uid/gid `65532:65532` instead of root. Files
+  you mount (config, TLS cert and key) must be readable by 65532: make them
+  world-readable (`chmod 0644`), or group-readable and add the group
+  (`--group-add`, compose `group_add`, Kubernetes `fsGroup`). The image writes
+  nothing to its filesystem, so `--read-only` works. The default ports
+  8080/9090 and the built-in `HEALTHCHECK` are unaffected, but ports below
+  1024 fail to bind as 65532 outside Docker's default sysctl (Kubernetes,
+  containerd, Podman) unless `net.ipv4.ip_unprivileged_port_start` is lowered.
+- Cargo features: the new default `bin` feature gates the binary and its
+  dependencies (`clap`, `tracing-subscriber`, `metrics-util`); `ferryman::admin`
+  now needs feature `admin` (`metrics-exporter-prometheus`) and
+  `ferryman::reload` needs feature `reload` (`notify`). Default builds
+  (`cargo install`, binstall, Docker, release archives) are unchanged. Library
+  users with `default-features = false` must enable `admin` and/or `reload`
+  to keep using those modules; without them the library has 150 instead of
+  209 crates in its dependency tree.
+
+- Untrusted peers' `X-Forwarded-Ssl`, `X-Forwarded-Scheme` and
+  `X-Forwarded-Prefix` are now stripped; see the Security note above for the
+  migration. An untrusted client's `X-Forwarded-Port` is now stripped and
+  not replaced.
+- SIGHUP no longer terminates the process: it reloads the config and TLS
+  certificate (see Added). Migration: anything that used SIGHUP to stop or
+  restart ferryman must send SIGTERM (or SIGINT) instead.
+- The metrics listener is now ferryman's own admin server, not the
+  Prometheus exporter's. The old one answered `OK` on `/health` and metrics
+  on every other path and method; now `GET`/`HEAD` `/metrics` is metrics,
+  `/healthz` (alias `/health`) is `200 ok`, `/readyz` is readiness, other
+  paths 404 and other methods 405. Scrape configs and probes must use
+  `/metrics`, `/healthz` (or `/health`) or `/readyz`. The admin server is
+  HTTP/1 only. The `http-listener` feature of `metrics-exporter-prometheus`
+  is no longer used. `ConfigToml` gains a field (it is `#[non_exhaustive]`; no migration).
+
+- `build_table` rejects route prefixes containing `;`, `\`, `%2F` or `%5C`
+  (`Error::NonCanonicalPrefix`): every request to them would be 400.
+- `Route` is `#[non_exhaustive]` with a new pub `rewrite_host` field: replace
+  struct literals with `Route::new(prefix, upstream)`.
+- Paths that are ambiguous between ferryman and an upstream that treats
+  `%2F`/`%5C`/`\` as `/` or drops `;params` now get 400 `bad path` when that
+  reading would select a different route (`/api%2Fsecret`, `/api;x/x`).
+  `;params` are dropped up to the next raw `/` before decoding (Tomcat and
+  Spring order) as well. `/app;jsessionid=X` where `/app` is a route now
+  gets 400 (it used to be routed to `/`); params after a later segment
+  (`/app/x;jsessionid=X`) still pass. Migration: send plain `/` separators; encoded separators inside a segment
+  that do not change the route (`group%2Fproject`) still pass.
+- Route matching uses a normalised path: `%XX` of unreserved characters
+  (`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, and
+  repeated `/` is merged. Requests such as `/%61pi/x` or `//api/x` may now
+  match a more specific route than before (here `/api` instead of `/`).
+  Matching stays case-sensitive and `%2f` stays encoded; the forwarded path
+  is unchanged. **Migration:** write route prefixes in normalised form
+  (unreserved characters unescaped, uppercase hex, no `//`); non-normal
+  prefixes are rejected at load (`Error::NonCanonicalPrefix`).
+
+- `CircuitState` and `Admission` are now `#[non_exhaustive]`.
+  **Migration:** add a `_ =>` arm to any `match` on either enum.
+- `ferryman_core::Error` (new, `#[non_exhaustive]`, `std::error::Error +
+  Send + Sync + 'static`) replaces `anyhow::Error` in every public
+  `ferryman-core` signature: `build_table`, `load_config`,
+  `TrustedProxies::parse`, `Breaker::new`, `BreakerConfig::validate`.
+  Variants are matchable by category (`InvalidConfig`, `InvalidPrefix`,
+  `DuplicatePrefix`, `InvalidUpstream`, `InvalidCooldown`,
+  `ConflictingCooldown`, `InvalidCidr`, `InvalidBreakerConfig`,
+  `ReadConfig`, `Toml`). `Display` messages are unchanged; `ReadConfig` and
+  `Toml` expose the cause via `source()`, so print the chain with
+  `anyhow::Error::from(e)` and `{:#}`. `ferryman-core` no longer depends on
+  `anyhow` (it now uses `thiserror`). **Migration:** `?` into
+  `anyhow::Result` keeps working; code naming `anyhow` types for these
+  results, or relying on `{:#}` of the raw error to show the cause, must
+  change. `ferryman::serve` still returns `anyhow::Result<()>`.
+- `Upstream::new(uri, BreakerConfig) -> Result<Upstream, Error>` replaces
+  `Upstream::new(uri, cooldown, failure_threshold) -> Upstream` and now
+  rejects a cooldown under 1 ms or a zero threshold
+  (`Error::InvalidBreakerConfig`). **Migration:**
+  `Upstream::new(uri, BreakerConfig::default().with_cooldown(c).with_failure_threshold(n))?`.
+  `BreakerConfig::name` is ignored here (the breaker is named `host:port`).
+- `toml::de::Error` and `http::uri::InvalidUri` are exposed as `Error` sources
+  (`ReadConfig`/`Toml`/`InvalidUpstream`); a major bump of those crates is a
+  semver break for `ferryman-core`.
+- Route prefixes containing non-ASCII bytes are rejected at load
+  (`Error::NonCanonicalPrefix`); write them percent-encoded.
+- The `PORT` environment variable now sets the bind address
+  (`--bind` > `FERRYMAN_BIND` > `0.0.0.0:$PORT` > `0.0.0.0:8080`), and a
+  non-numeric `PORT` fails startup. Migration: unset `PORT` if it is set in
+  your environment for another purpose and you rely on the default bind.
+
 ### Added
 
 - Documentation site (mdBook, `book/`, deployed to GitHub Pages by
@@ -51,85 +177,6 @@ and `ferryman` are released together with the same version.
   is the normalised one; a remainder that fails `bad_path` answers 400.
   Trusted peers' single plain-path `X-Forwarded-Prefix` is prepended.
 
-### Changed (breaking)
-
-- The Docker image now runs as uid/gid `65532:65532` instead of root. Files
-  you mount (config, TLS cert and key) must be readable by 65532: make them
-  world-readable (`chmod 0644`), or group-readable and add the group
-  (`--group-add`, compose `group_add`, Kubernetes `fsGroup`). The image writes
-  nothing to its filesystem, so `--read-only` works. The default ports
-  8080/9090 and the built-in `HEALTHCHECK` are unaffected, but ports below
-  1024 fail to bind as 65532 outside Docker's default sysctl (Kubernetes,
-  containerd, Podman) unless `net.ipv4.ip_unprivileged_port_start` is lowered.
-- Cargo features: the new default `bin` feature gates the binary and its
-  dependencies (`clap`, `tracing-subscriber`, `metrics-util`); `ferryman::admin`
-  now needs feature `admin` (`metrics-exporter-prometheus`) and
-  `ferryman::reload` needs feature `reload` (`notify`). Default builds
-  (`cargo install`, binstall, Docker, release archives) are unchanged. Library
-  users with `default-features = false` must enable `admin` and/or `reload`
-  to keep using those modules; without them the library has 150 instead of
-  209 crates in its dependency tree.
-
-### Security
-
-- Dot segments hidden behind mixed encodings (`/api/%2%65%2%65/x`,
-  `/api/%%32%65%%32%65/x`, which normalise to `%2e%2e`) are now rejected with
-  400: the path check also runs on the normalised path. New
-  `ferryman_core::path::bad_path_normalized`; `bad_path` is unchanged.
-  Migration: none.
-
-- Request trailers are no longer forwarded: the proxied request body drops
-  trailer frames, so a client cannot deliver trust-governed names (`X-Real-IP`)
-  to the upstream as trailers. Data frames and timing are unchanged. Migration:
-  none (the `Trailer` header was already stripped as hop-by-hop).
-
-- Strip non-canonical spellings of proxy-asserted headers: any request header
-  whose name maps onto a trust-governed one when every non-alphanumeric byte is
-  read as `-` (`x.forwarded.for`, `X.Real.IP`, as well as the
-  `_` forms below) is removed for every peer. This generalises the underscore
-  rule to PHP-style `.`/space folding. Runs of separators are collapsed and the ends
-  trimmed first (`x__real_ip`, `x-.forwarded.for`). Migration: none unless a client
-  deliberately sent these spellings.
-
-- Request headers whose name differs from a trust-governed header only by
-  `_` instead of `-` (`X_Real_IP`, `X_Forwarded_For`, `X_Forwarded_Prefix`,
-  `X_Forwarded_Proto`/`-Host`/`-Port`/`-Ssl`/`-Scheme`, `Forwarded`) are now
-  removed for every peer, trusted or not. CGI-style backends (WSGI/Werkzeug,
-  Rack/Puma, PHP-FPM) fold `_` and `-` together, so such a header could
-  otherwise reach the app as the real one. Migration: none unless a client
-  deliberately sent these spellings.
-
-- Untrusted peers can no longer forge `X-Forwarded-Ssl`, `X-Forwarded-Scheme`,
-  `X-Forwarded-Port` or `X-Forwarded-Prefix`: all instances are stripped
-  (ferryman never sets `X-Forwarded-Port` itself, see Added). Trusted peers keep
-  them. Migration: an app behind ferryman that relied on a client-supplied
-  `X-Forwarded-Ssl` / `-Scheme` / `-Prefix` arriving from an untrusted hop now
-  sees them removed; if a proxy or load balancer in front of ferryman sets
-  them, add its range to `trusted_proxies`.
-
-- Host hardening (low severity, defence in depth): when the request target
-  has no authority, the `Host` header is now validated before routing and
-  must be a single bare `host[:port]` (no userinfo, comma list, path,
-  obs-text, empty value, `*`, or a port that is not 1-5 digits <= 65535); an HTTP/1.1
-  request with neither `Host` nor an authority is rejected too (HTTP/1.0
-  without `Host` is still forwarded); more than one `Host` is rejected even when an
-  authority is present. Failures are `400 bad host` (route/upstream `none`,
-  no breaker ticket). `host` named in `Connection` is no longer stripped
-  from requests or responses. Migration: clients sending malformed, missing (1.1) or
-  duplicate `Host` now get 400. h2 `:authority` and absolute-form targets
-  still take precedence over `Host`; `local_health_path` is answered before
-  this check.
-
-- A client that stalled its upload could open the breaker for everyone: the
-  upstream's own body-read timeout produced a 502 (or a forwarded 502-504)
-  that was counted as an upstream failure, so three slow uploads yielded 503
-  for all clients. When the client left its upload idle for at least
-  min(1 s, `request_body_idle_timeout_secs` / 2), such a result now releases
-  the breaker ticket instead of counting; the response status is unchanged (`handle_streaming` only; the deprecated
-  `handle` is unchanged).
-
-### Added
-
 - Trust model completion: `X-Forwarded-Port` (never synthesised: untrusted
   peers' values are stripped and none is added; a trusted peer's rightmost
   valid value is kept, else none), optional RFC 7239 `Forwarded` output (`forwarded_header =
@@ -137,7 +184,7 @@ and `ferryman` are released together with the same version.
   `xff = "append" | "replace"` (default append), and a one-time warning when
   `trusted_proxies` is empty and a private/loopback/link-local peer connects.
   New public items: `XffMode`, `RouteTable::{with_forwarded_header,
-  forwarded_header, with_xff_mode, xff_mode}`,.
+  forwarded_header, with_xff_mode, xff_mode}`.
 
 - Reload model. The watcher now watches the config file's directory and
   reacts to any event there, so Kubernetes ConfigMap mounts (an atomic
@@ -210,84 +257,10 @@ and `ferryman` are released together with the same version.
   body error (400) and URI-rebuild 502 paths, so a client hanging up while
   holding the half-open probe no longer blocks recovery for a cooldown.
 
-### Changed (breaking)
-
-- Untrusted peers' `X-Forwarded-Ssl`, `X-Forwarded-Scheme` and
-  `X-Forwarded-Prefix` are now stripped; see the Security note above for the
-  migration. An untrusted client's `X-Forwarded-Port` is now stripped and
-  not replaced.
-- SIGHUP no longer terminates the process: it reloads the config and TLS
-  certificate (see Added). Migration: anything that used SIGHUP to stop or
-  restart ferryman must send SIGTERM (or SIGINT) instead.
-- The metrics listener is now ferryman's own admin server, not the
-  Prometheus exporter's. The old one answered `OK` on `/health` and metrics
-  on every other path and method; now `GET`/`HEAD` `/metrics` is metrics,
-  `/healthz` (alias `/health`) is `200 ok`, `/readyz` is readiness, other
-  paths 404 and other methods 405. Scrape configs and probes must use
-  `/metrics`, `/healthz` (or `/health`) or `/readyz`. The admin server is
-  HTTP/1 only. The `http-listener` feature of `metrics-exporter-prometheus`
-  is no longer used. `ConfigToml` gains a field (it is `#[non_exhaustive]`; no migration).
-
-- `build_table` rejects route prefixes containing `;`, `\`, `%2F` or `%5C`
-  (`Error::NonCanonicalPrefix`): every request to them would be 400.
-- `Route` is `#[non_exhaustive]` with a new pub `rewrite_host` field: replace
-  struct literals with `Route::new(prefix, upstream)`.
-- Paths that are ambiguous between ferryman and an upstream that treats
-  `%2F`/`%5C`/`\` as `/` or drops `;params` now get 400 `bad path` when that
-  reading would select a different route (`/api%2Fsecret`, `/api;x/x`).
-  `;params` are dropped up to the next raw `/` before decoding (Tomcat and
-  Spring order) as well. `/app;jsessionid=X` where `/app` is a route now
-  gets 400 (it used to be routed to `/`); params after a later segment
-  (`/app/x;jsessionid=X`) still pass. Migration: send plain `/` separators; encoded separators inside a segment
-  that do not change the route (`group%2Fproject`) still pass.
-- Route matching uses a normalised path: `%XX` of unreserved characters
-  (`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, and
-  repeated `/` is merged. Requests such as `/%61pi/x` or `//api/x` may now
-  match a more specific route than before (here `/api` instead of `/`).
-  Matching stays case-sensitive and `%2f` stays encoded; the forwarded path
-  is unchanged. **Migration:** write route prefixes in normalised form
-  (unreserved characters unescaped, uppercase hex, no `//`); non-normal
-  prefixes are rejected at load (`Error::NonCanonicalPrefix`).
-
-- `Error::Toml { path }` is now `Option<PathBuf>` (`None` for `from_str` /
-  `from_table`). Migration: `path.display()` becomes `path.as_deref()`;
-  `Display` is unchanged when the path is set.
-
-- `CircuitState` and `Admission` are now `#[non_exhaustive]`.
-  **Migration:** add a `_ =>` arm to any `match` on either enum.
-- `ferryman_core::Error` (new, `#[non_exhaustive]`, `std::error::Error +
-  Send + Sync + 'static`) replaces `anyhow::Error` in every public
-  `ferryman-core` signature: `build_table`, `load_config`,
-  `TrustedProxies::parse`, `Breaker::new`, `BreakerConfig::validate`.
-  Variants are matchable by category (`InvalidConfig`, `InvalidPrefix`,
-  `DuplicatePrefix`, `InvalidUpstream`, `InvalidCooldown`,
-  `ConflictingCooldown`, `InvalidCidr`, `InvalidBreakerConfig`,
-  `ReadConfig`, `Toml`). `Display` messages are unchanged; `ReadConfig` and
-  `Toml` expose the cause via `source()`, so print the chain with
-  `anyhow::Error::from(e)` and `{:#}`. `ferryman-core` no longer depends on
-  `anyhow` (it now uses `thiserror`). **Migration:** `?` into
-  `anyhow::Result` keeps working; code naming `anyhow` types for these
-  results, or relying on `{:#}` of the raw error to show the cause, must
-  change. `ferryman::serve` still returns `anyhow::Result<()>`.
-- `Upstream::new(uri, BreakerConfig) -> Result<Upstream, Error>` replaces
-  `Upstream::new(uri, cooldown, failure_threshold) -> Upstream` and now
-  rejects a cooldown under 1 ms or a zero threshold
-  (`Error::InvalidBreakerConfig`). **Migration:**
-  `Upstream::new(uri, BreakerConfig::default().with_cooldown(c).with_failure_threshold(n))?`.
-  `BreakerConfig::name` is ignored here (the breaker is named `host:port`).
-- `toml::de::Error` and `http::uri::InvalidUri` are exposed as `Error` sources
-  (`ReadConfig`/`Toml`/`InvalidUpstream`); a major bump of those crates is a
-  semver break for `ferryman-core`.
-
 ### Fixed
 
-- Health-driven recovery: a failing health check while the circuit is open
-  no longer re-stamps the cooldown. Before, with a cooldown longer than
-  `health_interval_secs` (the defaults), a broken `/health` kept the circuit
-  open forever even though real requests would succeed. Now the request-path
-  half-open probe gets its slot after the cooldown regardless; only a failed
-  half-open probe restarts the cooldown. Health successes and the
-  success-while-closed no-op are unchanged.
+- A generated `x-request-id` is no longer removed when a request names it in
+  `Connection`.
 
 ## [0.2.4] - 2026-10-11
 
@@ -501,7 +474,8 @@ First public release.
 - Prometheus metrics on a separate listener.
 - `echo_upstream` example for local benchmarking.
 
-[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Bunty9/ferryman/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/Bunty9/ferryman/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Bunty9/ferryman/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Bunty9/ferryman/compare/v0.2.1...v0.2.2

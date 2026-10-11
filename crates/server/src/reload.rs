@@ -204,7 +204,17 @@ fn reload_once(
     let cfg = raw
         .map_err(anyhow::Error::from)
         .and_then(|b| Ok(String::from_utf8(b)?))
-        .and_then(|s| s.parse::<ferryman_core::ConfigToml>().map_err(Into::into))
+        .and_then(|s| {
+            // Name the file in the error, like `load_config` does at startup.
+            s.parse::<ferryman_core::ConfigToml>().map_err(|e| match e {
+                ferryman_core::Error::Toml { source, .. } => ferryman_core::Error::Toml {
+                    path: Some(path.to_path_buf()),
+                    source,
+                }
+                .into(),
+                e => e.into(),
+            })
+        })
         .inspect_err(|e| fail(anyhow::anyhow!("{e:#}")))
         .ok()?;
     let prev = table.load_full();

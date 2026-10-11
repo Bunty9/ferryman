@@ -36,9 +36,12 @@ accept ── set TCP_NODELAY
   │
   └─ proxy::handle_streaming
        1. table.load_full()             one Arc for the whole request
-       2. bad_path_normalized(path)      raw and normalised: dot segments, NUL, %u, double-encoded -> 400
+       2. local_health_path             GET/HEAD match -> 200, answered first
+       2a. bad_path_normalized(path)     raw and normalised: dot segments, NUL, %u, double-encoded -> 400
        2b. ambiguous_route(table, path) %2F/%5C/\/; reading picks another route -> 400
-       2c. lookup(path)                 none -> 404
+       2c. bad_host                     single bare host[:port], present on 1.1 -> 400
+       2d. lookup(path)                 none -> 404
+       2e. strip_prefix remainder check  re-checked at runtime, failing -> 400 (before admission)
        3. Upgrade (not h2c) / CONNECT   -> 501
        4. upstream.try_acquire()        None -> 503, else Admission
        5. rewrite request:
@@ -50,7 +53,7 @@ accept ── set TCP_NODELAY
             version = HTTP/1.1, x-forwarded-for / -proto;
             forwarded headers per trusted_proxies: x-real-ip always set by
             ferryman; forwarded / x-forwarded-host / -ssl / -scheme / -prefix /
-            -port stripped for untrusted peers (port set from the listener);
+            -port stripped for untrusted peers (-port is never added);
             x-forwarded-proto from the connection unless trusted
        6. client.request(); body wrapped in RequestBody (idle timeout
           between frames, signals EOS). upstream_timeout (to response
@@ -59,7 +62,9 @@ accept ── set TCP_NODELAY
             upload stalled   -> 408 (no breaker effect)
             client body err  -> 400 (no breaker effect)
             transport err    -> 502 + breaker failure
-            502/503/504      -> passed through + breaker failure
+            502/503/504      -> passed through + breaker failure, unless the client
+                                stalled its upload >= min(1s, idle timeout/2):
+                                then the ticket is released (status unchanged)
             anything else    -> passed through + breaker success
        7. strip hop-by-hop from the response, stream the body back
 ```

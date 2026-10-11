@@ -19,13 +19,16 @@ per request.
 | `X-Forwarded-Scheme` | stripped | kept |
 | `X-Forwarded-Prefix` | stripped; set to the prefix on `strip_prefix` routes | kept; on `strip_prefix` routes a single plain-path value is prepended (`/outer` + `/api` = `/outer/api`), anything else is replaced |
 
-Request headers that differ from a trust-governed header only by `_` for `-`
-(for example `X_Real_IP`) are removed for every peer.
+Request headers whose name maps onto a trust-governed one when every
+non-alphanumeric byte is read as `-` (runs collapsed, ends trimmed; for
+example `X_Real_IP`, `X.Real.IP`) are removed for every peer.
 
 ## Details
 
-- ferryman does not add `X-Forwarded-Host` itself; the `Host` header is
-  unchanged.
+- ferryman never sets `X-Forwarded-Host`. The `Host` header is forwarded
+  unchanged unless the route has `rewrite_host = true`, which replaces it with
+  the upstream's authority; the client's host is then lost to the app unless
+  you set `forwarded_header = true` (its `host=` carries it).
 - In `Forwarded`, `for=` is the connecting peer, `proto=` is this hop's
   connection scheme and `host=` is the client's own host (URI authority, else
   `Host`), also with `rewrite_host = true`.

@@ -7,7 +7,7 @@ name: kiln
 
 on:
   push:
-    branches: [phase-1]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

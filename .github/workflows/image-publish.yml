@@ -17,6 +17,7 @@ permissions: {}
 jobs:
   image:
     name: image
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:
       group: ghcr-image
@@ -40,10 +41,25 @@ jobs:
             exit 1
           fi
 
-      # Default ref (main): Dockerfile.release and the extract script.
+      # Checks out main (the job only runs there): Dockerfile.release and the
+      # extract script.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+
+      # The binaries were built from the tag's commit, not main's. The tags/
+      # endpoint cannot match a same-named branch.
+      - id: rev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/tags/$TAG" -q .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # Only the newest stable release may move X.Y / latest (no rollback).
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name)
+          echo "is_latest=$([ "$latest" = "$TAG" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: Download the release's musl archives
         env:
@@ -58,13 +74,17 @@ jobs:
       - name: Verify checksums and build provenance
         env:
           GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.rev.outputs.sha }}
         run: |
           set -euo pipefail
           cd dist
           sha256sum --ignore-missing -c SHA256SUMS
           [ "$(sha256sum --ignore-missing -c SHA256SUMS | wc -l)" -eq 2 ]
           for a in ferryman-v*-unknown-linux-musl.tar.gz; do
-            gh attestation verify "$a" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "$a" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$TAG" --source-digest "$SHA" \
+              --deny-self-hosted-runners
           done
 
       - name: Unpack the musl binaries
@@ -76,33 +96,22 @@ jobs:
             exit 1
           fi
 
-      # The binaries were built from the tag's commit, not main's.
-      - id: rev
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" -q .sha)
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        env:
-          DOCKER_METADATA_PR_HEAD_SHA: "false"
         with:
           images: ${{ env.IMAGE }}
           flavor: latest=false
-          # X.Y and latest are for stable tags only (no '-' in the tag).
+          # X.Y and latest: stable and newest release only.
           # Not a tag-ref run, so the version comes from the input, not git.
           tags: |
             type=semver,pattern={{version}},value=${{ inputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }},enable=${{ !contains(inputs.tag, '-') }}
-            type=raw,value=latest,enable=${{ !contains(inputs.tag, '-') }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }},enable=${{ steps.rev.outputs.is_latest == 'true' && !contains(inputs.tag, '-') }}
+            type=raw,value=latest,enable=${{ steps.rev.outputs.is_latest == 'true' && !contains(inputs.tag, '-') }}
           labels: |
             org.opencontainers.image.licenses=MIT OR Apache-2.0
             org.opencontainers.image.title=ferryman
-            org.opencontainers.image.version=${{ inputs.tag }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
+          annotations: |
             org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
 
       # BuildKit pinned by digest (v0.34.0), and the Dockerfile uses the

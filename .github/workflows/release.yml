@@ -353,7 +353,8 @@ jobs:
   # tier-1 musl release binaries: nothing is recompiled, so the image holds
   # exactly the attested archive contents. Runs after `publish` (the crates
   # are the primary artefact) and `release` does not wait for it; if it
-  # fails, re-run `image` / `image-attest` only (docs/plans/2026-09-28-publishing.md).
+  # fails, recover with the `image-publish.yml` dispatch, not a re-run
+  # (docs/plans/2026-09-28-publishing.md).
   # Holds `packages: write` but NOT `id-token`: the attestation is a separate
   # job. Checkout is for Dockerfile.release and config.toml only; no cargo.
   # Skipped on dispatch dry runs (see `image-dry-run`).

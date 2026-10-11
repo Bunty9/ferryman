@@ -223,11 +223,13 @@ If `image` or `image-attest` fails, do **not** re-run the tag's run: a
 re-run uses the tag's own (possibly buggy) workflow file. Instead dispatch
 `.github/workflows/image-publish.yml` (Actions -> image-publish -> Run
 workflow, or `gh workflow run image-publish.yml -f tag=vX.Y.Z`). It runs
-from main's `Dockerfile.release` and scripts, downloads the tag's GitHub
+(from main only) with main's `Dockerfile.release` and scripts, downloads the tag's GitHub
 release archives, verifies `SHA256SUMS` and each archive's build-provenance
-attestation, then builds, pushes and attests as `image`/`image-attest` do.
+attestation (pinned to `release.yml`, the tag and its commit), then builds, pushes and attests as `image`/`image-attest` do.
 The push is a fresh image (new `created` label, so a new digest) that moves
-the tags; the crates and GitHub release are unaffected. **Never re-run `binaries` after
+the tags (X.Y and `latest` only if the tag is the newest stable release);
+the image's attestation is signed by `image-publish.yml`, not `release.yml`.
+The crates and GitHub release are unaffected. **Never re-run `binaries` after
 `release` has succeeded**: it re-runs the dependent jobs, and `release`
 uploads with `--clobber`, replacing the attested archives with a rebuild.
 

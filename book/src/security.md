@@ -18,6 +18,11 @@ gh attestation verify ferryman-v$v-$t.tar.gz --repo Bunty9/ferryman
 gh attestation verify oci://ghcr.io/bunty9/ferryman:X.Y.Z --repo Bunty9/ferryman
 ```
 
+An image pushed by the normal release is signed by `release.yml`; one recovered
+after a failed release job is signed by `image-publish.yml`. Verify with
+`--repo` as above, and add `--signer-workflow
+Bunty9/ferryman/.github/workflows/<release|image-publish>.yml` to pin one.
+
 Releases also publish `SHA256SUMS` and a `.sha256` file per archive
 ([Quickstarts](quickstarts.md#release-archives)). Tier-1 binaries embed their
 dependency list (`cargo auditable`), so `cargo audit bin ./ferryman` works on

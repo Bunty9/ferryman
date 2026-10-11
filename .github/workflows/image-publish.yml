@@ -76,6 +76,16 @@ jobs:
             exit 1
           fi
 
+      # The binaries were built from the tag's commit, not main's.
+      - id: rev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" -q .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         env:
@@ -93,6 +103,7 @@ jobs:
             org.opencontainers.image.licenses=MIT OR Apache-2.0
             org.opencontainers.image.title=ferryman
             org.opencontainers.image.version=${{ inputs.tag }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
 
       # BuildKit pinned by digest (v0.34.0), and the Dockerfile uses the
       # builtin frontend (no `# syntax=` pull), so the build toolchain is fixed.

@@ -36,6 +36,8 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-nextest
+      - name: Release script self-test
+        run: bash scripts/test-extract-release-bins.sh
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy

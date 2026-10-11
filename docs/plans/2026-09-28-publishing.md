@@ -219,11 +219,15 @@ profile or org -> Packages -> `ferryman` -> Package settings -> Change
 visibility -> Public (also link it to the repository there if it isn't
 already). Until then anonymous `docker pull` fails with `unauthorized`.
 
-If `image` or `image-attest` fails (transient registry error), re-run just
-that job (and `image-attest` after `image`) from the Actions UI while the
-tier-1 artifacts exist (30 day retention). A re-run pushes a fresh image
-(new `created` label, so a new digest) and moves the tags to it; the
-crates and GitHub release are unaffected. **Never re-run `binaries` after
+If `image` or `image-attest` fails, do **not** re-run the tag's run: a
+re-run uses the tag's own (possibly buggy) workflow file. Instead dispatch
+`.github/workflows/image-publish.yml` (Actions -> image-publish -> Run
+workflow, or `gh workflow run image-publish.yml -f tag=vX.Y.Z`). It runs
+from main's `Dockerfile.release` and scripts, downloads the tag's GitHub
+release archives, verifies `SHA256SUMS` and each archive's build-provenance
+attestation, then builds, pushes and attests as `image`/`image-attest` do.
+The push is a fresh image (new `created` label, so a new digest) that moves
+the tags; the crates and GitHub release are unaffected. **Never re-run `binaries` after
 `release` has succeeded**: it re-runs the dependent jobs, and `release`
 uploads with `--clobber`, replacing the attested archives with a rebuild.
 

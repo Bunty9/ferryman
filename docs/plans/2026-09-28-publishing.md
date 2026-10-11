@@ -199,6 +199,27 @@ checkout of the tagged commit, with a crates.io token via `cargo login`
 --notes-file <(...)` using the same `CHANGELOG.md` section (see the
 `awk` command in `release.yml`'s "Extract CHANGELOG.md section" step).
 
+### The GHCR image (`image` job)
+
+After `publish` succeeds, the `image` job builds `Dockerfile.release` from
+the tier-1 musl archives (no recompile) for linux/amd64 + linux/arm64 and
+pushes `ghcr.io/bunty9/ferryman` with tags `X.Y.Z`, `X.Y`, `latest` (for a
+prerelease tag `v…-*`: only `X.Y.Z`), OCI labels, and a build provenance
+attestation pushed to the registry. It is the only job with
+`packages: write`, is skipped on `workflow_dispatch` dry runs, and
+`release` does not wait for it (the crates are the primary artefact).
+
+**One-time manual step:** the first push creates the GHCR package as
+*private*. After the first image release, make it public once: GitHub
+profile or org -> Packages -> `ferryman` -> Package settings -> Change
+visibility -> Public (also link it to the repository there if it isn't
+already). Until then anonymous `docker pull` fails with `unauthorized`.
+
+If `image` fails (transient registry error), re-run just that job from the
+Actions UI; it is idempotent (tags are overwritten with the same content
+and it needs the tier-1 artifacts, so re-run `binaries` too if they
+expired, 7 day retention). The crates and GitHub release are unaffected.
+
 ### Release procedure (once Trusted Publishing is set up)
 
 1. Bump the version in **`[workspace.package]`**, the `ferryman-core`
@@ -224,7 +245,8 @@ checkout of the tagged commit, with a crates.io token via `cargo login`
    ```
 6. `release.yml` runs on the tag push: tests, publishes both crates to
    crates.io, and creates the `vX.Y.Z` GitHub release from the
-   `CHANGELOG.md` section. Nothing further to do by hand — and if any
+   `CHANGELOG.md` section, then pushes the GHCR image (`image` job).
+   Nothing further to do by hand — and if any
    step fails partway, see "recovering from a half-published release"
    above.
 

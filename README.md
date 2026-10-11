@@ -108,6 +108,39 @@ cargo install --locked ferryman  # builds from crates.io (Rust 1.88+)
 docker build -t ferryman .       # static musl binary in a scratch image
 ```
 
+### Docker image
+
+Multi-arch (linux/amd64, linux/arm64) images are published to GHCR from the
+release binaries, with build provenance attached:
+`ghcr.io/bunty9/ferryman:X.Y.Z`, `:X.Y` and `:latest` (prereleases get only
+the exact tag). Verify with
+`gh attestation verify oci://ghcr.io/bunty9/ferryman:X.Y.Z --repo Bunty9/ferryman`.
+
+```bash
+docker run --rm --read-only -p 8080:8080 -p 127.0.0.1:9090:9090 \
+  -v "$PWD/config:/etc/ferryman:ro" \
+  ghcr.io/bunty9/ferryman:latest --config /etc/ferryman/ferryman.toml
+```
+
+```yaml
+# docker-compose.yml
+services:
+  ferryman:
+    image: ghcr.io/bunty9/ferryman:latest
+    read_only: true
+    command: ["--config", "/etc/ferryman/ferryman.toml"]
+    volumes: ["./config:/etc/ferryman:ro"]
+    ports: ["8080:8080", "127.0.0.1:9090:9090"]
+```
+
+The image is `FROM scratch` and runs as **uid/gid 65532** (non-root) with no
+writable paths, so `--read-only` / `read_only: true` works. Mounted config,
+TLS certificate and key files must be readable by 65532: mode `0644`, or
+group-readable plus `--group-add <gid>` (compose `group_add`, Kubernetes
+`fsGroup`). A `0600` file owned by your own user is not readable and the
+container fails at startup with a permission error. Mount the config as a
+directory so hot reload sees rename-replace saves.
+
 On Windows, Ctrl-C drains gracefully; console close / system shutdown
 starts the drain, but Windows terminates the process after about 5 s.
 

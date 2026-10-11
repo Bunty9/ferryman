@@ -136,6 +136,7 @@ body_of() {
 # this script uses for the *first* config swap in the hot-reload step, so
 # that step actually pins rename-replace working, unmodified.
 swap_config() {
+    chmod 0644 "$CONFIG_TMP" # container runs as 65532: file must be world-readable
     mv "$CONFIG_TMP" "$CONFIG_FILE"
 }
 
@@ -153,6 +154,7 @@ swap_config() {
 # note for the production implication.
 swap_config_unlink() {
     rm -f "$CONFIG_FILE"
+    chmod 0644 "$CONFIG_TMP" # container runs as 65532: file must be world-readable
     mv "$CONFIG_TMP" "$CONFIG_FILE"
 }
 

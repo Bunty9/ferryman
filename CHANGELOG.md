@@ -9,6 +9,10 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Multi-arch (amd64, arm64) Docker image on GHCR, `ghcr.io/bunty9/ferryman`
+  (`X.Y.Z`, `X.Y`, `latest`; prereleases only the exact tag). Built by the
+  release workflow's new `image` job from the attested tier-1 musl binaries
+  (no rebuild), with OCI labels and a build provenance attestation.
 - systemd support: `deploy/systemd/ferryman.service` (hardened, `Type=notify`,
   `LoadCredential` TLS) and `sd_notify` over `$NOTIFY_SOCKET` (`READY=1`,
   `RELOADING=1` + `MONOTONIC_USEC` around SIGHUP reloads, `STOPPING=1`);
@@ -31,6 +35,12 @@ and `ferryman` are released together with the same version.
 
 ### Changed (breaking)
 
+- The Docker image now runs as uid/gid `65532:65532` instead of root. Files
+  you mount (config, TLS cert and key) must be readable by 65532: make them
+  world-readable (`chmod 0644`), or group-readable and add the group
+  (`--group-add`, compose `group_add`, Kubernetes `fsGroup`). The image writes
+  nothing to its filesystem, so `--read-only` works. Binding 8080/9090 and
+  the built-in `HEALTHCHECK` are unaffected.
 - Cargo features: the new default `bin` feature gates the binary and its
   dependencies (`clap`, `tracing-subscriber`, `metrics-util`); `ferryman::admin`
   now needs feature `admin` (`metrics-exporter-prometheus`) and

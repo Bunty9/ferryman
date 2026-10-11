@@ -3,7 +3,7 @@
 //! hyper client, records metrics, and turns transport failures into
 //! circuit-breaker trips.
 
-use ferryman_core::{SharedTable, TrustedProxies, XffMode};
+use ferryman_core::{RouteTable, SharedTable, TrustedProxies, XffMode};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -20,6 +20,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::time::Sleep;
+use tracing::Instrument;
 
 #[allow(deprecated)]
 use crate::ProxyClient;
@@ -299,16 +300,82 @@ pub async fn handle(
     handle_inner(table, client, peer, None, proto, req, |b, _, _| (b, None)).await
 }
 
-/// Shared core. `wrap` turns the inbound body into the client's body type and
-/// optionally returns an end-of-body signal; without one (legacy), the
-/// upstream timeout starts immediately and only counts for bodyless requests.
+/// Per-request state for the access log line (`None` = `access_log = false`).
+struct Cx {
+    started: Instant,
+    log: Option<AccessInfo>,
+}
+
+struct AccessInfo {
+    method: http::Method,
+    host: String,
+    path: String,
+    version: http::Version,
+    peer: IpAddr,
+    proto: &'static str,
+    request_id: Option<String>,
+}
+
+const MAX_LOGGED_PATH: usize = 512;
+const MAX_REQUEST_ID: usize = 128;
+
+/// Log-safe copy: at most `max` bytes, anything but visible ASCII becomes `?`
+/// (no newline/ANSI injection into text logs).
+fn sanitize(s: &str, max: usize) -> String {
+    s.bytes()
+        .take(max)
+        .map(|b| {
+            if (0x21..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+fn valid_request_id(v: &HeaderValue) -> bool {
+    let b = v.as_bytes();
+    !b.is_empty() && b.len() <= MAX_REQUEST_ID && b.iter().all(|c| (0x21..=0x7e).contains(c))
+}
+
+/// 128 random-ish bits as hex. Not cryptographic: per-process random hasher
+/// keys mixed with a counter; unique enough to correlate log lines.
+fn generate_request_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut out = String::with_capacity(32);
+    for _ in 0..2 {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
+}
+
+/// Keeps a valid incoming `x-request-id`, else replaces it with a fresh one.
+fn ensure_request_id(headers: &mut HeaderMap) -> String {
+    const NAME: HeaderName = HeaderName::from_static("x-request-id");
+    if let Some(v) = headers.get(NAME).filter(|v| valid_request_id(v)) {
+        return String::from_utf8_lossy(v.as_bytes()).into_owned();
+    }
+    let id = generate_request_id();
+    headers.insert(
+        NAME,
+        HeaderValue::from_str(&id).expect("hex is a valid header value"),
+    );
+    id
+}
+
+/// Wraps the core in the request span, sets up the access-log context and the
+/// optional `x-request-id` (on the upstream request and the response).
 async fn handle_inner<B>(
     table: SharedTable,
     client: Client<HttpConnector, B>,
     peer: SocketAddr,
     local_port: Option<u16>,
     proto: &'static str,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
 ) -> Result<Response<ResponseBody>, Infallible>
 where
@@ -320,13 +387,76 @@ where
     // `.await` points below; `load`'s guard is meant for short critical
     // sections only.
     let table = table.load_full();
+    let request_id = if table.request_id() {
+        Some(ensure_request_id(req.headers_mut()))
+    } else if table.access_log() {
+        req.headers()
+            .get("x-request-id")
+            .filter(|v| valid_request_id(v))
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+    } else {
+        None
+    };
+    let log = table.access_log().then(|| {
+        let host = match req.uri().authority() {
+            Some(a) => sanitize(a.as_str(), 255),
+            None => req
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map_or_else(|| "-".to_string(), |h| sanitize(h, 255)),
+        };
+        AccessInfo {
+            method: req.method().clone(),
+            host,
+            path: sanitize(req.uri().path(), MAX_LOGGED_PATH),
+            version: req.version(),
+            peer: peer.ip(),
+            proto,
+            request_id: request_id.clone(),
+        }
+    });
+    // Bounded fields only: never the raw path.
+    let span = tracing::info_span!(
+        "request",
+        method = %req.method(),
+        route = tracing::field::Empty,
+        upstream = tracing::field::Empty,
+    );
+    let cx = Cx { started, log };
+    let Ok(mut resp) = handle_core(table, client, peer, local_port, proto, req, wrap, &cx)
+        .instrument(span)
+        .await;
+    if let Some(v) = request_id.and_then(|id| HeaderValue::from_str(&id).ok()) {
+        resp.headers_mut().entry("x-request-id").or_insert(v);
+    }
+    Ok(resp)
+}
 
+/// Shared core. `wrap` turns the inbound body into the client's body type and
+/// optionally returns an end-of-body signal; without one (legacy), the
+/// upstream timeout starts immediately and only counts for bodyless requests.
+#[allow(clippy::too_many_arguments)]
+async fn handle_core<B>(
+    table: Arc<RouteTable>,
+    client: Client<HttpConnector, B>,
+    peer: SocketAddr,
+    local_port: Option<u16>,
+    proto: &'static str,
+    req: Request<Incoming>,
+    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
+    cx: &Cx,
+) -> Result<Response<ResponseBody>, Infallible>
+where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     // Answered before bad_path/lookup: no upstream, no breaker. Exact match
     // on the raw path. Metric label is the fixed "local_health".
     if table.local_health_path() == Some(req.uri().path())
         && matches!(*req.method(), http::Method::GET | http::Method::HEAD)
     {
-        record(started, "local_health", "none", 200);
+        record(cx, "local_health", "none", 200);
         let body = if req.method() == http::Method::HEAD {
             ""
         } else {
@@ -338,21 +468,24 @@ where
     if ferryman_core::path::bad_path_normalized(req.uri().path())
         || ferryman_core::path::ambiguous_route(&table, req.uri().path())
     {
-        record(started, "none", "none", 400);
+        record(cx, "none", "none", 400);
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
     }
 
     if bad_host(req.headers(), req.uri(), req.version()) {
-        record(started, "none", "none", 400);
+        record(cx, "none", "none", 400);
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad host\n"));
     }
 
     let Some(route) = table.lookup(req.uri().path()) else {
-        record(started, "none", "none", 404);
+        record(cx, "none", "none", 404);
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
     };
     let route_label = route.prefix.clone();
     let upstream = route.upstream.clone();
+    let span = tracing::Span::current();
+    span.record("route", route_label.as_str());
+    span.record("upstream", &*upstream.name);
     let rewrite_host = route.rewrite_host;
     // bad_path/ambiguous_route already accepted the raw path; strip only
     // after them, on the normalised path, and re-check the result.
@@ -360,7 +493,7 @@ where
         match route.stripped_path(req.uri().path()) {
             Some(p) => Some((p, route.stripped_prefix().to_string())),
             None => {
-                record(started, "none", "none", 400);
+                record(cx, "none", "none", 400);
                 return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
             }
         }
@@ -377,7 +510,7 @@ where
         .get(header::UPGRADE)
         .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
     if wants_upgrade || req.method() == http::Method::CONNECT {
-        record(started, &route_label, &upstream.name, 501);
+        record(cx, &route_label, &upstream.name, 501);
         return Ok(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "protocol upgrades are not supported",
@@ -385,7 +518,7 @@ where
     }
 
     let Some(admission) = upstream.try_acquire() else {
-        record(started, &route_label, &upstream.name, 503);
+        record(cx, &route_label, &upstream.name, 503);
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream unavailable",
@@ -451,7 +584,7 @@ where
                 Err(_) => {
                     // Request-derived, so the client's fault.
                     upstream.release(admission);
-                    record(started, &route_label, &upstream.name, 400);
+                    record(cx, &route_label, &upstream.name, 400);
                     return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
                 }
             }
@@ -462,7 +595,7 @@ where
         Ok(uri) => uri,
         Err(e) => {
             upstream.release(admission);
-            record(started, &route_label, &upstream.name, 502);
+            record(cx, &route_label, &upstream.name, 502);
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 format!("rebuilding upstream URI: {e}"),
@@ -544,7 +677,7 @@ where
             if counts_timeout {
                 upstream.record_failure(admission);
             }
-            record(started, &route_label, &upstream.name, 504);
+            record(cx, &route_label, &upstream.name, 504);
             Ok(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream timeout",
@@ -554,7 +687,7 @@ where
             // The client stalled or over-ran its upload: 408, no breaker effect.
             upstream.release(admission);
             tracing::debug!("client request body idle timeout");
-            record(started, &route_label, &upstream.name, 408);
+            record(cx, &route_label, &upstream.name, 408);
             Ok(error_response(
                 StatusCode::REQUEST_TIMEOUT,
                 "request body timeout",
@@ -565,7 +698,7 @@ where
             // Not the upstream's fault, so the breaker stays out of it.
             upstream.release(admission);
             tracing::debug!(error = %e, "client request body failed");
-            record(started, &route_label, &upstream.name, 400);
+            record(cx, &route_label, &upstream.name, 400);
             Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 "request body error",
@@ -578,7 +711,7 @@ where
                 upstream.record_failure(admission);
             }
             tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
-            record(started, &route_label, &upstream.name, 502);
+            record(cx, &route_label, &upstream.name, 502);
             Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
         }
         Some(Ok(resp)) => {
@@ -594,7 +727,12 @@ where
             } else {
                 upstream.record_success(admission);
             }
-            record(started, &route_label, &upstream.name, status.as_u16());
+            let len = resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            record_len(cx, &route_label, &upstream.name, status.as_u16(), len);
 
             let (mut rparts, rbody) = resp.into_parts();
             strip_hop_by_hop(&mut rparts.headers);
@@ -1014,7 +1152,32 @@ fn append_forwarded_for(headers: &mut HeaderMap, ip: IpAddr) {
     }
 }
 
-fn record(started: Instant, route: &str, upstream: &str, status: u16) {
+fn record(cx: &Cx, route: &str, upstream: &str, status: u16) {
+    record_len(cx, route, upstream, status, None);
+}
+
+/// Metrics plus the access log line. `bytes_out` is the response
+/// `Content-Length` when known (streamed bodies are not counted).
+fn record_len(cx: &Cx, route: &str, upstream: &str, status: u16, bytes_out: Option<u64>) {
+    let started = cx.started;
+    if let Some(a) = &cx.log {
+        tracing::info!(
+            target: "ferryman::access",
+            method = %a.method,
+            host = %a.host,
+            path = %a.path,
+            route,
+            upstream,
+            status,
+            bytes_out,
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            request_id = a.request_id.as_deref(),
+            peer = %a.peer,
+            scheme = a.proto,
+            version = ?a.version,
+            "request"
+        );
+    }
     metrics::counter!(
         "ferryman_requests_total",
         "route" => route.to_string(),

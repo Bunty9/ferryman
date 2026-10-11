@@ -203,6 +203,8 @@ pub struct RouteTable {
     forwarded_header: bool,
     xff_mode: crate::config::XffMode,
     local_health_path: Option<String>,
+    access_log: bool,
+    request_id: bool,
 }
 
 impl RouteTable {
@@ -222,6 +224,8 @@ impl RouteTable {
             forwarded_header: false,
             xff_mode: crate::config::XffMode::default(),
             local_health_path: None,
+            access_log: true,
+            request_id: false,
         }
     }
 
@@ -294,6 +298,28 @@ impl RouteTable {
     pub fn with_forwarded_header(mut self, on: bool) -> Self {
         self.forwarded_header = on;
         self
+    }
+
+    /// Emit the per-request access log line (config `access_log`; default true).
+    pub fn with_access_log(mut self, on: bool) -> Self {
+        self.access_log = on;
+        self
+    }
+
+    /// Generate/validate `x-request-id` (config `request_id`; default false).
+    pub fn with_request_id(mut self, on: bool) -> Self {
+        self.request_id = on;
+        self
+    }
+
+    /// Whether the access log line is emitted.
+    pub fn access_log(&self) -> bool {
+        self.access_log
+    }
+
+    /// Whether `x-request-id` is generated/validated.
+    pub fn request_id(&self) -> bool {
+        self.request_id
     }
 
     /// Set how `X-Forwarded-For` is built (config `xff`; default append).

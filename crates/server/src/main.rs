@@ -48,6 +48,16 @@ struct Args {
     /// TLS private key PEM path. Requires `--tls-cert`.
     #[arg(long, global = true, env = "FERRYMAN_TLS_KEY")]
     tls_key: Option<PathBuf>,
+
+    /// Log output format: `json` (default) or `text`.
+    #[arg(long, env = "FERRYMAN_LOG_FORMAT", value_enum, default_value_t = LogFormat::Json)]
+    log_format: LogFormat,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFormat {
+    Json,
+    Text,
 }
 
 #[derive(Subcommand, Debug)]
@@ -123,12 +133,13 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .json()
-        .init();
+    let fmt = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    match args.log_format {
+        LogFormat::Json => fmt.json().init(),
+        LogFormat::Text => fmt.init(),
+    }
 
     // Installed before any slow startup work: SIGHUP's default action kills
     // the process, and it now means "reload".
@@ -324,7 +335,24 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_bind;
+    use super::{resolve_bind, Args, LogFormat};
+    use clap::Parser;
+
+    #[test]
+    fn log_format_flag() {
+        let f =
+            |a: &[&str]| Args::try_parse_from(std::iter::once("ferryman").chain(a.iter().copied()));
+        assert_eq!(f(&[]).unwrap().log_format, LogFormat::Json);
+        assert_eq!(
+            f(&["--log-format", "text"]).unwrap().log_format,
+            LogFormat::Text
+        );
+        assert_eq!(
+            f(&["--log-format", "json"]).unwrap().log_format,
+            LogFormat::Json
+        );
+        assert!(f(&["--log-format", "xml"]).is_err());
+    }
 
     #[test]
     fn bind_order() {

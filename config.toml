@@ -59,6 +59,11 @@ default_cooldown_secs = 30
 # forwarded_header = false
 # xff = "append"
 
+# One `ferryman::access` log line per request (default true; query string is
+# never logged) and optional x-request-id generation (default false).
+# access_log = true
+# request_id = false
+
 # Shutdown (SIGTERM/SIGINT). /readyz goes 503 immediately; ferryman keeps
 # serving for shutdown_delay_secs (0..=86400, default 0) so a load balancer
 # can deregister it, then stops accepting and waits up to drain_timeout_secs

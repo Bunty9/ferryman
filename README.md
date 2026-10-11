@@ -193,6 +193,8 @@ fail loudly instead of silently falling back to defaults.
 | `shutdown_delay_secs`            | 0       | On SIGTERM/SIGINT, `/readyz` flips to 503 at once and ferryman keeps accepting for this long (0-86400) before the drain starts. Read at shutdown, so a reload applies. |
 | `local_health_path`              | none    | Path the proxy answers itself (`GET`/`HEAD` -> `200 ok`, no upstream, no breaker; metric `route="local_health"`), for PaaS platforms that only probe the serving port. Absolute, no `?`/`#`; rejected if equal to a route prefix; shadows a route prefix it falls under (e.g. `/up` under a `/` catch-all). Hot-reloads. |
 | `forwarded_header`               | `false` | Also add an RFC 7239 `Forwarded` element `for=<peer>;proto=<scheme>;host=<Host>` (IPv6 as `for="[2001:db8::1]"`). Untrusted peer: a fresh element; trusted: appended to the incoming list. Hot-reloads. |
+| `access_log`                     | `true`  | One `ferryman::access` log line per request (see "Logging"). Hot-reloads. |
+| `request_id`                     | `false` | Generate `x-request-id` when absent (or invalid) and set it on the upstream request and the response. Hot-reloads. |
 | `xff`                            | `"append"` | `"append"`: peer added to the incoming `X-Forwarded-For`. `"replace"`: set to the single client address ferryman puts in `X-Real-IP`. Hot-reloads. |
 | `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
 | `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the normalised, case-sensitive request path (see "Routing and access control"). |
@@ -269,7 +271,40 @@ CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
 `0.0.0.0:$PORT` (ignored with a warning if not a valid port) >
 `0.0.0.0:8080`), `--metrics-bind`
 (`FERRYMAN_METRICS_BIND`, `0.0.0.0:9090`), `--tls-cert` / `--tls-key`
-(`FERRYMAN_TLS_CERT` / `FERRYMAN_TLS_KEY`).
+(`FERRYMAN_TLS_CERT` / `FERRYMAN_TLS_KEY`), `--log-format text|json`
+(`FERRYMAN_LOG_FORMAT`, default `json`).
+
+### Logging
+
+Logs go to stdout as JSON by default; `--log-format text` (or
+`FERRYMAN_LOG_FORMAT=text`) gives the human-readable format. Filter with
+`RUST_LOG` (default `info`).
+
+With `access_log = true` (default) every request, including early rejections
+(400, 404, 501, 503, 408, 502, 504 and `local_health_path`), logs one `info`
+line with target `ferryman::access` and fields: `method`, `host` (URI
+authority or `Host`, `-` if none), `path`, `route` (config prefix, `none`,
+or `local_health`), `upstream` (`host:port` or `none`), `status`, `bytes_out`,
+`duration_ms`, `request_id`, `peer` (connecting IP, not `X-Forwarded-For`),
+`scheme`, `version`. Notes:
+
+- The query string is never logged (it may carry secrets). `path` is the raw
+  path, non-visible-ASCII bytes replaced by `?`, truncated to 512 bytes.
+- `duration_ms` runs to the response headers (like the metric), not the end
+  of the streamed body. `bytes_out` is the response `Content-Length` when the
+  upstream sent one; it is omitted otherwise and for ferryman's own error
+  responses.
+- Each request runs in a `request` span with bounded fields `method`, `route`,
+  `upstream` (never the raw path), so breaker transition logs emitted during
+  the request appear under it. Disable the access lines with
+  `access_log = false`; the span stays.
+- `request_id = true`: a valid incoming `x-request-id` (1-128 visible ASCII
+  bytes) is kept, else a random 32-hex id replaces it. It is sent upstream,
+  echoed on the response (unless the upstream sets its own) and logged. With
+  `request_id = false` ferryman touches nothing but still logs a valid
+  incoming id.
+- `traceparent` and `tracestate` are end-to-end headers: forwarded to the
+  upstream and returned untouched. ferryman does not emit spans over OTLP.
 
 ### Inline config (`FERRYMAN_CONFIG_TOML`)
 

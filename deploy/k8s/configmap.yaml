@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ferryman-config
+  labels:
+    app.kubernetes.io/name: ferryman
+data:
+  ferryman.toml: |
+    # Mounted as a directory at /etc/ferryman. Edit this ConfigMap and the
+    # kubelet refreshes the files (up to ~60-90 s); ferryman hot-reloads the
+    # ..data symlink swap without a restart. A config that fails to parse is
+    # logged and the old routes stay live.
+
+    # Pod termination: /readyz flips to 503 at once, ferryman keeps accepting
+    # for shutdown_delay_secs while endpoints propagate, then drains for up
+    # to drain_timeout_secs. The Deployment's terminationGracePeriodSeconds
+    # must exceed delay + drain.
+    shutdown_delay_secs = 10
+    drain_timeout_secs = 15
+
+    # Uncomment when a load balancer or ingress sits in front (see README
+    # "Forwarded headers and trusted_proxies"); use your pod/LB CIDRs.
+    # trusted_proxies = ["10.0.0.0/8"]
+
+    # Replace with your own routes. "app" is a Service in the same namespace.
+    [[routes]]
+    prefix = "/app"
+    upstream = "http://app:8080"

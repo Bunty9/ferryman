@@ -168,6 +168,52 @@ fn shutdown_delay_keeps_serving_then_drain_is_bounded() {
 }
 
 #[test]
+fn cloud_run_profile_exits_within_the_kill_window() {
+    // Cloud Run: SIGTERM, SIGKILL after 10 s. shutdown_delay 0 + drain 8 must
+    // beat that even with a request stuck on a hung upstream.
+    let hang = TcpListener::bind("127.0.0.1:0").unwrap();
+    let up = hang.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in hang.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    let toml = format!("shutdown_delay_secs = 0\ndrain_timeout_secs = 8\n{ROUTE}")
+        .replace("http://127.0.0.1:1", &format!("http://{up}"));
+    let mut p = start(&toml, "0");
+    assert_eq!(get(p.proxy, "/up"), Some(200));
+
+    let mut inflight = TcpStream::connect(p.proxy).unwrap();
+    inflight
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let t0 = Instant::now();
+    Command::new("kill")
+        .args(["-TERM", &p.child.id().to_string()])
+        .status()
+        .unwrap();
+    let status = loop {
+        if let Some(s) = p.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "still running after 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(
+        t0.elapsed() >= Duration::from_secs(7),
+        "drain did not wait for the in-flight request: {:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
 fn bad_port_is_a_startup_error() {
     let o = Command::new(env!("CARGO_BIN_EXE_ferryman"))
         .env("PORT", "nope")

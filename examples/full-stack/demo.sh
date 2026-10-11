@@ -335,6 +335,20 @@ else
     fail "forwarded-header check failed: proto=$proto xff=$xff has_secret=$has_secret"
 fi
 
+# Untrusted client (trusted_proxies is empty): forged forwarding headers are
+# replaced or stripped; X-Real-IP is derived from the TCP peer.
+json=$(body_of --cacert "$CA" --http1.1 -H "X-Real-IP: 203.0.113.9" \
+    -H "X-Forwarded-Proto: http" -H "X-Forwarded-Host: evil.example" \
+    "$BASE/api/users/echo")
+real=$(printf '%s' "$json" | jq -r '.headers["x-real-ip"] // empty')
+proto=$(printf '%s' "$json" | jq -r '.headers["x-forwarded-proto"] // empty')
+fwdhost=$(printf '%s' "$json" | jq -r '.headers["x-forwarded-host"] // empty')
+if [ -n "$real" ] && [ "$real" != "203.0.113.9" ] && [ "$proto" = "https" ] && [ -z "$fwdhost" ]; then
+    ok "untrusted client: forged X-Real-IP replaced ($real), X-Forwarded-Proto forced to https, X-Forwarded-Host stripped"
+else
+    fail "forged-header check failed: x-real-ip=$real proto=$proto x-forwarded-host=$fwdhost"
+fi
+
 ########################################################################
 # Step 5: streaming responses + large request bodies
 ########################################################################
@@ -496,7 +510,10 @@ expect_status "$GRAFANA/api/dashboards/uid/ferryman" 200
 # Step 11: hot reload (valid, then invalid, then restore)
 ########################################################################
 step "Hot reload: add a route, reject invalid TOML, restore"
+# The reload also adds trusted_proxies (the client's address is a private one
+# here), checked right after the new route is live.
 {
+    echo 'trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]'
     cat "$CONFIG_FILE"
     echo
     echo '[[routes]]'
@@ -505,6 +522,18 @@ step "Hot reload: add a route, reject invalid TOML, restore"
 } >"$CONFIG_TMP"
 swap_config
 wait_until "/api/inventory/echo returns 200 after reload" 15 inventory_up
+
+# Trusted front proxy: its X-Forwarded-Proto passes through and X-Real-IP is
+# derived from the rightmost untrusted X-Forwarded-For entry.
+json=$(body_of --cacert "$CA" --http1.1 -H "X-Forwarded-Proto: http" \
+    -H "X-Forwarded-For: 198.51.100.7" "$BASE/api/users/echo")
+proto=$(printf '%s' "$json" | jq -r '.headers["x-forwarded-proto"] // empty')
+real=$(printf '%s' "$json" | jq -r '.headers["x-real-ip"] // empty')
+if [ "$proto" = "http" ] && [ "$real" = "198.51.100.7" ]; then
+    ok "trusted proxy: X-Forwarded-Proto passed through, X-Real-IP derived from X-Forwarded-For"
+else
+    fail "trusted-proxy check failed: proto=$proto x-real-ip=$real"
+fi
 
 invalid_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo 'this is not valid toml [[[' >"$CONFIG_TMP"

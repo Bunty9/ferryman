@@ -224,6 +224,26 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ferryman
 - **Logs.** JSON on stdout lands in the journal: `journalctl -u ferryman -o cat | jq .`
   (or `--log-format text`).
 
+## Deploy
+
+| Where | Recipe | Checked in CI |
+| --- | --- | --- |
+| Docker Compose | [`examples/full-stack/`](./examples/full-stack): TLS, upstreams, Prometheus, Grafana | `demo.sh --ci` |
+| Kubernetes | [`deploy/k8s/`](./deploy/k8s): Restricted PSS, probes, ConfigMap reload, graceful shutdown | kind job |
+| systemd | [`deploy/systemd/`](./deploy/systemd) (see "systemd" above) | unit tests |
+| Fly.io | [`fly.toml`](./fly.toml) (see "Fly.io" below) | n/a |
+| Cloud Run, Render, Railway, Heroku, ECS | "PaaS and orchestrators" above | `crates/server/tests/paas.rs` |
+
+### Fly.io
+
+`fly.toml` publishes only the proxy (`internal_port` 8080); the admin listener
+(`[::]:9090`, dual-stack because Fly's private network is IPv6) is never
+exposed. Fly's Prometheus scrapes `9090/metrics` (`[metrics]`) and a machine
+check probes `9090/healthz`. If you prefer to probe the proxy port, set
+`local_health_path = "/up"` in the config and point the check at it.
+`kill_signal = "SIGINT"` with `kill_timeout = "30s"` covers the default 25 s
+drain.
+
 ## Examples
 
 Reference examples live under [`examples/`](./examples) (index:
@@ -618,6 +638,7 @@ ferryman/
   scripts/wrk2-smoke.sh      # boots the compose fixture and runs wrk2
   Dockerfile                 # cargo-chef multi-stage, scratch final (musl)
   fly.toml                   # Fly.io 2-region (sin + iad)
+  deploy/                    # k8s manifests (kind-tested) and the systemd unit
   deny.toml                  # cargo-deny config
   rust-toolchain.toml        # stable channel
   .github/workflows/ci.yml   # nextest + clippy + fmt + deny + bench + wrk2 + examples

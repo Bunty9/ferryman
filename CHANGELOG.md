@@ -9,6 +9,17 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Kubernetes recipe `deploy/k8s/` (Deployment, Service, ConfigMap, README):
+  Restricted Pod Security Standard, httpGet probes on the admin port, ConfigMap
+  mounted as a directory so edits hot-reload, termination grace sized for
+  `shutdown_delay_secs` + `drain_timeout_secs`. A `kind` CI job applies it into
+  a `restricted` namespace and asserts a ConfigMap edit goes live without a
+  restart.
+- `examples/full-stack/demo.sh` asserts forged `X-Real-IP`/`X-Forwarded-Host`
+  from an untrusted client are replaced or stripped and that a trusted
+  proxy's `X-Forwarded-Proto` passes through. PaaS e2e test for the Cloud Run
+  profile (`shutdown_delay_secs = 0`, `drain_timeout_secs = 8`, exit < 10 s).
+  `fly.toml` gains an admin `/healthz` machine check; README "Deploy" section.
 - Multi-arch (amd64, arm64) Docker image on GHCR, `ghcr.io/bunty9/ferryman`
   (`X.Y.Z`, `X.Y`, `latest`; prereleases only the exact tag). Built by the
   release workflow's new `image` job from the attested tier-1 musl binaries

@@ -7,6 +7,10 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Fixed
+
+- release image job: extraction script printed checksum output into the version.
+
 ## [0.3.0] - 2026-10-11
 
 ### Security

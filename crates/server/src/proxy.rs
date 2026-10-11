@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -58,10 +58,34 @@ impl std::fmt::Debug for RequestBody {
 /// What `handle`'s timer can see of the body: whether hyper polled it, and
 /// whether the last poll was left waiting on the client (as opposed to hyper
 /// having stopped reading, e.g. an upstream whose receive buffer is full).
-#[derive(Default)]
 struct BodyState {
     polled: AtomicBool,
     waiting_on_client: AtomicBool,
+    origin: Instant,
+    /// Start of the current client stall, ms since `origin` + 1 (0 = none).
+    stall_since: AtomicU64,
+    /// Longest finished client stall so far, ms.
+    longest_stall: AtomicU64,
+}
+
+impl BodyState {
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+    fn stall_ended(&self) {
+        let since = self.stall_since.swap(0, Ordering::Relaxed);
+        if since != 0 {
+            let d = (self.now_ms() + 1).saturating_sub(since);
+            self.longest_stall.fetch_max(d, Ordering::Relaxed);
+        }
+    }
+    /// Did the client leave its upload idle for >= `theta` at any point (incl. now)?
+    fn client_stalled(&self, theta: Duration) -> bool {
+        let t = theta.as_millis() as u64;
+        let since = self.stall_since.load(Ordering::Relaxed);
+        self.longest_stall.load(Ordering::Relaxed) >= t
+            || (since != 0 && (self.now_ms() + 1).saturating_sub(since) >= t)
+    }
 }
 
 struct Eos {
@@ -94,7 +118,13 @@ impl std::error::Error for BodyTotalTimeout {}
 impl RequestBody {
     fn new(inner: Incoming, idle: Duration, total: Duration) -> (Self, Eos) {
         let (tx, rx) = oneshot::channel();
-        let state = Arc::new(BodyState::default());
+        let state = Arc::new(BodyState {
+            polled: AtomicBool::new(false),
+            waiting_on_client: AtomicBool::new(false),
+            origin: Instant::now(),
+            stall_since: AtomicU64::new(0),
+            longest_stall: AtomicU64::new(0),
+        });
         let mut b = Self {
             inner,
             idle,
@@ -133,6 +163,7 @@ impl Body for RequestBody {
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 this.idle_sleep = None;
+                this.state.stall_ended();
                 this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 // The last frame of a content-length body may not be followed
                 // by another poll, so check here as well as on `None`.
@@ -140,10 +171,12 @@ impl Body for RequestBody {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
+                this.state.stall_ended();
                 this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 Poll::Ready(Some(Err(e.into())))
             }
             Poll::Ready(None) => {
+                this.state.stall_ended();
                 this.state.waiting_on_client.store(false, Ordering::Relaxed);
                 if let Some(tx) = this.eos.take() {
                     let _ = tx.send(());
@@ -152,6 +185,13 @@ impl Body for RequestBody {
             }
             Poll::Pending => {
                 this.state.waiting_on_client.store(true, Ordering::Relaxed);
+                let now = this.state.now_ms() + 1;
+                let _ = this.state.stall_since.compare_exchange(
+                    0,
+                    now,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 let idle = this.idle;
                 let idle_sleep = this
                     .idle_sleep
@@ -222,7 +262,8 @@ pub async fn handle_streaming(
 /// the whole request including the body upload, no body idle timeout, and a
 /// timeout counts against the breaker only for bodyless requests. It shares
 /// the core with `handle_streaming`, so it still gets the forwarded-header and
-/// bad-path fixes.
+/// bad-path fixes. It does not get the client-stall protection
+/// (`handle_streaming` only).
 #[deprecated(
     since = "0.2.3",
     note = "long uploads can 504; use `handle_streaming` with a `StreamingClient`"
@@ -348,6 +389,11 @@ where
     let fwd = Request::from_parts(parts, body);
 
     let upstream_timeout = table.upstream_timeout;
+    // A client that left its upload idle for >= theta may have tripped the
+    // upstream's own body-read timeout; its 502/5xx then isn't evidence.
+    let theta = (table.request_body_idle_timeout() / 2).min(Duration::from_secs(1));
+    let stall = body_done.as_ref().map(|e| e.state.clone());
+    let client_stalled = || stall.as_ref().is_some_and(|s| s.client_stalled(theta));
     // Completes when the request must be failed as an upstream timeout (504).
     let timer = async move {
         let Some(Eos { mut rx, state }) = body_done else {
@@ -416,7 +462,11 @@ where
             ))
         }
         Some(Err(e)) => {
-            upstream.record_failure(admission);
+            // A stalled client is not evidence against the upstream: no result
+            // is recorded (as for the 408/400 arms above).
+            if !client_stalled() {
+                upstream.record_failure(admission);
+            }
             tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
             record(started, &route_label, &upstream.name, 502);
             Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
@@ -426,7 +476,9 @@ where
             // Health is judged on the response head; the body is streamed
             // afterwards with no timeout of its own.
             if matches!(status.as_u16(), 502..=504) {
-                upstream.record_failure(admission);
+                if !client_stalled() {
+                    upstream.record_failure(admission);
+                }
             } else {
                 upstream.record_success(admission);
             }
@@ -503,6 +555,52 @@ fn join_cookies(headers: &mut HeaderMap) {
     }
 }
 
+/// Canonical names of the headers ferryman asserts itself.
+const PROXY_ASSERTED: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
+
+/// Is `name` (lowercase) a non-canonical spelling of a proxy-asserted header?
+/// CGI-style backends (WSGI, Rack, PHP-FPM) fold `_`, `.` and space to `-`, so
+/// every non-alphanumeric byte is read as `-` (runs collapsed, ends trimmed).
+/// Allocation-free for names made only of `[a-z0-9-]` that are already normal.
+fn is_noncanonical_spelling(name: &str) -> bool {
+    // Already normal (no leading/trailing `-`, no `--`): protected iff an exact
+    // match, and exact matches are canonical, hence kept.
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+    {
+        return false;
+    }
+    let mut folded = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            folded.push(c);
+        } else if !folded.is_empty() && !folded.ends_with('-') {
+            folded.push('-');
+        }
+    }
+    PROXY_ASSERTED.contains(&folded.trim_end_matches('-'))
+}
+
+/// Remove, for every peer, non-canonical spellings of proxy-asserted headers.
+fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
+    let bad: Vec<HeaderName> = headers
+        .keys()
+        .filter(|k| is_noncanonical_spelling(k.as_str()))
+        .cloned()
+        .collect();
+    for k in bad {
+        headers.remove(k);
+    }
+}
+
 /// Decide the forwarding headers the upstream sees (pure; unit-tested).
 ///
 /// Untrusted peer (every peer when `trusted_proxies` is empty): `x-forwarded-proto`
@@ -522,6 +620,7 @@ fn apply_forwarded_headers(
     proto: &'static str,
     trusted: &TrustedProxies,
 ) {
+    strip_noncanonical_spellings(headers);
     let xfp = HeaderName::from_static("x-forwarded-proto");
     let peer_trusted = trusted.contains(peer);
     if peer_trusted {
@@ -774,6 +873,45 @@ mod tests {
         ("x-forwarded-host", "evil.example"),
         ("x-forwarded-proto", "https"),
     ];
+
+    #[test]
+    fn noncanonical_spellings_are_stripped_for_every_peer() {
+        let h = [
+            ("x_real_ip", "6.6.6.6"),
+            ("X_Forwarded_For", "6.6.6.6"),
+            ("x.forwarded.for", "6.6.6.6"),
+            ("x_forwarded-host", "evil.example"),
+            ("x_forwarded_proto", "https"),
+            ("x_forwarded_proto", "http"),
+            ("x__forwarded_for", "6.6.6.6"),
+            ("-x-real-ip", "6.6.6.6"),
+            ("x-forwarded-for--", "6.6.6.6"),
+            ("x--forwarded--for-", "6.6.6.6"),
+            ("-forwarded", "for=6.6.6.6"),
+            ("x--custom", "keep"),
+            ("x_custom", "keep"),
+            ("x.custom", "keep"),
+        ];
+        for trusted in [&[][..], &["10.0.0.0/8"][..]] {
+            let m = run(trusted, "10.1.2.3", "http", &h);
+            for k in [
+                "x_real_ip",
+                "x_forwarded_for",
+                "x.forwarded.for",
+                "x_forwarded-host",
+                "x_forwarded_proto",
+                "x__forwarded_for",
+                "-x-real-ip",
+                "x--forwarded--for-",
+                "-forwarded",
+            ] {
+                assert!(m.get(k).is_none(), "{k} kept (trusted={trusted:?})");
+            }
+            assert_eq!(get(&m, "x_custom"), Some("keep"));
+            assert_eq!(get(&m, "x--custom"), Some("keep"));
+            assert_eq!(get(&m, "x.custom"), Some("keep"));
+        }
+    }
 
     #[test]
     fn empty_list_is_untrusted_for_everyone() {

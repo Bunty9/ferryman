@@ -7,6 +7,15 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-11
+
+### Security
+
+- Client-side upload stalls are no longer counted as upstream failures by the
+  circuit breaker.
+- Strip non-canonical spellings of proxy-asserted headers (e.g. underscore or
+  dot variants) from requests.
+
 ## [0.2.3] - 2026-10-05
 
 ### Security
@@ -210,7 +219,8 @@ First public release.
 - Prometheus metrics on a separate listener.
 - `echo_upstream` example for local benchmarking.
 
-[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/Bunty9/ferryman/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/Bunty9/ferryman/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Bunty9/ferryman/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Bunty9/ferryman/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Bunty9/ferryman/compare/v0.2.0...v0.2.1

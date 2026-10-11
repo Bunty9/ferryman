@@ -262,7 +262,8 @@ pub async fn handle_streaming(
 /// the whole request including the body upload, no body idle timeout, and a
 /// timeout counts against the breaker only for bodyless requests. It shares
 /// the core with `handle_streaming`, so it still gets the forwarded-header and
-/// bad-path fixes.
+/// bad-path fixes. It does not get the client-stall protection
+/// (`handle_streaming` only).
 #[deprecated(
     since = "0.2.3",
     note = "long uploads can 504; use `handle_streaming` with a `StreamingClient`"
@@ -554,19 +555,6 @@ fn join_cookies(headers: &mut HeaderMap) {
     }
 }
 
-/// Decide the forwarding headers the upstream sees (pure; unit-tested).
-///
-/// Untrusted peer (every peer when `trusted_proxies` is empty): `x-forwarded-proto`
-/// is set from the connection, `x-forwarded-for` gets the peer appended,
-/// `x-real-ip` is overwritten with the peer, and client `forwarded` /
-/// `x-forwarded-host` are stripped.
-///
-/// Trusted peer: incoming `x-forwarded-proto` (rightmost value), `x-forwarded-host`
-/// and `forwarded` are kept; missing `x-forwarded-proto` comes from the
-/// connection. `x-real-ip` is always overwritten with the rightmost
-/// `x-forwarded-for` entry that is not a trusted proxy (`:port` suffixes
-/// tolerated; an unparsable entry stops the walk), else the peer.
-/// `x-forwarded-for` always gets the peer appended.
 /// Canonical names of the headers ferryman asserts itself.
 const PROXY_ASSERTED: [&str; 5] = [
     "forwarded",
@@ -579,9 +567,15 @@ const PROXY_ASSERTED: [&str; 5] = [
 /// Is `name` (lowercase) a non-canonical spelling of a proxy-asserted header?
 /// CGI-style backends (WSGI, Rack, PHP-FPM) fold `_`, `.` and space to `-`, so
 /// every non-alphanumeric byte is read as `-` (runs collapsed, ends trimmed).
-/// Allocation-free for names made only of `[a-z0-9-]`.
+/// Allocation-free for names made only of `[a-z0-9-]` that are already normal.
 fn is_noncanonical_spelling(name: &str) -> bool {
-    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+    // Already normal (no leading/trailing `-`, no `--`): protected iff an exact
+    // match, and exact matches are canonical, hence kept.
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+    {
         return false;
     }
     let mut folded = String::with_capacity(name.len());
@@ -607,6 +601,19 @@ fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
     }
 }
 
+/// Decide the forwarding headers the upstream sees (pure; unit-tested).
+///
+/// Untrusted peer (every peer when `trusted_proxies` is empty): `x-forwarded-proto`
+/// is set from the connection, `x-forwarded-for` gets the peer appended,
+/// `x-real-ip` is overwritten with the peer, and client `forwarded` /
+/// `x-forwarded-host` are stripped.
+///
+/// Trusted peer: incoming `x-forwarded-proto` (rightmost value), `x-forwarded-host`
+/// and `forwarded` are kept; missing `x-forwarded-proto` comes from the
+/// connection. `x-real-ip` is always overwritten with the rightmost
+/// `x-forwarded-for` entry that is not a trusted proxy (`:port` suffixes
+/// tolerated; an unparsable entry stops the walk), else the peer.
+/// `x-forwarded-for` always gets the peer appended.
 fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     peer: IpAddr,
@@ -877,6 +884,11 @@ mod tests {
             ("x_forwarded_proto", "https"),
             ("x_forwarded_proto", "http"),
             ("x__forwarded_for", "6.6.6.6"),
+            ("-x-real-ip", "6.6.6.6"),
+            ("x-forwarded-for--", "6.6.6.6"),
+            ("x--forwarded--for-", "6.6.6.6"),
+            ("-forwarded", "for=6.6.6.6"),
+            ("x--custom", "keep"),
             ("x_custom", "keep"),
             ("x.custom", "keep"),
         ];
@@ -889,10 +901,14 @@ mod tests {
                 "x_forwarded-host",
                 "x_forwarded_proto",
                 "x__forwarded_for",
+                "-x-real-ip",
+                "x--forwarded--for-",
+                "-forwarded",
             ] {
                 assert!(m.get(k).is_none(), "{k} kept (trusted={trusted:?})");
             }
             assert_eq!(get(&m, "x_custom"), Some("keep"));
+            assert_eq!(get(&m, "x--custom"), Some("keep"));
             assert_eq!(get(&m, "x.custom"), Some("keep"));
         }
     }

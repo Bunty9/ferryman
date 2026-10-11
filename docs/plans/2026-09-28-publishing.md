@@ -84,9 +84,10 @@ in `[workspace.package]` and in the `ferryman-core` entry of
 
 `.github/workflows/release.yml` exists in the repo already. On a tag push
 (`v[0-9]+.[0-9]+.[0-9]+` or prerelease `v[0-9]+.[0-9]+.[0-9]+-*`) it
-runs six jobs (`verify`, `binaries`, `binaries-extra`, `attest`, `publish`, `release`), each with only the permissions and checkout it needs
+runs these jobs (`verify`, `binaries`, `binaries-extra`, `attest`, `publish`, `release`, `image`, `image-attest`; `image-dry-run` on dispatch only), each with only the permissions and checkout it needs
 (see "why separate jobs" below). Graph: `verify` -> `binaries` ->
-`attest` -> `publish` -> `release`, with `binaries-extra` (best effort) alongside:
+`attest` -> `publish` -> `release`, with `binaries-extra` (best effort) alongside, and
+`publish` -> `image` -> `image-attest` as a branch `release` does not wait for:
 
 1. **`verify`** (`permissions: contents: read`, checkout with
    `persist-credentials: false`) — checks the tag points at a commit on
@@ -136,7 +137,7 @@ runs six jobs (`verify`, `binaries`, `binaries-extra`, `attest`, `publish`, `rel
    version like any other.
 
 **Dry run.** Actions tab, *release*, *Run workflow* (`workflow_dispatch`)
-runs only `binaries` and `binaries-extra` (verify/attest/publish/release are skipped);
+runs `binaries`, `binaries-extra` and `image-dry-run` (verify/attest/publish/release/image are skipped; `image-dry-run` builds the multi-arch image to an OCI tarball without pushing, then runs the amd64 image read-only as 65532 with `--version` and `check`);
 download the `bin-t1-*`/`bin-t2-*` artifacts to inspect the archives. Do this before
 the first tagged release that ships binaries, and after changing the
 matrix.
@@ -189,7 +190,7 @@ Because each crate's publish step checks crates.io for that exact
 Actions UI (don't re-push the tag) picks up where it left off: `ferryman-core`
 is found to already exist and is skipped, `ferryman` gets published, and
 the `release` job then creates the GitHub release (it still requires
-every tier-1 archive; re-run `binaries` jobs too if they expired). No manual crates.io
+every tier-1 archive, kept 30 days). No manual crates.io
 intervention needed for this case.
 
 If the workflow can't be re-run (e.g. the tag itself was wrong), publish
@@ -205,9 +206,12 @@ After `publish` succeeds, the `image` job builds `Dockerfile.release` from
 the tier-1 musl archives (no recompile) for linux/amd64 + linux/arm64 and
 pushes `ghcr.io/bunty9/ferryman` with tags `X.Y.Z`, `X.Y`, `latest` (for a
 prerelease tag `v…-*`: only `X.Y.Z`), OCI labels, and a build provenance
-attestation pushed to the registry. It is the only job with
-`packages: write`, is skipped on `workflow_dispatch` dry runs, and
-`release` does not wait for it (the crates are the primary artefact).
+attestation pushed to the registry. Two jobs: `image` has `packages: write`
+(no OIDC); `image-attest` has `id-token`/`attestations`/`packages: write`, no
+checkout, and attests the digest `image` outputs. Both are skipped on
+`workflow_dispatch` dry runs, where `image-dry-run` builds without pushing.
+`release` does not wait for them (the crates are the primary artefact).
+BuildKit is pinned by digest; bump it deliberately.
 
 **One-time manual step:** the first push creates the GHCR package as
 *private*. After the first image release, make it public once: GitHub
@@ -215,10 +219,13 @@ profile or org -> Packages -> `ferryman` -> Package settings -> Change
 visibility -> Public (also link it to the repository there if it isn't
 already). Until then anonymous `docker pull` fails with `unauthorized`.
 
-If `image` fails (transient registry error), re-run just that job from the
-Actions UI; it is idempotent (tags are overwritten with the same content
-and it needs the tier-1 artifacts, so re-run `binaries` too if they
-expired, 7 day retention). The crates and GitHub release are unaffected.
+If `image` or `image-attest` fails (transient registry error), re-run just
+that job (and `image-attest` after `image`) from the Actions UI while the
+tier-1 artifacts exist (30 day retention). A re-run pushes a fresh image
+(new `created` label, so a new digest) and moves the tags to it; the
+crates and GitHub release are unaffected. **Never re-run `binaries` after
+`release` has succeeded**: it re-runs the dependent jobs, and `release`
+uploads with `--clobber`, replacing the attested archives with a rebuild.
 
 ### Release procedure (once Trusted Publishing is set up)
 

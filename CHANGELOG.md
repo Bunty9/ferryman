@@ -39,8 +39,10 @@ and `ferryman` are released together with the same version.
   you mount (config, TLS cert and key) must be readable by 65532: make them
   world-readable (`chmod 0644`), or group-readable and add the group
   (`--group-add`, compose `group_add`, Kubernetes `fsGroup`). The image writes
-  nothing to its filesystem, so `--read-only` works. Binding 8080/9090 and
-  the built-in `HEALTHCHECK` are unaffected.
+  nothing to its filesystem, so `--read-only` works. The default ports
+  8080/9090 and the built-in `HEALTHCHECK` are unaffected, but ports below
+  1024 fail to bind as 65532 outside Docker's default sysctl (Kubernetes,
+  containerd, Podman) unless `net.ipv4.ip_unprivileged_port_start` is lowered.
 - Cargo features: the new default `bin` feature gates the binary and its
   dependencies (`clap`, `tracing-subscriber`, `metrics-util`); `ferryman::admin`
   now needs feature `admin` (`metrics-exporter-prometheus`) and

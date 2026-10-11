@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Release image: no compiling. The `image` job in .github/workflows/release.yml
 # extracts the tier-1 musl release binaries into bin/amd64/ferryman and
 # bin/arm64/ferryman and builds this for linux/amd64 + linux/arm64. Same

@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 # Supported build matrix: native builds only, on an amd64 host (produces a
 # linux/amd64 image) or an arm64 host (produces a linux/arm64 image, e.g.
 # Apple Silicon's Docker Desktop, which defaults to building linux/arm64).

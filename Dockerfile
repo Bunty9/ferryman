@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 # Supported build matrix: native builds only, on an amd64 host (produces a
 # linux/amd64 image) or an arm64 host (produces a linux/arm64 image, e.g.
 # Apple Silicon's Docker Desktop, which defaults to building linux/arm64).
@@ -52,10 +50,21 @@ RUN cargo build --release \
     && cp "target/$(cat /rust_target.txt)/release/ferryman" /out/ferryman
 
 # ---- Stage 4: scratch runtime -----------------------------------------------
+# Runs as uid/gid 65532 (the conventional "nonroot"; scratch has no
+# /etc/passwd, a numeric USER is all Docker needs). The image never writes to
+# its own filesystem, so `--read-only` works. Anything you mount (config,
+# TLS cert and key) must be readable by 65532: world-readable, or
+# group-readable with `--group-add`/`group_add`/`fsGroup`. See README.
+# Keep the runtime stanza in sync with Dockerfile.release.
 FROM scratch AS runtime
 WORKDIR /app
-COPY --from=builder /out/ferryman /usr/local/bin/ferryman
-COPY config.toml /app/config.toml
+COPY --from=builder --chmod=0755 /out/ferryman /usr/local/bin/ferryman
+COPY --chmod=0644 config.toml /app/config.toml
+USER 65532:65532
 EXPOSE 8080 9090
+# Exec form: scratch has no shell or curl. Probes the admin /healthz on the
+# metrics port (override with FERRYMAN_METRICS_BIND at run time).
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/usr/local/bin/ferryman", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/ferryman"]
 CMD ["--config", "/app/config.toml"]

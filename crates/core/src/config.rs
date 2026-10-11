@@ -5,15 +5,21 @@
 //! events, calls [`build_table`], and atomically swaps the result into the
 //! `SharedTable`.
 
+use crate::error::Error;
 use crate::proxies::TrustedProxies;
 use crate::route::{Route, RouteTable, Upstream};
-use anyhow::{bail, Context};
+use crate::BreakerConfig;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 /// Top-level config file.
+///
+/// Reserved: the top-level names `mtls`, `jwt`, `limits`, `tls` and
+/// `tenant_rps` are never claimed by core; an embedding (ferryman-edge)
+/// strips them before [`ConfigToml::from_table`]. Any other unknown key is
+/// rejected.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -43,7 +49,49 @@ pub struct ConfigToml {
     /// Not required to be >= the idle timeout; whichever fires first wins.
     #[serde(default = "default_body_timeout")]
     pub request_body_timeout_secs: u64,
+    /// Path the proxy itself answers with `200 ok` on `GET`/`HEAD`, for
+    /// platforms that only probe the serving port. Absolute, no query or
+    /// fragment; must not equal a route prefix. Shadows any route prefix it
+    /// falls under. Default: none.
+    #[serde(default)]
+    pub local_health_path: Option<String>,
+    /// On shutdown, how long to wait for in-flight connections after the
+    /// listener closes, in seconds (1..=86400). Default 25.
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
+    /// On shutdown, how long to keep serving with `/readyz` at 503 before
+    /// the listener closes, in seconds (0..=86400). Default 0.
+    #[serde(default)]
+    pub shutdown_delay_secs: u64,
+    /// Also emit an RFC 7239 `Forwarded` element (`for`, `proto`, `host`).
+    /// Default false.
+    #[serde(default)]
+    pub forwarded_header: bool,
+    /// How `X-Forwarded-For` is built: `"append"` (default) adds the peer to
+    /// the incoming list; `"replace"` sets it to the single client address
+    /// that goes into `X-Real-IP`.
+    #[serde(default)]
+    pub xff: XffMode,
+    /// Emit one `ferryman::access` log line per request. Default false.
+    #[serde(default)]
+    pub access_log: bool,
+    /// Generate `x-request-id` when absent (and replace invalid ones), set it
+    /// on the upstream request and the response. Default false.
+    #[serde(default)]
+    pub request_id: bool,
     pub routes: Vec<RouteToml>,
+}
+
+/// `xff` config key: how the upstream-bound `X-Forwarded-For` is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum XffMode {
+    /// Append the peer address to the incoming list.
+    #[default]
+    Append,
+    /// Replace the list with the client address (as in `X-Real-IP`).
+    Replace,
 }
 
 fn default_health_interval() -> u64 {
@@ -59,6 +107,10 @@ fn default_upstream_timeout() -> u64 {
     30
 }
 pub(crate) const DEFAULT_KEEPALIVE_SECS: u64 = 10;
+pub(crate) const DEFAULT_DRAIN_SECS: u64 = 25;
+fn default_drain_timeout() -> u64 {
+    DEFAULT_DRAIN_SECS
+}
 pub(crate) const DEFAULT_BODY_IDLE_SECS: u64 = 30;
 pub(crate) const DEFAULT_BODY_TOTAL_SECS: u64 = 300;
 fn default_body_timeout() -> u64 {
@@ -86,14 +138,73 @@ pub struct RouteToml {
     /// Per-route circuit-breaker cooldown override.
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+    /// Active health-probe path; absolute, no query or fragment. Default
+    /// `/health`. Routes sharing an upstream must agree.
+    #[serde(default)]
+    pub health_path: Option<String>,
+    /// Skip active health probing for this route's upstream (default
+    /// `false`); only request traffic then drives its breaker. Routes
+    /// sharing an upstream must agree.
+    #[serde(default)]
+    pub health_disabled: bool,
+    /// Send the upstream's `host[:port]` as `Host` instead of the client's
+    /// (default `false`). Routes sharing an upstream may differ.
+    #[serde(default)]
+    pub rewrite_host: bool,
+    /// Remove the matched prefix from the path sent upstream (default
+    /// `false`) and set `X-Forwarded-Prefix` to it. The forwarded path is
+    /// then the normalised one.
+    #[serde(default)]
+    pub strip_prefix: bool,
 }
 
 /// Read and parse the TOML config at `path`. Shared by the server's initial
 /// boot and its hot-reload watcher so both get the same error context.
-pub fn load_config(path: &Path) -> anyhow::Result<ConfigToml> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config file {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
+///
+/// # Errors
+///
+/// [`Error::ReadConfig`] if the file can't be read, [`Error::Toml`] if it
+/// doesn't parse (both carry the cause as `source()`).
+pub fn load_config(path: &Path) -> Result<ConfigToml, Error> {
+    let raw = std::fs::read_to_string(path).map_err(|source| Error::ReadConfig {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    raw.parse().map_err(|e| match e {
+        Error::Toml { source, .. } => Error::Toml {
+            path: Some(path.to_path_buf()),
+            source,
+        },
+        e => e,
+    })
+}
+
+impl std::str::FromStr for ConfigToml {
+    type Err = Error;
+
+    /// Parse config text (no file context: [`Error::Toml`] has `path: None`).
+    fn from_str(s: &str) -> Result<Self, Error> {
+        toml::from_str(s).map_err(|source| Error::Toml { path: None, source })
+    }
+}
+
+impl ConfigToml {
+    /// Build a config from an already-parsed TOML table (two-pass parse: the
+    /// caller removes the keys it owns first). `deny_unknown_fields` applies
+    /// to whatever remains.
+    ///
+    /// Core never claims the top-level names `mtls`, `jwt`, `limits`, `tls`
+    /// and `tenant_rps`; they are reserved for ferryman-edge, which strips
+    /// them before calling this.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Toml`] (with `path: None`) on unknown keys or wrong types.
+    pub fn from_table(table: toml::Table) -> Result<Self, Error> {
+        table
+            .try_into()
+            .map_err(|source| Error::Toml { path: None, source })
+    }
 }
 
 /// Build a [`RouteTable`] from a parsed [`ConfigToml`], validating routes
@@ -101,12 +212,22 @@ pub fn load_config(path: &Path) -> anyhow::Result<ConfigToml> {
 /// (matched by `host:port` name) share its circuit breaker, so a hot reload
 /// neither resets an open circuit nor strands results from in-flight
 /// requests on an orphaned breaker. Fails without side effects.
-pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result<RouteTable> {
+///
+/// # Errors
+///
+/// [`Error::InvalidConfig`] (out-of-range top-level key),
+/// [`Error::InvalidCidr`] (`trusted_proxies`), [`Error::InvalidPrefix`],
+/// [`Error::NonCanonicalPrefix`],
+/// [`Error::DuplicatePrefix`], [`Error::InvalidUpstream`],
+/// [`Error::InvalidCooldown`], [`Error::ConflictingCooldown`],
+/// [`Error::InvalidHealthPath`], [`Error::ConflictingHealth`] and
+/// [`Error::InvalidBreakerConfig`].
+pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTable, Error> {
     if cfg.failure_threshold < 1 {
-        bail!(
-            "failure_threshold must be >= 1, got {}",
-            cfg.failure_threshold
-        );
+        return Err(Error::InvalidConfig {
+            key: "failure_threshold",
+            reason: format!("must be >= 1, got {}", cfg.failure_threshold),
+        });
     }
     for (key, v) in [
         ("health_interval_secs", cfg.health_interval_secs),
@@ -118,12 +239,51 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
             cfg.request_body_idle_timeout_secs,
         ),
         ("request_body_timeout_secs", cfg.request_body_timeout_secs),
+        ("drain_timeout_secs", cfg.drain_timeout_secs),
     ] {
         if v == 0 {
-            bail!("{key} must be >= 1");
+            return Err(Error::InvalidConfig {
+                key,
+                reason: "must be >= 1".into(),
+            });
         }
         if v > MAX_SECS {
-            bail!("{key} must be <= {MAX_SECS}, got {v}");
+            return Err(Error::InvalidConfig {
+                key,
+                reason: format!("must be <= {MAX_SECS}, got {v}"),
+            });
+        }
+    }
+    if cfg.shutdown_delay_secs > MAX_SECS {
+        return Err(Error::InvalidConfig {
+            key: "shutdown_delay_secs",
+            reason: format!("must be <= {MAX_SECS}, got {}", cfg.shutdown_delay_secs),
+        });
+    }
+    if let Some(p) = &cfg.local_health_path {
+        if !(p.starts_with('/')
+            && !p.contains(['?', '#'])
+            && p.parse::<http::uri::PathAndQuery>().is_ok())
+        {
+            return Err(Error::InvalidConfig {
+                key: "local_health_path",
+                reason: format!("{p:?} must start with '/' and contain no '?' or '#'"),
+            });
+        }
+        if crate::path::bad_path(p) {
+            return Err(Error::InvalidConfig {
+                key: "local_health_path",
+                reason: format!("{p:?} is not an acceptable request path"),
+            });
+        }
+        if let Some(r) = cfg.routes.iter().find(|r| &r.prefix == p) {
+            return Err(Error::InvalidConfig {
+                key: "local_health_path",
+                reason: format!(
+                    "{p:?} equals the prefix of route {:?} and would shadow it",
+                    r.prefix
+                ),
+            });
         }
     }
     let trusted_proxies = TrustedProxies::parse(&cfg.trusted_proxies)?;
@@ -139,63 +299,93 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
     // breakers the live table is still using.
     let mut seen_prefixes = HashSet::new();
     let mut cooldown_by_name: HashMap<String, Duration> = HashMap::new();
+    let mut health_by_name: HashMap<String, (String, bool)> = HashMap::new();
     let mut validated = Vec::with_capacity(cfg.routes.len());
 
     for r in cfg.routes {
         if !r.prefix.starts_with('/') {
-            bail!("route prefix {:?} must start with '/'", r.prefix);
+            return Err(Error::InvalidPrefix { prefix: r.prefix });
+        }
+        let normal = crate::route::normalize(&r.prefix);
+        if !r.prefix.is_ascii() || normal != r.prefix {
+            let normal = if r.prefix.is_ascii() {
+                normal.into_owned()
+            } else {
+                "ASCII only (percent-encode non-ASCII bytes)".to_string()
+            };
+            return Err(Error::NonCanonicalPrefix {
+                prefix: r.prefix,
+                normal,
+            });
+        }
+        if r.prefix.contains([';', '\\']) || {
+            let u = r.prefix.to_ascii_uppercase();
+            u.contains("%2F") || u.contains("%5C")
+        } {
+            return Err(Error::NonCanonicalPrefix {
+                prefix: r.prefix,
+                normal: "prefixes may not contain ';', '\\', %2F or %5C (such requests are rejected as ambiguous)".to_string(),
+            });
         }
         if !seen_prefixes.insert(r.prefix.clone()) {
-            bail!("duplicate route prefix {:?}", r.prefix);
+            return Err(Error::DuplicatePrefix { prefix: r.prefix });
         }
 
-        let uri: http::Uri = r.upstream.parse().with_context(|| {
-            format!(
-                "route {:?}: invalid upstream URI {:?}",
-                r.prefix, r.upstream
-            )
-        })?;
+        let bad = |reason: String, source| Error::InvalidUpstream {
+            route: r.prefix.clone(),
+            upstream: r.upstream.clone(),
+            reason,
+            source,
+        };
+        let uri: http::Uri = r
+            .upstream
+            .parse()
+            .map_err(|e| bad(format!("invalid upstream URI {:?}", r.upstream), Some(e)))?;
 
         match uri.scheme_str() {
             Some("http") => {}
-            Some(other) => bail!(
-                "route {:?}: upstream {:?} has scheme {:?} — https upstreams are not supported",
-                r.prefix,
-                r.upstream,
-                other
-            ),
-            None => bail!(
-                "route {:?}: upstream {:?} has no scheme (expected e.g. http://host:port)",
-                r.prefix,
-                r.upstream
-            ),
+            Some(other) => {
+                return Err(bad(
+                    format!(
+                        "upstream {:?} has scheme {:?} — https upstreams are not supported",
+                        r.upstream, other
+                    ),
+                    None,
+                ))
+            }
+            None => {
+                return Err(bad(
+                    format!(
+                        "upstream {:?} has no scheme (expected e.g. http://host:port)",
+                        r.upstream
+                    ),
+                    None,
+                ))
+            }
         }
         // Also catches an empty IPv6 literal (`http://[]:80`).
         if uri
             .host()
             .is_none_or(|h| h.trim_matches(['[', ']']).is_empty())
         {
-            bail!(
-                "route {:?}: upstream {:?} has no host",
-                r.prefix,
-                r.upstream
-            );
+            return Err(bad(format!("upstream {:?} has no host", r.upstream), None));
         }
         if let Some(pq) = uri.path_and_query() {
             if pq.query().is_some() {
-                bail!(
-                    "route {:?}: upstream {:?} must not include a query string",
-                    r.prefix,
-                    r.upstream
-                );
+                return Err(bad(
+                    format!("upstream {:?} must not include a query string", r.upstream),
+                    None,
+                ));
             }
             if !pq.path().is_empty() && pq.path() != "/" {
-                bail!(
-                    "route {:?}: upstream {:?} must not include a path (got {:?})",
-                    r.prefix,
-                    r.upstream,
-                    pq.path()
-                );
+                return Err(bad(
+                    format!(
+                        "upstream {:?} must not include a path (got {:?})",
+                        r.upstream,
+                        pq.path()
+                    ),
+                    None,
+                ));
             }
         }
 
@@ -205,48 +395,133 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> anyhow::Result
             .map(Duration::from_secs)
             .unwrap_or(default_cooldown);
         if cooldown.is_zero() {
-            bail!("route {:?}: cooldown_secs must be >= 1", r.prefix);
+            return Err(Error::InvalidCooldown {
+                route: r.prefix,
+                reason: "must be >= 1".into(),
+            });
         }
         if cooldown.as_secs() > MAX_SECS {
-            bail!(
-                "route {:?}: cooldown_secs must be <= {MAX_SECS}, got {}",
-                r.prefix,
-                cooldown.as_secs()
-            );
+            return Err(Error::InvalidCooldown {
+                route: r.prefix,
+                reason: format!("must be <= {MAX_SECS}, got {}", cooldown.as_secs()),
+            });
         }
+        // Validate the breaker config here, before `prev` is touched, so the
+        // `Upstream::new` below cannot fail.
+        let breaker = BreakerConfig::default()
+            .with_cooldown(cooldown)
+            .with_failure_threshold(cfg.failure_threshold);
+        breaker.validate().map_err(|e| match e {
+            Error::InvalidBreakerConfig { reason, .. } => Error::InvalidBreakerConfig {
+                reason,
+                upstream: Some(name.clone()),
+            },
+            e => e,
+        })?;
         let first = *cooldown_by_name.entry(name.clone()).or_insert(cooldown);
         if first != cooldown {
-            bail!(
-                "route {:?}: upstream {name} is shared with another route but has a \
-                 different cooldown ({}s vs {}s); routes to one upstream share one breaker",
-                r.prefix,
-                cooldown.as_secs(),
-                first.as_secs()
-            );
+            return Err(Error::ConflictingCooldown {
+                route: r.prefix,
+                upstream: name,
+                cooldown_secs: cooldown.as_secs(),
+                other_secs: first.as_secs(),
+            });
         }
-        validated.push((r.prefix, uri, name, cooldown));
+        if let Some(p) = &r.health_path {
+            if !(p.starts_with('/')
+                && !p.contains(['?', '#'])
+                && p.parse::<http::uri::PathAndQuery>().is_ok())
+            {
+                return Err(Error::InvalidHealthPath {
+                    route: r.prefix,
+                    path: p.clone(),
+                });
+            }
+        }
+        let health = (
+            r.health_path.unwrap_or_else(|| "/health".to_string()),
+            r.health_disabled,
+        );
+        let first = health_by_name
+            .entry(name.clone())
+            .or_insert_with(|| health.clone());
+        let conflict = if first.0 != health.0 {
+            Some(("health_path", health.0.clone(), first.0.clone()))
+        } else if first.1 != health.1 {
+            Some(("health_disabled", health.1.to_string(), first.1.to_string()))
+        } else {
+            None
+        };
+        if let Some((setting, value, other)) = conflict {
+            return Err(Error::ConflictingHealth {
+                route: r.prefix,
+                upstream: name,
+                setting,
+                value,
+                other,
+            });
+        }
+        validated.push((
+            r.prefix,
+            uri,
+            name,
+            cooldown,
+            breaker,
+            health,
+            (r.rewrite_host, r.strip_prefix),
+        ));
     }
 
     let mut upstreams_by_name: HashMap<String, Upstream> = HashMap::new();
-    let routes = validated
-        .into_iter()
-        .map(|(prefix, uri, name, cooldown)| {
-            let upstream = upstreams_by_name
-                .entry(name)
-                .or_insert_with_key(|name| match prev_by_name.get(name.as_str()) {
-                    Some(prev_u) => prev_u.reuse(cooldown, cfg.failure_threshold),
-                    None => Upstream::new(uri, cooldown, cfg.failure_threshold),
-                })
-                .clone();
-            Route { prefix, upstream }
-        })
-        .collect();
+    let mut routes = Vec::with_capacity(validated.len());
+    for (
+        prefix,
+        uri,
+        name,
+        cooldown,
+        breaker,
+        (health_path, health_disabled),
+        (rewrite_host, strip_prefix),
+    ) in validated
+    {
+        let upstream = match upstreams_by_name.get(&name) {
+            Some(u) => u.clone(),
+            None => {
+                let health_path = Some(health_path);
+                let u = match prev_by_name.get(name.as_str()) {
+                    // Breaker (and its state) is kept; health settings are
+                    // simply replaced on the new table's Upstream.
+                    Some(prev_u) => prev_u.reuse(
+                        cooldown,
+                        cfg.failure_threshold,
+                        health_path,
+                        health_disabled,
+                    ),
+                    None => Upstream::new(uri, breaker)?.with_health(health_path, health_disabled),
+                };
+                upstreams_by_name.insert(name, u.clone());
+                u
+            }
+        };
+        routes.push(
+            Route::new(prefix, upstream)
+                .with_rewrite_host(rewrite_host)
+                .with_strip_prefix(strip_prefix),
+        );
+    }
 
     Ok(RouteTable::new(routes, upstream_timeout)
         .with_keepalive_timeout(Duration::from_secs(cfg.keepalive_timeout_secs))
         .with_request_body_idle_timeout(Duration::from_secs(cfg.request_body_idle_timeout_secs))
         .with_request_body_timeout(Duration::from_secs(cfg.request_body_timeout_secs))
-        .with_trusted_proxies(trusted_proxies))
+        .with_drain_timeout(Duration::from_secs(cfg.drain_timeout_secs))
+        .with_shutdown_delay(Duration::from_secs(cfg.shutdown_delay_secs))
+        .with_trusted_proxies(trusted_proxies)
+        .with_forwarded_header(cfg.forwarded_header)
+        .with_xff_mode(cfg.xff)
+        .with_access_log(cfg.access_log)
+        .with_request_id(cfg.request_id)
+        .with_local_health_path(cfg.local_health_path))
 }
 
 #[cfg(test)]
@@ -264,7 +539,37 @@ mod tests {
             trusted_proxies: Vec::new(),
             request_body_idle_timeout_secs: 30,
             request_body_timeout_secs: 300,
+            local_health_path: None,
+            drain_timeout_secs: 25,
+            shutdown_delay_secs: 0,
+            forwarded_header: false,
+            xff: XffMode::Append,
+            access_log: false,
+            request_id: false,
             routes,
+        }
+    }
+
+    #[test]
+    fn log_keys_default_and_parse() {
+        let t = build_table(cfg(vec![route("/a", "http://h:1")]), None).unwrap();
+        assert!(!t.access_log() && !t.request_id());
+        let c: ConfigToml = "access_log = true\nrequest_id = true\n[[routes]]\nprefix = \"/\"\nupstream = \"http://h:1\"\n"
+            .parse()
+            .unwrap();
+        let t = build_table(c, None).unwrap();
+        assert!(t.access_log() && t.request_id());
+    }
+
+    #[test]
+    fn non_normal_prefixes_are_rejected() {
+        for p in ["/%61dmin", "/a%2fb", "/x//y", "/中"] {
+            let r = build_table(cfg(vec![route(p, "http://h:1")]), None);
+            assert!(matches!(r, Err(Error::NonCanonicalPrefix { .. })), "{p}");
+        }
+        for p in ["/a%2Fb", "/a%5Cb", "/a;b", "/a\\b"] {
+            let r = build_table(cfg(vec![route(p, "http://h:1")]), None);
+            assert!(matches!(r, Err(Error::NonCanonicalPrefix { .. })), "{p}");
         }
     }
 
@@ -273,7 +578,37 @@ mod tests {
             prefix: prefix.to_string(),
             upstream: upstream.to_string(),
             cooldown_secs: None,
+            health_path: None,
+            health_disabled: false,
+            rewrite_host: false,
+            strip_prefix: false,
         }
+    }
+
+    #[test]
+    fn local_health_path_validation() {
+        for bad in ["healthz", "/h?x=1", "/h#f", "/svc-a", "/a/../b", "/a%00"] {
+            let mut c = cfg(vec![route("/svc-a", "http://h:1")]);
+            c.local_health_path = Some(bad.into());
+            assert!(
+                matches!(
+                    build_table(c, None),
+                    Err(Error::InvalidConfig {
+                        key: "local_health_path",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+        let mut c = cfg(vec![route("/svc-a", "http://h:1")]);
+        c.local_health_path = Some("/up".into());
+        assert_eq!(
+            build_table(c, None).unwrap().local_health_path(),
+            Some("/up")
+        );
+        let c = cfg(vec![route("/svc-a", "http://h:1")]);
+        assert_eq!(build_table(c, None).unwrap().local_health_path(), None);
     }
 
     #[test]
@@ -391,6 +726,43 @@ mod tests {
         assert!(toml::from_str::<ConfigToml>(raw).is_err());
     }
 
+    const MIN: &str = "[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n";
+
+    #[test]
+    fn from_table_rejects_unknown_and_accepts_stripped_edge_keys() {
+        let mut t: toml::Table = format!("failure_treshold = 1\n{MIN}").parse().unwrap();
+        let e = ConfigToml::from_table(t.clone()).unwrap_err();
+        assert!(matches!(e, Error::Toml { path: None, .. }), "{e}");
+        t.remove("failure_treshold");
+        t.insert("tenant_rps".into(), 5.into());
+        t.insert("jwt".into(), toml::Table::new().into());
+        t.insert("limits".into(), toml::Table::new().into());
+        assert!(ConfigToml::from_table(t.clone()).is_err());
+        for k in ["tenant_rps", "jwt", "limits"] {
+            t.remove(k);
+        }
+        assert_eq!(ConfigToml::from_table(t).unwrap().routes.len(), 1);
+    }
+
+    #[test]
+    fn from_str_matches_load_config_and_has_no_path() {
+        let p = std::env::temp_dir().join(format!("ferryman-a4-{}.toml", std::process::id()));
+        let raw = format!("failure_threshold = 7\n{MIN}");
+        std::fs::write(&p, &raw).unwrap();
+        let a = load_config(&p).unwrap();
+        let b: ConfigToml = raw.parse().unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        std::fs::write(&p, "routes = 3").unwrap();
+        let Error::Toml { path, .. } = load_config(&p).unwrap_err() else {
+            panic!()
+        };
+        assert_eq!(path.as_deref(), Some(p.as_path()));
+        std::fs::remove_file(&p).ok();
+        let e = "routes = 3".parse::<ConfigToml>().unwrap_err();
+        assert!(matches!(&e, Error::Toml { path: None, .. }));
+        assert_eq!(e.to_string(), "parsing config");
+    }
+
     #[test]
     fn rejects_conflicting_cooldowns_for_shared_upstream() {
         let mut b = route("/b", "http://localhost:8001");
@@ -410,7 +782,7 @@ mod tests {
         assert_eq!(t.upstreams().count(), 1);
     }
 
-    fn parse(extra: &str) -> anyhow::Result<RouteTable> {
+    fn parse(extra: &str) -> Result<RouteTable, Error> {
         let raw = format!("{extra}\n[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n");
         build_table(toml::from_str(&raw).unwrap(), None)
     }
@@ -441,6 +813,8 @@ mod tests {
             "keepalive_timeout_secs",
             "request_body_idle_timeout_secs",
             "request_body_timeout_secs",
+            "drain_timeout_secs",
+            "shutdown_delay_secs",
         ] {
             assert!(parse(&format!("{key} = 86400")).is_ok(), "{key} at bound");
             let err = parse(&format!("{key} = 86401")).err().expect(key);
@@ -451,6 +825,17 @@ mod tests {
         r.cooldown_secs = Some(86_401);
         let err = build_table(cfg(vec![r]), None).err().unwrap();
         assert!(err.to_string().contains("cooldown_secs"), "{err}");
+    }
+
+    #[test]
+    fn forwarding_keys_parse() {
+        let t = parse("").unwrap();
+        assert!(!t.forwarded_header());
+        assert_eq!(t.xff_mode(), XffMode::Append);
+        let t = parse("forwarded_header = true\nxff = \"replace\"").unwrap();
+        assert!(t.forwarded_header());
+        assert_eq!(t.xff_mode(), XffMode::Replace);
+        assert!(toml::from_str::<ConfigToml>("xff = \"nope\"\nroutes = []").is_err());
     }
 
     #[test]
@@ -479,10 +864,100 @@ mod tests {
             "keepalive_timeout_secs",
             "request_body_idle_timeout_secs",
             "request_body_timeout_secs",
+            "drain_timeout_secs",
         ] {
             assert!(parse(&format!("{key} = 0")).is_err());
         }
+        assert!(parse("shutdown_delay_secs = 0").is_ok());
+        let t = parse("").unwrap();
+        assert_eq!(t.drain_timeout(), Duration::from_secs(25));
+        assert_eq!(t.shutdown_delay(), Duration::ZERO);
+        let t = parse("drain_timeout_secs = 8\nshutdown_delay_secs = 3").unwrap();
+        assert_eq!(t.drain_timeout(), Duration::from_secs(8));
+        assert_eq!(t.shutdown_delay(), Duration::from_secs(3));
         let err = parse("trusted_proxies = [\"10.0.0.0/33\"]").err().unwrap();
         assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
+    }
+
+    #[test]
+    fn health_keys_default_and_parse() {
+        let t = parse("").unwrap();
+        let u = t.lookup("/a").unwrap().upstream.clone();
+        assert_eq!((u.health_path(), u.health_disabled()), ("/health", false));
+
+        let raw = "[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n\
+                   health_path = \"/ready\"\nhealth_disabled = true\n";
+        let t = build_table(toml::from_str(raw).unwrap(), None).unwrap();
+        let u = &t.lookup("/a").unwrap().upstream;
+        assert_eq!((u.health_path(), u.health_disabled()), ("/ready", true));
+    }
+
+    #[test]
+    fn rejects_bad_health_path() {
+        for bad in ["healthz", "", "/h?x=1", "/h#f", "/a b", "/a\u{1}b"] {
+            let mut r = route("/a", "http://h:1");
+            r.health_path = Some(bad.to_string());
+            let r = build_table(cfg(vec![r]), None);
+            assert!(
+                matches!(r, Err(Error::InvalidHealthPath { .. })),
+                "{bad:?}: {:?}",
+                r.err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_health_for_shared_upstream() {
+        let mut b = route("/b", "http://localhost:8001");
+        b.health_path = Some("/ready".into());
+        let c = cfg(vec![route("/a", "http://localhost:8001"), b]);
+        let err = build_table(c, None).err().expect("conflict");
+        assert!(
+            matches!(&err, Error::ConflictingHealth { route, setting: "health_path", .. } if route == "/b"),
+            "{err}"
+        );
+
+        let mut b = route("/b", "http://localhost:8001");
+        b.health_disabled = true;
+        let c = cfg(vec![route("/a", "http://localhost:8001"), b]);
+        assert!(matches!(
+            build_table(c, None).err(),
+            Some(Error::ConflictingHealth {
+                setting: "health_disabled",
+                ..
+            })
+        ));
+
+        // Explicit default equals implicit default: no conflict.
+        let mut b = route("/b", "http://localhost:8001");
+        b.health_path = Some("/health".into());
+        let c = cfg(vec![route("/a", "http://localhost:8001"), b]);
+        assert!(build_table(c, None).is_ok());
+    }
+
+    #[test]
+    fn reload_changing_health_keeps_breaker_state() {
+        let c = cfg(vec![route("/a", "http://localhost:8001")]);
+        let old = build_table(c.clone(), None).unwrap();
+        let up = old.upstreams().next().unwrap();
+        for _ in 0..3 {
+            up.record_failure(Admission::Normal);
+        }
+        assert_eq!(up.state(), CircuitState::Open);
+
+        let mut r = route("/a", "http://localhost:8001");
+        r.health_path = Some("/ready".into());
+        r.health_disabled = true;
+        let new = build_table(cfg(vec![r]), Some(&old)).unwrap();
+        let new_up = new.upstreams().next().unwrap();
+        assert_eq!(new_up.state(), CircuitState::Open, "state must survive");
+        assert_eq!(
+            (new_up.health_path(), new_up.health_disabled()),
+            ("/ready", true)
+        );
+        // Old table keeps its own settings; breaker is still shared.
+        assert_eq!((up.health_path(), up.health_disabled()), ("/health", false));
+        up.record_success(Admission::Probe);
+        assert_eq!(new_up.state(), CircuitState::Closed);
     }
 }

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferryman
+  labels:
+    app.kubernetes.io/name: ferryman
+spec:
+  selector:
+    app.kubernetes.io/name: ferryman
+  ports:
+    - name: proxy
+      port: 8080
+      targetPort: proxy
+    # Admin (/metrics, /healthz, /readyz): in-cluster only. Keep it off any
+    # Ingress/LoadBalancer; scrape it with Prometheus.
+    - name: admin
+      port: 9090
+      targetPort: admin

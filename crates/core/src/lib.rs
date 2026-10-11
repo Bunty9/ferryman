@@ -24,17 +24,20 @@
 //! } else {
 //!     // circuit open: answer 503
 //! }
-//! # Ok::<(), anyhow::Error>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 mod breaker;
 pub mod config;
+mod error;
 pub mod health;
+pub mod path;
 mod proxies;
 pub mod route;
 
-pub use breaker::CircuitState;
-pub use config::{build_table, load_config, ConfigToml, RouteToml};
+pub use breaker::{Breaker, BreakerConfig, CircuitState};
+pub use config::{build_table, load_config, ConfigToml, RouteToml, XffMode};
+pub use error::Error;
 pub use health::health_loop;
 pub use proxies::TrustedProxies;
 pub use route::{Admission, Route, RouteTable, SharedTable, Upstream};

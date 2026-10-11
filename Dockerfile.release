@@ -1,0 +1,15 @@
+# Release image: no compiling. The `image` job in .github/workflows/release.yml
+# extracts the tier-1 musl release binaries into bin/amd64/ferryman and
+# bin/arm64/ferryman and builds this for linux/amd64 + linux/arm64. Same
+# runtime stanza as the last stage of Dockerfile; keep them in sync.
+FROM scratch
+ARG TARGETARCH
+WORKDIR /app
+COPY --chmod=0755 bin/${TARGETARCH}/ferryman /usr/local/bin/ferryman
+COPY --chmod=0644 config.toml /app/config.toml
+USER 65532:65532
+EXPOSE 8080 9090
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/usr/local/bin/ferryman", "healthcheck"]
+ENTRYPOINT ["/usr/local/bin/ferryman"]
+CMD ["--config", "/app/config.toml"]

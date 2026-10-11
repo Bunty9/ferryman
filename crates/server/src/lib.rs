@@ -1,11 +1,15 @@
 //! ferryman — hyper-based reverse proxy service: the per-request
 //! handler ([`proxy`]), optional TLS termination ([`tls`]), and the
-//! hot-reload watcher ([`reload`]).
+//! hot-reload watcher (`reload`, feature `reload`), plus the admin server
+//! (`admin`, feature `admin`). The `bin` feature (default) adds the CLI.
 //!
 //! `main.rs` is a thin CLI wrapper around [`serve`] so integration tests can
 //! drive the same accept loop on an ephemeral port.
 
+#[cfg(feature = "admin")]
+pub mod admin;
 pub mod proxy;
+#[cfg(feature = "reload")]
 pub mod reload;
 pub mod tls;
 
@@ -46,11 +50,6 @@ pub const LATENCY_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
-/// How long to wait for in-flight connections to finish after `shutdown`
-/// resolves, before dropping them anyway. Kept under fly.toml's 30s
-/// `kill_timeout` so the drain finishes before a SIGKILL.
-const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
-
 /// Deadline for a client to finish the TLS handshake and to send its first
 /// request. Stops idle sockets from pinning file descriptors (slowloris).
 /// Later HTTP/1 requests are bounded by `keepalive_timeout_secs` instead.
@@ -61,8 +60,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const H2_KEEP_ALIVE: Duration = Duration::from_secs(30);
 
 /// Accept connections on `listener` and serve the proxy until `shutdown`
-/// resolves, then stop accepting and wait (up to
-/// `GRACEFUL_SHUTDOWN_TIMEOUT`, 25s) for in-flight connections to finish.
+/// resolves, then stop accepting and wait (up to the table's
+/// `drain_timeout_secs`, default 25s, read at that moment) for in-flight
+/// connections to finish.
+///
+/// `shutdown_delay_secs` is NOT applied here: the caller's `shutdown` future
+/// should flip its readiness signal, sleep `table.load().shutdown_delay()`
+/// and then resolve (see `main.rs` and `examples/embedded`). Signals that
+/// arrive before `serve` starts get the OS default action.
 ///
 /// TLS-terminates each connection first when `tls` is `Some`; otherwise
 /// serves plain HTTP. Either way, both HTTP/1 and HTTP/2 are auto-detected.
@@ -170,9 +175,10 @@ pub async fn serve(
     }
 
     drop(listener);
+    let drain = table.load().drain_timeout();
     tokio::select! {
         _ = graceful.shutdown() => {}
-        _ = tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT) => {
+        _ = tokio::time::sleep(drain) => {
             tracing::warn!("graceful shutdown timed out waiting for in-flight connections");
         }
     }

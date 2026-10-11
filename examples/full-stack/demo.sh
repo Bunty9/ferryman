@@ -136,6 +136,7 @@ body_of() {
 # this script uses for the *first* config swap in the hot-reload step, so
 # that step actually pins rename-replace working, unmodified.
 swap_config() {
+    chmod 0644 "$CONFIG_TMP" # container runs as 65532: file must be world-readable
     mv "$CONFIG_TMP" "$CONFIG_FILE"
 }
 
@@ -153,6 +154,7 @@ swap_config() {
 # note for the production implication.
 swap_config_unlink() {
     rm -f "$CONFIG_FILE"
+    chmod 0644 "$CONFIG_TMP" # container runs as 65532: file must be world-readable
     mv "$CONFIG_TMP" "$CONFIG_FILE"
 }
 
@@ -333,6 +335,20 @@ else
     fail "forwarded-header check failed: proto=$proto xff=$xff has_secret=$has_secret"
 fi
 
+# Untrusted client (trusted_proxies is empty): forged forwarding headers are
+# replaced or stripped; X-Real-IP is derived from the TCP peer.
+json=$(body_of --cacert "$CA" --http1.1 -H "X-Real-IP: 203.0.113.9" \
+    -H "X-Forwarded-Proto: http" -H "X-Forwarded-Host: evil.example" \
+    "$BASE/api/users/echo")
+real=$(printf '%s' "$json" | jq -r '.headers["x-real-ip"] // empty')
+proto=$(printf '%s' "$json" | jq -r '.headers["x-forwarded-proto"] // empty')
+fwdhost=$(printf '%s' "$json" | jq -r '.headers["x-forwarded-host"] // empty')
+if [ -n "$real" ] && [ "$real" != "203.0.113.9" ] && [ "$proto" = "https" ] && [ -z "$fwdhost" ]; then
+    ok "untrusted client: forged X-Real-IP replaced ($real), X-Forwarded-Proto forced to https, X-Forwarded-Host stripped"
+else
+    fail "forged-header check failed: x-real-ip=$real proto=$proto x-forwarded-host=$fwdhost"
+fi
+
 ########################################################################
 # Step 5: streaming responses + large request bodies
 ########################################################################
@@ -399,6 +415,8 @@ else
     fail "breaker never refused a request (no bare 503 without x-served-by) within 5 tries"
 fi
 
+expect_status "$METRICS/healthz" 200
+expect_status "$METRICS/readyz" 200
 expect_body_contains "$METRICS/metrics" 'ferryman_circuit_state{upstream="orders:8080"} 1'
 
 # Recovery: the breaker now blocks the proxied admin/fail?on=0 too, and
@@ -457,8 +475,8 @@ step "Prometheus: target up, histogram series, circuit-open alert fires"
 # Prometheus's scrape_interval is 5s and the tour above can outrun that
 # comfortably (cached-image runs finish steps 1-8 in well under 5s), so
 # poll rather than asserting on the first query.
-wait_until "Prometheus target job=ferryman is up" 15 prom_target_up
-wait_until "ferryman_request_duration_seconds_bucket has series" 15 prom_has_duration_buckets
+wait_until "Prometheus target job=ferryman is up" 60 prom_target_up
+wait_until "ferryman_request_duration_seconds_bucket has series" 60 prom_has_duration_buckets
 
 # orders-v2 is still down from step 8: poll here (while it's down) for the
 # FerrymanCircuitOpen alert (for: 30s) to go from pending to firing.
@@ -475,6 +493,10 @@ echo "  orders-v2 recovery time: ${recovery_secs}s"
 # Step 10: Grafana health + provisioned dashboard
 ########################################################################
 step "Grafana: health check and provisioned dashboard"
+# Grafana can still be starting on a cold, small VM (e.g. a 4 vCPU kiln
+# runner) after the earlier steps finish; poll instead of checking once.
+grafana_up() { [ "$(status_of "$GRAFANA/api/health")" = "200" ]; }
+wait_until "Grafana /api/health is 200" 60 grafana_up
 expect_status "$GRAFANA/api/health" 200
 health_db=$(body_of "$GRAFANA/api/health" | jq -r '.database // empty')
 if [ "$health_db" = "ok" ]; then
@@ -488,7 +510,10 @@ expect_status "$GRAFANA/api/dashboards/uid/ferryman" 200
 # Step 11: hot reload (valid, then invalid, then restore)
 ########################################################################
 step "Hot reload: add a route, reject invalid TOML, restore"
+# The reload also adds trusted_proxies (the client's address is a private one
+# here), checked right after the new route is live.
 {
+    echo 'trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]'
     cat "$CONFIG_FILE"
     echo
     echo '[[routes]]'
@@ -497,6 +522,18 @@ step "Hot reload: add a route, reject invalid TOML, restore"
 } >"$CONFIG_TMP"
 swap_config
 wait_until "/api/inventory/echo returns 200 after reload" 15 inventory_up
+
+# Trusted front proxy: its X-Forwarded-Proto passes through and X-Real-IP is
+# derived from the rightmost untrusted X-Forwarded-For entry.
+json=$(body_of --cacert "$CA" --http1.1 -H "X-Forwarded-Proto: http" \
+    -H "X-Forwarded-For: 198.51.100.7" "$BASE/api/users/echo")
+proto=$(printf '%s' "$json" | jq -r '.headers["x-forwarded-proto"] // empty')
+real=$(printf '%s' "$json" | jq -r '.headers["x-real-ip"] // empty')
+if [ "$proto" = "http" ] && [ "$real" = "198.51.100.7" ]; then
+    ok "trusted proxy: X-Forwarded-Proto passed through, X-Real-IP derived from X-Forwarded-For"
+else
+    fail "trusted-proxy check failed: proto=$proto x-real-ip=$real"
+fi
 
 invalid_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo 'this is not valid toml [[[' >"$CONFIG_TMP"

@@ -2,7 +2,7 @@
 
 How the proxy works inside, and why it is built this way. The external
 contract (config keys, status codes, metrics) is in the
-[README](../README.md); the original design brief is in
+[book](https://bunty9.github.io/ferryman/) (config reference, routing, operations); the original design brief is in
 [`specs/2026-05-28-ferryman-design.md`](specs/2026-05-28-ferryman-design.md).
 
 ## Crates
@@ -15,9 +15,10 @@ contract (config keys, status codes, metrics) is in the
 |                  | `health.rs`                             | Concurrent active health checks                                  |
 | `ferryman`       | `lib.rs`                                | `serve`: accept loop, deadlines, TLS, graceful shutdown          |
 |                  | `proxy.rs`                              | Per-request handler                                              |
+|                  | `admin.rs`                              | `/metrics`, `/healthz`, `/readyz` server                         |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
-|                  | `reload.rs`                             | Debounced config file watcher                                    |
-|                  | `main.rs`                               | CLI, tracing, metrics exporter, signal handling                  |
+|                  | `reload.rs`                             | Debounced directory watcher, hash de-dup, SIGHUP/TLS reload                                    |
+|                  | `main.rs`                               | CLI (`check`, `healthcheck` subcommands), tracing, metrics recorder, signals |
 
 `ferryman` is a library plus a thin binary so the end-to-end tests
 can drive the real `serve` loop on an ephemeral port.
@@ -35,17 +36,25 @@ accept ── set TCP_NODELAY
   │
   └─ proxy::handle_streaming
        1. table.load_full()             one Arc for the whole request
-       2. bad_path(path)                dot segments, NUL, %u, double-encoded -> 400
-       2b. lookup(path)                 none -> 404
+       2. local_health_path             GET/HEAD match -> 200, answered first
+       2a. bad_path_normalized(path)     raw and normalised: dot segments, NUL, %u, double-encoded -> 400
+       2b. ambiguous_route(table, path) %2F/%5C/\/; reading picks another route -> 400
+       2c. bad_host                     single bare host[:port], present on 1.1 -> 400
+       2d. lookup(path)                 none -> 404
+       2e. strip_prefix remainder check  re-checked at runtime, failing -> 400 (before admission)
        3. Upgrade (not h2c) / CONNECT   -> 501
        4. upstream.try_acquire()        None -> 503, else Admission
        5. rewrite request:
-            strip hop-by-hop, join h2 cookies, Host from authority,
-            URI = upstream scheme+authority + original path+query,
+            strip hop-by-hop, join h2 cookies, Host from authority (route `rewrite_host`: upstream authority),
+            URI = upstream scheme+authority + original path+query
+              (`strip_prefix` route: normalised remainder after the prefix,
+              re-checked, failing -> 400; then x-forwarded-prefix set last,
+              after the forwarded headers),
             version = HTTP/1.1, x-forwarded-for / -proto;
             forwarded headers per trusted_proxies: x-real-ip always set by
-            ferryman; forwarded / x-forwarded-host stripped for untrusted
-            peers; x-forwarded-proto from the connection unless trusted
+            ferryman; forwarded / x-forwarded-host / -ssl / -scheme / -prefix /
+            -port stripped for untrusted peers (-port is never added);
+            x-forwarded-proto from the connection unless trusted
        6. client.request(); body wrapped in RequestBody (idle timeout
           between frames, signals EOS). upstream_timeout (to response
           headers) starts at body EOS, or immediately if bodyless
@@ -53,7 +62,9 @@ accept ── set TCP_NODELAY
             upload stalled   -> 408 (no breaker effect)
             client body err  -> 400 (no breaker effect)
             transport err    -> 502 + breaker failure
-            502/503/504      -> passed through + breaker failure
+            502/503/504      -> passed through + breaker failure, unless the client
+                                stalled its upload >= min(1s, idle timeout/2):
+                                then the ticket is released (status unchanged)
             anything else    -> passed through + breaker success
        7. strip hop-by-hop from the response, stream the body back
 ```
@@ -79,11 +90,20 @@ Lookup deliberately ignores health. If `/api/v1` is down, falling back to
 `/api` would send the request to a different service, so the answer is a
 503.
 
-Prefixes match the raw, undecoded, case-sensitive request path on a
-segment boundary. A less specific route (especially `/`) can receive paths
-that its upstream decodes or merges into a more specific prefix (e.g.
-`/%61pi/x`, `//api/x`). Routes are not access control: don't rely on a
-route to hide paths of an upstream that another route also reaches.
+Prefixes match the normalised, case-sensitive path on a segment boundary.
+`lookup` takes the raw path and normalises internally (borrowing, no
+allocation, when the path is already normal): `%XX` of unreserved chars
+(`A-Za-z0-9-._~`) is decoded, hex of other escapes is uppercased, repeated
+`/` is merged. The proxy runs `bad_path_normalized` first (`bad_path` on the raw path, and
+on the normalised one when the raw path contains `%`, which catches
+`%2%65%2%65` becoming `%2e%2e`), so lookup never sees dot segments, and
+still forwards the raw path. The exception
+is a route with `strip_prefix`: it forwards the normalised remainder after the
+prefix (re-checked with `bad_path`; a failing remainder is a 400) and sets
+`X-Forwarded-Prefix` after `apply_forwarded_headers`. `%2f` stays
+encoded (`/api%2fx` does not match `/api`) and case is significant, so
+routes are not access control: such variants fall to a less specific route
+(e.g. `/`) whose upstream may decode them into a more specific path.
 
 ## Circuit breaker
 
@@ -101,6 +121,7 @@ pointing there and kept across hot reloads.
        │  health check)          ┌──────────┐              │
        └──────────────────────── │ HalfOpen │ ─────────────┘
                                  └──────────┘
+        Probe failure while Open: no-op (no restamp)
                      probe lost for > cooldown: a new probe is admitted
 ```
 
@@ -118,6 +139,11 @@ pointing there and kept across hot reloads.
 - Health checks report as `Probe`: a healthy answer closes an open circuit
   at once (fast failover recovery), but a healthy answer while closed is a
   no-op, so it can't mask failing real traffic by resetting the count.
+- Only a failed half-open probe (`HalfOpen` -> `Open`) restamps `opened_at`.
+  A failing health check while already `Open` is a no-op, so a broken
+  health endpoint cannot starve the request-path probe of its slot.
+- Per-route `health_path` / `health_disabled` live on `Upstream`, not the
+  breaker; reload swaps them while reusing the same `Arc<Breaker>`.
 - Gauges publish the breaker's *current* state, so racing transitions
   can't leave a stale value.
 
@@ -133,9 +159,14 @@ removed by a reload disappear from `/metrics`.
 
 ## Hot reload
 
-`reload::watch_config` watches the config file's parent directory (so
-rename-replace saves are seen) and forwards matching events to a thread
-that waits for 200ms of quiet before reloading. The reload runs
+`reload::Reloader` watches the directories of the config file and the TLS
+cert/key (so rename-replace saves and ConfigMap/Secret `..data` symlink swaps
+are seen; any event counts) and a thread waits for 200ms of quiet. It then
+compares a content hash of the config bytes (and, separately, cert+key) with
+the last one acted on and does nothing if unchanged; SIGHUP skips that check.
+TLS uses a `ResolvesServerCert` holding an `ArcSwap<CertifiedKey>`, so a new
+pair applies to new handshakes only and a bad pair keeps the old one. The
+config reload runs
 `load_config` then `build_table(cfg, Some(&current))`:
 
 1. Validate every route and global setting. Any error: log it, keep the
@@ -148,8 +179,7 @@ In-flight requests keep the table they loaded; because breakers are
 shared, their results still land on the live breaker.
 
 Not reloadable: `health_interval_secs` (ticker is fixed at startup), bind
-addresses, TLS files. Kubernetes ConfigMap updates (a `..data` symlink
-swap) are not seen by the watcher.
+addresses, TLS on/off and the cert/key paths.
 
 ## Connection handling and shutdown
 
@@ -160,9 +190,11 @@ swap) are not seen by the watcher.
   first request's head when below 10s). HTTP/2: keep-alive ping every 30s.
 - Accept errors (e.g. `EMFILE`) are logged; the loop sleeps 100ms and
   continues.
-- On SIGINT/SIGTERM the listener closes, `GracefulShutdown` asks open
-  connections to finish, and the process exits after at most 25s (under
-  `fly.toml`'s 30s `kill_timeout`).
+- On SIGINT/SIGTERM `/readyz` flips to 503, serving continues for
+  `shutdown_delay_secs` (default 0), then the listener closes,
+  `GracefulShutdown` asks open connections to finish, and the process exits
+  after at most `drain_timeout_secs` (default 25, under `fly.toml`'s 30s
+  `kill_timeout`).
 
 ## Dependencies and build
 

@@ -5,10 +5,12 @@
 //! tens of routes typical of a self-hosted edge, a linear scan beats a trie
 //! on cache behaviour and is trivial to reason about.
 
-use crate::breaker::Breaker;
 pub use crate::breaker::{Admission, CircuitState};
+use crate::breaker::{Breaker, BreakerConfig};
 use crate::proxies::TrustedProxies;
+use crate::Error;
 use arc_swap::ArcSwap;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,19 +24,56 @@ pub struct Upstream {
     /// the scheme (80 for http) when the URI doesn't specify one.
     pub name: String,
     breaker: Arc<Breaker>,
+    health_path: Option<String>,
+    health_disabled: bool,
 }
 
 impl Upstream {
-    pub fn new(uri: http::Uri, cooldown: Duration, failure_threshold: u32) -> Self {
+    /// Create an upstream with its own closed breaker. Fails with
+    /// [`Error::InvalidBreakerConfig`] if `breaker` has a cooldown under
+    /// 1 ms or a zero threshold. The breaker is labelled with the upstream's
+    /// `host:port` name (`breaker.name` is ignored) and writes the
+    /// `ferryman_*` gauges.
+    pub fn new(uri: http::Uri, breaker: BreakerConfig) -> Result<Self, Error> {
         let name = upstream_name(&uri);
-        let breaker = Arc::new(Breaker::new(name.clone(), cooldown, failure_threshold));
-        Self { uri, name, breaker }
+        let breaker = Arc::new(Breaker::for_upstream(name.clone(), &breaker)?);
+        Ok(Self {
+            uri,
+            name,
+            breaker,
+            health_path: None,
+            health_disabled: false,
+        })
+    }
+
+    /// Set the health-probe path (`None` = `/health`) and whether active
+    /// probing is disabled. Does not touch the breaker.
+    pub fn with_health(mut self, path: Option<String>, disabled: bool) -> Self {
+        self.health_path = path;
+        self.health_disabled = disabled;
+        self
+    }
+
+    /// Health-probe path; `/health` unless configured.
+    pub fn health_path(&self) -> &str {
+        self.health_path.as_deref().unwrap_or("/health")
+    }
+
+    /// Whether the health loop skips this upstream (only requests drive its
+    /// breaker).
+    pub fn health_disabled(&self) -> bool {
+        self.health_disabled
     }
 
     /// May this request be sent to the upstream right now? Returns the
     /// ticket to pass back to `record_*`; see [`Admission`].
     pub fn try_acquire(&self) -> Option<Admission> {
         self.breaker.try_acquire()
+    }
+
+    /// See [`Breaker::release`].
+    pub fn release(&self, admission: Admission) {
+        self.breaker.release(admission)
     }
 
     pub fn record_success(&self, admission: Admission) {
@@ -49,12 +88,20 @@ impl Upstream {
         self.breaker.state()
     }
 
-    /// Same upstream, same breaker, new config. Used by hot reload so
-    /// in-flight requests and health probes holding the old table keep
-    /// reporting to the breaker the new table uses.
-    pub(crate) fn reuse(&self, cooldown: Duration, failure_threshold: u32) -> Self {
+    /// Same upstream, same breaker (state kept), new config and health
+    /// settings. Used by hot reload so in-flight requests and health probes
+    /// holding the old table keep reporting to the breaker the new table
+    /// uses. Health settings are plain fields on the returned value, so the
+    /// old table keeps its own and nothing is shared mutably.
+    pub(crate) fn reuse(
+        &self,
+        cooldown: Duration,
+        failure_threshold: u32,
+        health_path: Option<String>,
+        health_disabled: bool,
+    ) -> Self {
         self.breaker.reconfigure(cooldown, failure_threshold);
-        self.clone()
+        self.clone().with_health(health_path, health_disabled)
     }
 }
 
@@ -69,9 +116,72 @@ pub(crate) fn upstream_name(uri: &http::Uri) -> String {
 }
 
 /// One routing rule: a path prefix and the upstream it forwards to.
+#[non_exhaustive]
 pub struct Route {
     pub prefix: String,
     pub upstream: Upstream,
+    /// `true`: send the upstream's own authority as `Host`. `false` (default):
+    /// keep the client's `Host` (or the request authority, see the proxy docs).
+    pub rewrite_host: bool,
+    /// `true`: remove the matched prefix from the path sent upstream (and set
+    /// `X-Forwarded-Prefix`). `false` (default): forward the path as received.
+    pub strip_prefix: bool,
+}
+
+impl Route {
+    /// A route with `rewrite_host` off.
+    pub fn new(prefix: impl Into<String>, upstream: Upstream) -> Self {
+        Self {
+            prefix: prefix.into(),
+            upstream,
+            rewrite_host: false,
+            strip_prefix: false,
+        }
+    }
+
+    /// Set [`Route::strip_prefix`].
+    pub fn with_strip_prefix(mut self, strip: bool) -> Self {
+        self.strip_prefix = strip;
+        self
+    }
+
+    /// The prefix [`Route::strip_prefix`] removes: [`Route::prefix`] without
+    /// trailing slashes (`/api/` gives `/api`). Empty for a `/` route, which
+    /// has nothing to strip.
+    pub fn stripped_prefix(&self) -> &str {
+        self.prefix.trim_end_matches('/')
+    }
+
+    /// The path to forward for a `strip_prefix` route: what follows
+    /// [`Route::stripped_prefix`] on the NORMALISED `raw_path` (so a request
+    /// that matched through normalisation, like `/%61pi/x` for `/api`, is
+    /// stripped correctly), always starting with `/` (`/api` gives `/`).
+    /// Stripped routes therefore forward a normalised path. `None` when
+    /// the remainder fails the runtime check (not `/`-led, or `bad_path`;
+    /// callers answer 400). A `/` route has nothing to strip and returns the
+    /// raw path unchanged.
+    ///
+    /// `raw_path` must have passed `bad_path` and match this route. The
+    /// remainder is a suffix of the NORMALISED path, which CAN hold dot
+    /// segments `bad_path` never saw (`/api/%2%65%2%65/x` normalises to
+    /// `/api/%2e%2e/x`); the runtime re-check is load-bearing.
+    pub fn stripped_path(&self, raw_path: &str) -> Option<String> {
+        let prefix = self.stripped_prefix();
+        if prefix.is_empty() {
+            return Some(raw_path.to_string());
+        }
+        let norm = normalize(raw_path);
+        let rest = norm.strip_prefix(prefix)?;
+        let out = if rest.is_empty() { "/" } else { rest };
+        // Defence in depth: never hand upstream a path bad_path would refuse.
+        (out.starts_with('/') && !crate::path::bad_path(out)).then(|| out.to_string())
+    }
+
+    /// Set [`Route::rewrite_host`].
+    pub fn with_rewrite_host(mut self, rewrite: bool) -> Self {
+        self.rewrite_host = rewrite;
+        self
+    }
 }
 
 /// Routing decisions table. `routes` is sorted DESC by prefix length at
@@ -87,10 +197,19 @@ pub struct RouteTable {
     keepalive_timeout: Duration,
     request_body_idle_timeout: Duration,
     request_body_timeout: Duration,
+    drain_timeout: Duration,
+    shutdown_delay: Duration,
     trusted_proxies: TrustedProxies,
+    forwarded_header: bool,
+    xff_mode: crate::config::XffMode,
+    local_health_path: Option<String>,
+    access_log: bool,
+    request_id: bool,
 }
 
 impl RouteTable {
+    /// Does not validate prefixes; `build_table` does (they must already be in
+    /// normalised form, or they can never match).
     pub fn new(mut routes: Vec<Route>, upstream_timeout: Duration) -> Self {
         routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
         Self {
@@ -99,8 +218,26 @@ impl RouteTable {
             keepalive_timeout: Duration::from_secs(crate::config::DEFAULT_KEEPALIVE_SECS),
             request_body_idle_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_IDLE_SECS),
             request_body_timeout: Duration::from_secs(crate::config::DEFAULT_BODY_TOTAL_SECS),
+            drain_timeout: Duration::from_secs(crate::config::DEFAULT_DRAIN_SECS),
+            shutdown_delay: Duration::ZERO,
             trusted_proxies: TrustedProxies::default(),
+            forwarded_header: false,
+            xff_mode: crate::config::XffMode::default(),
+            local_health_path: None,
+            access_log: false,
+            request_id: false,
         }
+    }
+
+    /// Set the path the proxy answers itself (config `local_health_path`).
+    pub fn with_local_health_path(mut self, p: Option<String>) -> Self {
+        self.local_health_path = p;
+        self
+    }
+
+    /// Path answered locally with `200 ok` instead of being routed.
+    pub fn local_health_path(&self) -> Option<&str> {
+        self.local_health_path.as_deref()
     }
 
     /// Set the HTTP/1 keep-alive idle timeout (config `keepalive_timeout_secs`;
@@ -124,10 +261,81 @@ impl RouteTable {
         self
     }
 
+    /// Set the shutdown drain budget (config `drain_timeout_secs`; default 25 s).
+    pub fn with_drain_timeout(mut self, d: Duration) -> Self {
+        self.drain_timeout = d;
+        self
+    }
+
+    /// Set how long to keep serving after shutdown starts, before the
+    /// listener closes (config `shutdown_delay_secs`; default 0).
+    pub fn with_shutdown_delay(mut self, d: Duration) -> Self {
+        self.shutdown_delay = d;
+        self
+    }
+
+    /// Longest wait for in-flight connections once the listener has closed.
+    pub fn drain_timeout(&self) -> Duration {
+        self.drain_timeout
+    }
+
+    /// Time to keep accepting (with readiness failing) after shutdown starts.
+    ///
+    /// `ferryman::serve` does NOT apply this: an embedder does it inside its
+    /// shutdown future (flip readiness, then
+    /// `tokio::time::sleep(table.load().shutdown_delay())`, then resolve).
+    pub fn shutdown_delay(&self) -> Duration {
+        self.shutdown_delay
+    }
+
     /// Set the trusted proxy ranges (config `trusted_proxies`; default empty).
     pub fn with_trusted_proxies(mut self, t: TrustedProxies) -> Self {
         self.trusted_proxies = t;
         self
+    }
+
+    /// Emit an RFC 7239 `Forwarded` element (config `forwarded_header`; default false).
+    pub fn with_forwarded_header(mut self, on: bool) -> Self {
+        self.forwarded_header = on;
+        self
+    }
+
+    /// Emit the per-request access log line (config `access_log`; default false).
+    pub fn with_access_log(mut self, on: bool) -> Self {
+        self.access_log = on;
+        self
+    }
+
+    /// Generate/validate `x-request-id` (config `request_id`; default false).
+    pub fn with_request_id(mut self, on: bool) -> Self {
+        self.request_id = on;
+        self
+    }
+
+    /// Whether the access log line is emitted.
+    pub fn access_log(&self) -> bool {
+        self.access_log
+    }
+
+    /// Whether `x-request-id` is generated/validated.
+    pub fn request_id(&self) -> bool {
+        self.request_id
+    }
+
+    /// Set how `X-Forwarded-For` is built (config `xff`; default append).
+    pub fn with_xff_mode(mut self, m: crate::config::XffMode) -> Self {
+        self.xff_mode = m;
+        self
+    }
+
+    /// Whether an RFC 7239 `Forwarded` element is added.
+    pub fn forwarded_header(&self) -> bool {
+        self.forwarded_header
+    }
+
+    /// How `X-Forwarded-For` is built.
+    pub fn xff_mode(&self) -> crate::config::XffMode {
+        self.xff_mode
     }
 
     /// HTTP/1 keep-alive idle timeout.
@@ -154,8 +362,21 @@ impl RouteTable {
     /// `/svc-a` matches `/svc-a`, `/svc-a/`, `/svc-a/x`, but not `/svc-ab`.
     /// A prefix ending in `/` matches anything starting with it (including
     /// `/` itself, which acts as a catch-all).
+    ///
+    /// Pass the RAW request path: matching runs on a normalised copy
+    /// (`%XX` of unreserved chars decoded, other escapes' hex uppercased,
+    /// repeated `/` merged; case-sensitive, `%2f` stays encoded), so
+    /// `/%61pi/x` and `//api/x` match `/api`. The caller still forwards the
+    /// raw path. Normalisation CAN produce dot segments (`%2e%2e` becomes
+    /// `..`); it is safe only because the caller (the proxy's `bad_path`)
+    /// rejects those on the raw path before calling `lookup`. Normalisation
+    /// runs exactly once and is not idempotent for malformed escapes
+    /// (`/%2%61` becomes `/%2a`).
     pub fn lookup(&self, path: &str) -> Option<&Route> {
-        self.routes.iter().find(|r| prefix_matches(&r.prefix, path))
+        let path = normalize(path);
+        self.routes
+            .iter()
+            .find(|r| prefix_matches(&r.prefix, &path))
     }
 
     /// Upstreams referenced by this table, deduplicated by name — routes
@@ -177,6 +398,72 @@ impl RouteTable {
     }
 }
 
+fn hex_val(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
+}
+
+fn is_unreserved(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~')
+}
+
+/// What to do at `b[i]`: `Some(n)` = consume `n` bytes and emit the
+/// normalised form, `None` = already normal.
+fn rewrite_at(b: &[u8], i: usize) -> Option<(usize, [u8; 3], usize)> {
+    match b[i] {
+        b'/' if b.get(i + 1) == Some(&b'/') => Some((1, [0; 3], 0)),
+        b'%' => {
+            let (h, l) = (hex_val(*b.get(i + 1)?)?, hex_val(*b.get(i + 2)?)?);
+            let c = h << 4 | l;
+            if is_unreserved(c) {
+                Some((3, [c, 0, 0], 1))
+            } else if b[i + 1].is_ascii_lowercase() || b[i + 2].is_ascii_lowercase() {
+                Some((
+                    3,
+                    [
+                        b'%',
+                        b[i + 1].to_ascii_uppercase(),
+                        b[i + 2].to_ascii_uppercase(),
+                    ],
+                    3,
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Normalisation for matching; borrows when the path is already normal.
+/// Routes with `strip_prefix` also forward the normalised remainder (see
+/// [`Route::stripped_path`]); every other route forwards the raw path.
+pub(crate) fn normalize(path: &str) -> Cow<'_, str> {
+    if !path.contains('%') && !path.contains("//") {
+        return Cow::Borrowed(path);
+    }
+    let b = path.as_bytes();
+    let Some(first) = (0..b.len()).find(|&i| rewrite_at(b, i).is_some()) else {
+        return Cow::Borrowed(path);
+    };
+    let mut out = Vec::with_capacity(b.len());
+    out.extend_from_slice(&b[..first]);
+    let mut i = first;
+    while i < b.len() {
+        match rewrite_at(b, i) {
+            Some((n, bytes, len)) => {
+                out.extend_from_slice(&bytes[..len]);
+                i += n;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    // Only ASCII bytes were substituted, so this is always valid UTF-8.
+    Cow::Owned(String::from_utf8(out).expect("only ASCII substituted"))
+}
+
 fn prefix_matches(prefix: &str, path: &str) -> bool {
     if prefix.ends_with('/') {
         return path.starts_with(prefix);
@@ -196,22 +483,76 @@ mod tests {
     use super::*;
 
     fn upstream() -> Upstream {
-        Upstream::new(
-            "http://localhost:8001".parse().unwrap(),
-            Duration::from_secs(30),
-            3,
-        )
+        Upstream::new("http://localhost:8001".parse().unwrap(), Default::default()).unwrap()
     }
 
     fn table(prefixes: &[&str]) -> RouteTable {
         let routes = prefixes
             .iter()
-            .map(|p| Route {
-                prefix: p.to_string(),
-                upstream: upstream(),
-            })
+            .map(|p| Route::new(*p, upstream()))
             .collect();
         RouteTable::new(routes, Duration::from_secs(30))
+    }
+
+    fn route_of<'a>(t: &'a RouteTable, p: &str) -> Option<&'a str> {
+        t.lookup(p).map(|r| r.prefix.as_str())
+    }
+
+    #[test]
+    fn matches_on_normalised_path() {
+        let t = table(&["/", "/api", "/~x"]);
+        assert_eq!(route_of(&t, "/%61pi/x"), Some("/api"));
+        assert_eq!(route_of(&t, "//api/x"), Some("/api"));
+        assert_eq!(route_of(&t, "/api//x"), Some("/api"));
+        assert_eq!(route_of(&t, "///api"), Some("/api"));
+        assert_eq!(route_of(&t, "/%7ex"), Some("/~x"));
+        assert_eq!(route_of(&t, "/%7Ex/y"), Some("/~x"));
+        assert_eq!(route_of(&t, "/API/x"), Some("/"));
+        assert_eq!(route_of(&t, "/%41pi/x"), Some("/"));
+        assert_eq!(route_of(&t, "/api%2fx"), Some("/"));
+        assert_eq!(route_of(&t, "/api%2Fx"), Some("/"));
+        assert_eq!(route_of(&t, "/apix"), Some("/"));
+    }
+
+    #[test]
+    fn normalize_cases() {
+        for (raw, want) in [
+            ("/a%2fb", "/a%2Fb"),
+            ("/a%2Fb", "/a%2Fb"),
+            ("/%61%2f//b", "/a%2F/b"),
+            ("/a%zz", "/a%zz"),
+            ("/a%6", "/a%6"),
+            ("/a%e4%b8%ad", "/a%E4%B8%AD"),
+        ] {
+            assert_eq!(normalize(raw), want, "{raw}");
+        }
+        for p in ["/", "/api/x", "/a%2Fb", "/a%zz"] {
+            assert!(matches!(normalize(p), Cow::Borrowed(_)), "{p}");
+        }
+    }
+
+    /// Normalisation must not turn a path `bad_path` accepted into one with a
+    /// dot segment: `%2e` decodes to `.`, but `bad_path` rejects `%2e`-only
+    /// segments first, and a segment like `%2e%2e` never reaches lookup.
+    #[test]
+    fn decoding_dots_only_happens_inside_longer_segments() {
+        // `%2e` inside a longer segment stays a harmless filename.
+        assert_eq!(normalize("/api/a%2eb"), "/api/a.b");
+        // A pure-dot segment would be rejected by the proxy before lookup;
+        // lookup alone does not create a *new* one beyond what was there.
+        assert_eq!(normalize("/api/%2e%2e/x"), "/api/../x");
+    }
+
+    #[test]
+    fn escaped_prefix_and_trailing_slash_prefix() {
+        let t = table(&["/", "/a%2Fb", "/v/"]);
+        assert_eq!(route_of(&t, "/a%2fb"), Some("/a%2Fb"));
+        assert_eq!(route_of(&t, "/a%2Fb/x"), Some("/a%2Fb"));
+        assert_eq!(route_of(&t, "/v//x"), Some("/v/"));
+        assert_eq!(route_of(&t, "/v/a//x"), Some("/v/"));
+        let t = table(&["/api/", "/api/v1/"]);
+        assert_eq!(route_of(&t, "/api//"), Some("/api/"));
+        assert_eq!(route_of(&t, "/api/v1//x"), Some("/api/v1/"));
     }
 
     #[test]
@@ -248,17 +589,52 @@ mod tests {
     }
 
     #[test]
+    fn stripped_path_remainders() {
+        let r = |p: &str| Route::new(p, upstream()).with_strip_prefix(true);
+        assert_eq!(
+            r("/api").stripped_path("/api/users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(r("/api").stripped_path("/api").as_deref(), Some("/"));
+        assert_eq!(r("/api").stripped_path("/api/").as_deref(), Some("/"));
+        assert_eq!(
+            r("/api/").stripped_path("/api/users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(r("/api/").stripped_path("/api/").as_deref(), Some("/"));
+        assert_eq!(r("/api/").stripped_prefix(), "/api");
+        assert_eq!(
+            r("/api").stripped_path("/%61pi/users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(
+            r("/api").stripped_path("//api//users").as_deref(),
+            Some("/users")
+        );
+        assert_eq!(
+            r("/api").stripped_path("/api/a%2fb").as_deref(),
+            Some("/a%2Fb")
+        );
+        assert_eq!(r("/").stripped_path("/x").as_deref(), Some("/x"));
+        // None means 400. `/apix` and `/other` can't reach this via the
+        // proxy; the `%2%65` form can (it passes bad_path, normalises to
+        // dot segments).
+        assert_eq!(r("/api").stripped_path("/api/%2%65%2%65/x"), None);
+        assert_eq!(r("/api").stripped_path("/apix"), None);
+        assert_eq!(r("/api").stripped_path("/other"), None);
+        assert_eq!(r("/api").stripped_path("/api/%2e%2e/x"), None);
+        for p in ["/api/a/b", "/api/%41", "/api/a%2Fb", "/api"] {
+            let out = r("/api").stripped_path(p).unwrap();
+            assert!(!crate::path::bad_path(&out), "{p} -> {out}");
+        }
+    }
+
+    #[test]
     fn upstreams_deduped_by_name() {
         let shared = upstream();
         let routes = vec![
-            Route {
-                prefix: "/a".to_string(),
-                upstream: shared.clone(),
-            },
-            Route {
-                prefix: "/b".to_string(),
-                upstream: shared.clone(),
-            },
+            Route::new("/a", shared.clone()),
+            Route::new("/b", shared.clone()),
         ];
         let t = RouteTable::new(routes, Duration::from_secs(30));
         assert_eq!(t.upstreams().count(), 1);

@@ -10,6 +10,7 @@
 //! move the breaker out of open/half-open; results of ordinary requests that
 //! finish after the circuit opened are late news and are ignored.
 
+use crate::Error;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -24,8 +25,22 @@ fn now_millis() -> u64 {
 }
 
 /// Circuit breaker state. Mirrors the `ferryman_circuit_state` gauge values.
+///
+/// Non-exhaustive: matching without a wildcard arm does not compile.
+///
+/// ```compile_fail,E0004
+/// use ferryman_core::CircuitState;
+/// fn f(s: CircuitState) -> u8 {
+///     match s {
+///         CircuitState::Closed => 0,
+///         CircuitState::Open => 1,
+///         CircuitState::HalfOpen => 2,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum CircuitState {
     Closed = 0,
     Open = 1,
@@ -43,35 +58,202 @@ impl CircuitState {
 }
 
 /// Why a request was let through. Pass it back when reporting the result.
+///
+/// Non-exhaustive: matching without a wildcard arm does not compile.
+///
+/// ```compile_fail,E0004
+/// use ferryman_core::Admission;
+/// fn f(a: Admission) -> u8 {
+///     match a {
+///         Admission::Normal => 0,
+///         Admission::Probe => 1,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Admission {
     /// Ordinary request through a closed circuit. Its result only counts
     /// while the circuit is still closed.
     Normal,
     /// The single half-open probe, or an active health check. Its result is
-    /// authoritative: success closes the circuit, failure (re)opens it.
+    /// authoritative: success closes the circuit, failure of a half-open
+    /// probe reopens it (and restarts the cooldown). A failing probe while
+    /// already open changes nothing.
     Probe,
 }
 
-/// Lock-free circuit breaker for one upstream. Shared (via `Arc`) between
-/// every route that points at the backend, and across hot reloads.
-pub(crate) struct Breaker {
-    name: String,
+/// Circuit breaker settings. Build with [`Default`] and the `with_*` setters;
+/// [`Breaker::new`] validates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BreakerConfig {
+    /// Consecutive failures that open the circuit. Must be at least 1.
+    pub failure_threshold: u32,
+    /// How long the circuit stays open before one probe is let through.
+    /// Must be at least 1 ms.
+    pub cooldown: Duration,
+    /// Log label only: standalone breakers never publish metric gauges.
+    /// Keep it to a small fixed set of names.
+    pub name: Option<String>,
+}
+
+impl Default for BreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            cooldown: Duration::from_secs(30),
+            name: None,
+        }
+    }
+}
+
+impl BreakerConfig {
+    /// Consecutive failures that open the circuit (must be at least 1).
+    pub fn with_failure_threshold(mut self, failure_threshold: u32) -> Self {
+        self.failure_threshold = failure_threshold;
+        self
+    }
+
+    /// Time to stay open before admitting a probe. Validated by
+    /// [`Breaker::new`]: must be at least 1 ms.
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = cooldown;
+        self
+    }
+
+    /// Label used in transition logs only (no gauges). Keep it to a small
+    /// fixed set of names, not per-request values.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Check the invariants [`Breaker::new`] relies on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidBreakerConfig`] if the threshold is 0 or the cooldown
+    /// is under 1 ms.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.failure_threshold < 1 {
+            return Err(Error::InvalidBreakerConfig {
+                reason: "failure_threshold must be >= 1, got 0".into(),
+                upstream: None,
+            });
+        }
+        if self.cooldown < Duration::from_millis(1) {
+            return Err(Error::InvalidBreakerConfig {
+                reason: format!("cooldown must be >= 1ms, got {:?}", self.cooldown),
+                upstream: None,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Lock-free circuit breaker. Cheap to share (wrap in `Arc`); an upstream's
+/// breaker is shared between every route that points at the backend, and
+/// across hot reloads.
+///
+/// ```
+/// use ferryman_core::{Admission, Breaker, BreakerConfig, CircuitState};
+///
+/// let breaker = Breaker::new(BreakerConfig::default().with_failure_threshold(1))?;
+/// let ticket = breaker.try_acquire().expect("closed circuit admits");
+/// breaker.record_failure(ticket);
+/// // `CircuitState` and `Admission` are #[non_exhaustive]: keep a wildcard arm.
+/// let label = match breaker.state() {
+///     CircuitState::Closed => "closed",
+///     CircuitState::Open => "open",
+///     _ => "half-open or newer",
+/// };
+/// assert_eq!(label, "open");
+/// assert!(breaker.try_acquire().is_none());
+/// match Admission::Normal {
+///     Admission::Probe => {}
+///     _ => {}
+/// }
+/// # Ok::<(), ferryman_core::Error>(())
+/// ```
+pub struct Breaker {
+    name: Option<String>,
+    /// Only upstream breakers write the `ferryman_*` gauges.
+    gauges: bool,
     state: AtomicU8,
     consecutive_failures: AtomicU32,
     opened_at_millis: AtomicU64,
+    /// Last `release` re-arm (`u64::MAX` = never); caps re-arms to one per cooldown.
+    rearmed_at_millis: AtomicU64,
     // Config lives in atomics so a hot reload can retune a shared breaker.
     failure_threshold: AtomicU32,
     cooldown_millis: AtomicU64,
 }
 
+impl std::fmt::Debug for Breaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Breaker")
+            .field("name", &self.name)
+            .field("state", &self.state())
+            .field(
+                "failure_threshold",
+                &self.failure_threshold.load(Ordering::Relaxed),
+            )
+            .field(
+                "cooldown",
+                &Duration::from_millis(self.cooldown_millis.load(Ordering::Relaxed)),
+            )
+            .finish()
+    }
+}
+
 impl Breaker {
-    pub(crate) fn new(name: String, cooldown: Duration, failure_threshold: u32) -> Self {
+    /// Create a closed breaker. Fails if `config` is invalid.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidBreakerConfig`] (see [`BreakerConfig::validate`]).
+    pub fn new(config: BreakerConfig) -> Result<Self, Error> {
+        config.validate()?;
+        Ok(Self::unchecked(
+            config.name,
+            false,
+            config.cooldown,
+            config.failure_threshold,
+        ))
+    }
+
+    /// Validated breaker that writes the per-upstream gauges.
+    pub(crate) fn for_upstream(name: String, config: &BreakerConfig) -> Result<Self, Error> {
+        config.validate().map_err(|e| match e {
+            Error::InvalidBreakerConfig { reason, .. } => Error::InvalidBreakerConfig {
+                reason,
+                upstream: Some(name.clone()),
+            },
+            e => e,
+        })?;
+        Ok(Self::unchecked(
+            Some(name),
+            true,
+            config.cooldown,
+            config.failure_threshold,
+        ))
+    }
+
+    /// No validation; callers validate (or, in tests, want odd values).
+    pub(crate) fn unchecked(
+        name: Option<String>,
+        gauges: bool,
+        cooldown: Duration,
+        failure_threshold: u32,
+    ) -> Self {
         let b = Self {
             name,
+            gauges,
             state: AtomicU8::new(CircuitState::Closed as u8),
             consecutive_failures: AtomicU32::new(0),
             opened_at_millis: AtomicU64::new(0),
+            rearmed_at_millis: AtomicU64::new(u64::MAX),
             failure_threshold: AtomicU32::new(0),
             cooldown_millis: AtomicU64::new(0),
         };
@@ -87,7 +269,7 @@ impl Breaker {
             .store(failure_threshold, Ordering::Relaxed);
     }
 
-    pub(crate) fn state(&self) -> CircuitState {
+    pub fn state(&self) -> CircuitState {
         CircuitState::from_u8(self.state.load(Ordering::Acquire))
     }
 
@@ -98,7 +280,7 @@ impl Breaker {
     /// [`Admission::Probe`]. `HalfOpen` refuses everyone else, unless the
     /// in-flight probe has been out longer than a cooldown (lost or
     /// cancelled), in which case a fresh probe is admitted.
-    pub(crate) fn try_acquire(&self) -> Option<Admission> {
+    pub fn try_acquire(&self) -> Option<Admission> {
         match self.state() {
             CircuitState::Closed => Some(Admission::Normal),
             CircuitState::Open => {
@@ -131,7 +313,53 @@ impl Breaker {
             .is_ok()
     }
 
-    pub(crate) fn record_success(&self, admission: Admission) {
+    /// Hand back a ticket whose request ended without a verdict on the
+    /// upstream (client hung up, bad request, timeout that isn't the
+    /// upstream's fault). A `Probe` re-arms the half-open slot at once, so
+    /// the next caller can probe instead of waiting out another cooldown;
+    /// a `Normal` ticket is a no-op. Never changes the state or the failure
+    /// count.
+    ///
+    /// Re-arming happens at most once per cooldown (otherwise a client that
+    /// keeps starting and abandoning requests would turn every request into
+    /// a probe against a sick upstream). Call at most once per ticket and
+    /// not after `record_*` for it; it only acts while the circuit is
+    /// half-open, so a stale call is harmless except that it can re-arm a
+    /// newer probe's slot (bounded by the once-per-cooldown cap).
+    pub fn release(&self, admission: Admission) {
+        if admission != Admission::Probe {
+            return;
+        }
+        // ponytail: tickets carry no generation, so a stale release may
+        // re-arm another probe's slot (at most once per cooldown); add
+        // per-ticket generations if exactness matters.
+        let cooldown = self.cooldown_millis.load(Ordering::Relaxed);
+        let now = now_millis();
+        let stamp = self.opened_at_millis.load(Ordering::Acquire);
+        if self.state() != CircuitState::HalfOpen {
+            return;
+        }
+        let last = self.rearmed_at_millis.load(Ordering::Acquire);
+        if last != u64::MAX && now.saturating_sub(last) < cooldown {
+            return;
+        }
+        if self
+            .rearmed_at_millis
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // CAS, not store: a concurrent HalfOpen -> Open restamp wins.
+        let _ = self.opened_at_millis.compare_exchange(
+            stamp,
+            now.saturating_sub(cooldown),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn record_success(&self, admission: Admission) {
         match admission {
             Admission::Probe => {
                 // A health check passing says nothing about whether real
@@ -157,14 +385,19 @@ impl Breaker {
         }
     }
 
-    pub(crate) fn record_failure(&self, admission: Admission) {
+    pub fn record_failure(&self, admission: Admission) {
         match (admission, self.state()) {
-            (Admission::Probe, CircuitState::Open | CircuitState::HalfOpen) => {
+            (Admission::Probe, CircuitState::HalfOpen) => {
                 // Stamp before publishing Open so no reader pairs the Open
                 // state with a stale timestamp.
                 self.opened_at_millis.store(now_millis(), Ordering::Release);
                 self.transition(CircuitState::HalfOpen, CircuitState::Open);
             }
+            // A failing health check while already open must not push the
+            // cooldown out: otherwise a broken health endpoint (tick < cooldown)
+            // keeps the circuit open forever and no request-path probe ever
+            // gets a slot. Only a failed half-open probe re-stamps.
+            (Admission::Probe, CircuitState::Open) => {}
             (_, CircuitState::Closed) => {
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
                 if failures < self.failure_threshold.load(Ordering::Relaxed) {
@@ -193,25 +426,29 @@ impl Breaker {
 
     /// Only called after a state-changing CAS/swap, never on the hot path.
     fn log_transition(&self, from: CircuitState, to: CircuitState) {
+        let name = self.name.as_deref().unwrap_or("unnamed");
         if to == CircuitState::Open {
-            tracing::warn!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+            tracing::warn!(upstream = %name, ?from, ?to, "circuit breaker state change");
         } else {
-            tracing::info!(upstream = %self.name, ?from, ?to, "circuit breaker state change");
+            tracing::info!(upstream = %name, ?from, ?to, "circuit breaker state change");
         }
     }
 
     /// Publish the *current* state (not a transition target), so racing
     /// transitions can't leave the gauge showing a stale value.
     pub(crate) fn set_gauges(&self) {
+        let (true, Some(name)) = (self.gauges, &self.name) else {
+            return;
+        };
         let state = self.state();
-        metrics::gauge!("ferryman_circuit_state", "upstream" => self.name.clone())
+        metrics::gauge!("ferryman_circuit_state", "upstream" => name.clone())
             .set(state as u8 as f64);
         let alive = if state == CircuitState::Closed {
             1.0
         } else {
             0.0
         };
-        metrics::gauge!("ferryman_upstream_alive", "upstream" => self.name.clone()).set(alive);
+        metrics::gauge!("ferryman_upstream_alive", "upstream" => name.clone()).set(alive);
     }
 }
 
@@ -225,8 +462,9 @@ mod tests {
     const P: Admission = Admission::Probe;
 
     fn breaker(cooldown_ms: u64, threshold: u32) -> Breaker {
-        Breaker::new(
-            "test:1".to_string(),
+        Breaker::unchecked(
+            Some("test:1".to_string()),
+            true,
             Duration::from_millis(cooldown_ms),
             threshold,
         )
@@ -242,14 +480,14 @@ mod tests {
 
     #[test]
     fn closed_always_acquires() {
-        let b = breaker(50, 3);
+        let b = breaker(1_000, 3);
         assert_eq!(b.state(), CircuitState::Closed);
         assert_eq!(b.try_acquire(), Some(N));
     }
 
     #[test]
     fn opens_after_threshold_failures() {
-        let b = breaker(50, 3);
+        let b = breaker(1_000, 3);
         b.record_failure(N);
         b.record_failure(N);
         assert_eq!(b.state(), CircuitState::Closed);
@@ -260,7 +498,7 @@ mod tests {
 
     #[test]
     fn success_resets_failure_count() {
-        let b = breaker(50, 2);
+        let b = breaker(1_000, 2);
         b.record_failure(N);
         b.record_success(N);
         b.record_failure(N);
@@ -294,6 +532,78 @@ mod tests {
         half_open(&b);
         b.record_failure(P);
         assert_eq!(b.state(), CircuitState::Open);
+        assert_eq!(b.try_acquire(), None);
+    }
+
+    #[test]
+    fn probe_failure_while_open_does_not_restamp() {
+        // Health ticks (every 50 ms) are shorter than the cooldown (200 ms)
+        // and always fail; a request-path probe must still get its slot.
+        let b = breaker(200, 1);
+        b.record_failure(N);
+        for _ in 0..6 {
+            thread::sleep(Duration::from_millis(50));
+            b.record_failure(P);
+        }
+        assert_eq!(b.state(), CircuitState::Open);
+        assert_eq!(b.try_acquire(), Some(P), "cooldown must have elapsed");
+        b.record_success(P);
+        assert_eq!(b.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn release_probe_rearms_slot_immediately() {
+        let b = breaker(10_000, 1);
+        b.record_failure(N);
+        b.reconfigure(Duration::from_millis(200), 1);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(b.try_acquire(), Some(P));
+        assert_eq!(b.try_acquire(), None, "probe is out");
+        b.release(P);
+        assert_eq!(b.state(), CircuitState::HalfOpen, "state unchanged");
+        assert_eq!(b.try_acquire(), Some(P), "slot re-armed at once");
+        assert_eq!(b.try_acquire(), None);
+    }
+
+    #[test]
+    fn release_rearms_at_most_once_per_cooldown() {
+        let b = breaker(200, 1);
+        half_open(&b); // probe out
+        let mut admitted = 1;
+        for _ in 0..1000 {
+            b.release(P);
+            if b.try_acquire().is_some() {
+                admitted += 1;
+            }
+        }
+        assert!(admitted <= 2, "probe flood: {admitted}");
+        assert_eq!(b.state(), CircuitState::HalfOpen);
+        thread::sleep(Duration::from_millis(250));
+        // The stale rule may hand out a probe now; take whatever is out,
+        // then a release after the cooldown re-arms again.
+        let _ = b.try_acquire();
+        b.release(P);
+        assert_eq!(b.try_acquire(), Some(P), "re-armed after a cooldown");
+    }
+
+    #[test]
+    fn release_normal_and_stale_release_are_noops() {
+        // The monotonic base starts at first use; make `now` exceed the
+        // cooldown so a wrongly re-armed slot cannot hide behind saturation.
+        thread::sleep(Duration::from_millis(250));
+        let b = breaker(200, 2);
+        b.record_failure(N);
+        b.release(N);
+        b.release(P); // closed: nothing
+        assert_eq!(b.state(), CircuitState::Closed);
+        b.record_failure(N); // opens (2nd failure)
+        assert_eq!(b.state(), CircuitState::Open);
+        b.release(N);
+        b.release(P); // open: must not shorten the cooldown
+        assert_eq!(b.try_acquire(), None);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(b.try_acquire(), Some(P));
+        b.release(N); // no-op: slot stays taken
         assert_eq!(b.try_acquire(), None);
     }
 

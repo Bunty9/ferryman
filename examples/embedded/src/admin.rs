@@ -107,6 +107,8 @@ fn state_str(state: CircuitState) -> &'static str {
         CircuitState::Closed => "closed",
         CircuitState::Open => "open",
         CircuitState::HalfOpen => "half_open",
+        // CircuitState is #[non_exhaustive]
+        _ => "unknown",
     }
 }
 

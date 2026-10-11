@@ -3,7 +3,7 @@
 //! hyper client, records metrics, and turns transport failures into
 //! circuit-breaker trips.
 
-use ferryman_core::{SharedTable, TrustedProxies};
+use ferryman_core::{RouteTable, SharedTable, TrustedProxies, XffMode};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -20,6 +20,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::time::Sleep;
+use tracing::Instrument;
 
 #[allow(deprecated)]
 use crate::ProxyClient;
@@ -36,7 +37,8 @@ pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
 /// it enforces `request_body_idle_timeout_secs` between frames and
 /// `request_body_timeout_secs` overall (an over-slow upload errors, which
 /// `handle_streaming` turns into 408), and it reports end-of-stream so `handle_streaming` can
-/// start the upstream timeout only once the whole body is sent. Never buffers.
+/// start the upstream timeout only once the whole body is sent. Trailer frames
+/// are discarded (client trailers are never forwarded). Never buffers.
 pub struct RequestBody {
     inner: Incoming,
     idle: Duration,
@@ -160,54 +162,59 @@ impl Body for RequestBody {
         if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
         }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                this.idle_sleep = None;
-                this.state.stall_ended();
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                // The last frame of a content-length body may not be followed
-                // by another poll, so check here as well as on `None`.
-                this.signal_if_done();
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                this.state.stall_ended();
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                Poll::Ready(Some(Err(e.into())))
-            }
-            Poll::Ready(None) => {
-                this.state.stall_ended();
-                this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                if let Some(tx) = this.eos.take() {
-                    let _ = tx.send(());
+        loop {
+            return match Pin::new(&mut this.inner).poll_frame(cx) {
+                // Client trailers never reach the upstream: they could carry
+                // trust-governed header names. Keep polling for the next frame.
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
+                Poll::Ready(Some(Ok(frame))) => {
+                    this.idle_sleep = None;
+                    this.state.stall_ended();
+                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                    // The last frame of a content-length body may not be followed
+                    // by another poll, so check here as well as on `None`.
+                    this.signal_if_done();
+                    Poll::Ready(Some(Ok(frame)))
                 }
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                this.state.waiting_on_client.store(true, Ordering::Relaxed);
-                let now = this.state.now_ms() + 1;
-                let _ = this.state.stall_since.compare_exchange(
-                    0,
-                    now,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-                let idle = this.idle;
-                let idle_sleep = this
-                    .idle_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
-                if idle_sleep.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Some(Err(BodyIdleTimeout.into())));
+                Poll::Ready(Some(Err(e))) => {
+                    this.state.stall_ended();
+                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                    Poll::Ready(Some(Err(e.into())))
                 }
-                let deadline = this.deadline;
-                let total_sleep = this
-                    .total_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
-                if total_sleep.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
+                Poll::Ready(None) => {
+                    this.state.stall_ended();
+                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                    if let Some(tx) = this.eos.take() {
+                        let _ = tx.send(());
+                    }
+                    Poll::Ready(None)
                 }
-                Poll::Pending
-            }
+                Poll::Pending => {
+                    this.state.waiting_on_client.store(true, Ordering::Relaxed);
+                    let now = this.state.now_ms() + 1;
+                    let _ = this.state.stall_since.compare_exchange(
+                        0,
+                        now,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                    let idle = this.idle;
+                    let idle_sleep = this
+                        .idle_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                    if idle_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(BodyIdleTimeout.into())));
+                    }
+                    let deadline = this.deadline;
+                    let total_sleep = this
+                        .total_sleep
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+                    if total_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
+                    }
+                    Poll::Pending
+                }
+            };
         }
     }
 
@@ -262,8 +269,10 @@ pub async fn handle_streaming(
 /// the whole request including the body upload, no body idle timeout, and a
 /// timeout counts against the breaker only for bodyless requests. It shares
 /// the core with `handle_streaming`, so it still gets the forwarded-header and
-/// bad-path fixes. It does not get the client-stall protection
-/// (`handle_streaming` only).
+/// bad-path fixes. It does not get the client-stall protection (`handle_streaming` only).
+/// Request trailers are not dropped on this path (the body is the raw
+/// `Incoming`); that is safe only because `Trailer` is a hop-by-hop header and
+/// is stripped.
 #[deprecated(
     since = "0.2.3",
     note = "long uploads can 504; use `handle_streaming` with a `StreamingClient`"
@@ -279,15 +288,84 @@ pub async fn handle(
     handle_inner(table, client, peer, proto, req, |b, _, _| (b, None)).await
 }
 
-/// Shared core. `wrap` turns the inbound body into the client's body type and
-/// optionally returns an end-of-body signal; without one (legacy), the
-/// upstream timeout starts immediately and only counts for bodyless requests.
+/// Per-request state for the access log line (`None` = `access_log = false`).
+struct Cx {
+    started: Instant,
+    log: Option<AccessInfo>,
+}
+
+struct AccessInfo {
+    method: http::Method,
+    host: String,
+    path: String,
+    version: http::Version,
+    peer: IpAddr,
+    proto: &'static str,
+    request_id: Option<String>,
+}
+
+const MAX_LOGGED_PATH: usize = 512;
+const MAX_REQUEST_ID: usize = 128;
+
+/// Log-safe copy: at most `max` bytes, anything but visible ASCII becomes `?`
+/// (no newline/ANSI injection into text logs).
+fn sanitize(s: &[u8], max: usize) -> String {
+    s.iter()
+        .copied()
+        .take(max)
+        .map(|b| {
+            if (0x21..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+fn valid_request_id(v: &HeaderValue) -> bool {
+    let b = v.as_bytes();
+    !b.is_empty() && b.len() <= MAX_REQUEST_ID && b.iter().all(|c| (0x21..=0x7e).contains(c))
+}
+
+/// 128 random-ish bits as hex. Not cryptographic: per-process random hasher
+/// keys mixed with a counter; unique enough to correlate log lines.
+fn generate_request_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let word = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(N.fetch_add(1, Ordering::Relaxed));
+        h.finish()
+    };
+    format!("{:016x}{:016x}", word(), word())
+}
+
+/// Keeps a valid incoming `x-request-id`, else replaces it with a fresh one.
+fn ensure_request_id(headers: &mut HeaderMap) -> String {
+    const NAME: HeaderName = HeaderName::from_static("x-request-id");
+    // More than one header is ambiguous: replace (insert drops them all).
+    if headers.get_all(NAME).iter().count() == 1 {
+        if let Some(v) = headers.get(NAME).filter(|v| valid_request_id(v)) {
+            return String::from_utf8_lossy(v.as_bytes()).into_owned();
+        }
+    }
+    let id = generate_request_id();
+    headers.insert(
+        NAME,
+        HeaderValue::from_str(&id).expect("hex is a valid header value"),
+    );
+    id
+}
+
+/// Wraps the core in the request span, sets up the access-log context and the
+/// optional `x-request-id` (on the upstream request and the response).
 async fn handle_inner<B>(
     table: SharedTable,
     client: Client<HttpConnector, B>,
     peer: SocketAddr,
     proto: &'static str,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
 ) -> Result<Response<ResponseBody>, Infallible>
 where
@@ -299,18 +377,127 @@ where
     // `.await` points below; `load`'s guard is meant for short critical
     // sections only.
     let table = table.load_full();
+    let echo_id = table.request_id();
+    let request_id = if echo_id {
+        Some(ensure_request_id(req.headers_mut()))
+    } else if table.access_log() {
+        req.headers()
+            .get("x-request-id")
+            .filter(|v| valid_request_id(v))
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+    } else {
+        None
+    };
+    let log = table.access_log().then(|| {
+        let host = match req.uri().authority() {
+            Some(a) => sanitize(a.as_str().as_bytes(), 255),
+            None => req
+                .headers()
+                .get(header::HOST)
+                .map_or_else(|| "-".to_string(), |h| sanitize(h.as_bytes(), 255)),
+        };
+        AccessInfo {
+            method: req.method().clone(),
+            host,
+            path: sanitize(req.uri().path().as_bytes(), MAX_LOGGED_PATH),
+            version: req.version(),
+            peer: peer.ip(),
+            proto,
+            request_id: request_id.clone(),
+        }
+    });
+    // Bounded fields only: never the raw path.
+    // Skipped entirely when neither the access log nor request ids are on.
+    let span = if log.is_some() || echo_id {
+        tracing::info_span!(
+            "request",
+            method = %req.method(),
+            route = tracing::field::Empty,
+            upstream = tracing::field::Empty,
+        )
+    } else {
+        tracing::Span::none()
+    };
+    let cx = Cx { started, log };
+    let Ok(mut resp) = handle_core(table, client, peer, proto, req, wrap, &cx)
+        .instrument(span)
+        .await;
+    // Only with `request_id = true`; a client-supplied id is never echoed otherwise.
+    if let Some(v) = request_id
+        .filter(|_| echo_id)
+        .and_then(|id| HeaderValue::from_str(&id).ok())
+    {
+        resp.headers_mut().entry("x-request-id").or_insert(v);
+    }
+    Ok(resp)
+}
 
-    if bad_path(req.uri().path()) {
-        record(started, "none", "none", 400);
+/// Shared core. `wrap` turns the inbound body into the client's body type and
+/// optionally returns an end-of-body signal; without one (legacy), the
+/// upstream timeout starts immediately and only counts for bodyless requests.
+#[allow(clippy::too_many_arguments)]
+async fn handle_core<B>(
+    table: Arc<RouteTable>,
+    client: Client<HttpConnector, B>,
+    peer: SocketAddr,
+    proto: &'static str,
+    req: Request<Incoming>,
+    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
+    cx: &Cx,
+) -> Result<Response<ResponseBody>, Infallible>
+where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    // Answered before bad_path/lookup: no upstream, no breaker. Exact match
+    // on the raw path. Metric label is the fixed "local_health".
+    if table.local_health_path() == Some(req.uri().path())
+        && matches!(*req.method(), http::Method::GET | http::Method::HEAD)
+    {
+        record(cx, "local_health", "none", 200);
+        let body = if req.method() == http::Method::HEAD {
+            ""
+        } else {
+            "ok"
+        };
+        return Ok(error_response(StatusCode::OK, body));
+    }
+
+    if ferryman_core::path::bad_path_normalized(req.uri().path())
+        || ferryman_core::path::ambiguous_route(&table, req.uri().path())
+    {
+        record(cx, "none", "none", 400);
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
     }
 
+    if bad_host(req.headers(), req.uri(), req.version()) {
+        record(cx, "none", "none", 400);
+        return Ok(error_response(StatusCode::BAD_REQUEST, "bad host\n"));
+    }
+
     let Some(route) = table.lookup(req.uri().path()) else {
-        record(started, "none", "none", 404);
+        record(cx, "none", "none", 404);
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
     };
     let route_label = route.prefix.clone();
     let upstream = route.upstream.clone();
+    let span = tracing::Span::current();
+    span.record("route", route_label.as_str());
+    span.record("upstream", &*upstream.name);
+    let rewrite_host = route.rewrite_host;
+    // bad_path/ambiguous_route already accepted the raw path; strip only
+    // after them, on the normalised path, and re-check the result.
+    let strip = if route.strip_prefix {
+        match route.stripped_path(req.uri().path()) {
+            Some(p) => Some((p, route.stripped_prefix().to_string())),
+            None => {
+                record(cx, "none", "none", 400);
+                return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
+            }
+        }
+    } else {
+        None
+    };
 
     // Upgrades (WebSocket etc.) need both hops spliced together, which this
     // proxy doesn't do; say so instead of forwarding a mangled plain GET.
@@ -321,7 +508,7 @@ where
         .get(header::UPGRADE)
         .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
     if wants_upgrade || req.method() == http::Method::CONNECT {
-        record(started, &route_label, &upstream.name, 501);
+        record(cx, &route_label, &upstream.name, 501);
         return Ok(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "protocol upgrades are not supported",
@@ -329,7 +516,7 @@ where
     }
 
     let Some(admission) = upstream.try_acquire() else {
-        record(started, &route_label, &upstream.name, 503);
+        record(cx, &route_label, &upstream.name, 503);
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream unavailable",
@@ -350,10 +537,30 @@ where
     if parts.version == http::Version::HTTP_2 {
         join_cookies(&mut parts.headers);
     }
-    // An authority in the request URI (HTTP/2 `:authority`, or an HTTP/1
-    // absolute-form target) overrides `Host` (RFC 9112 §3.2.2). Pin it before
-    // the URI is rewritten so upstreams see the client's host either way.
-    if let Some(v) = parts.uri.authority().and_then(|a| {
+    // Default: an authority in the request URI (HTTP/2 `:authority`, or an
+    // HTTP/1 absolute-form target) overrides `Host` (RFC 9112 §3.2.2). Pin it
+    // before the URI is rewritten so upstreams see the client's host either
+    // way. With `rewrite_host`, the upstream's own authority wins over both.
+    // The client's effective host, for `Forwarded host=`; captured before
+    // `rewrite_host` can overwrite it.
+    let client_host: Option<String> = table
+        .forwarded_header()
+        .then(|| match parts.uri.authority() {
+            Some(a) => a.as_str().rsplit('@').next().unwrap_or("").to_string(),
+            None => parts
+                .headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .filter(|h| !h.is_empty());
+    let authority = if rewrite_host {
+        upstream.uri.authority()
+    } else {
+        parts.uri.authority()
+    };
+    if let Some(v) = authority.and_then(|a| {
         let host = match a.port() {
             Some(port) => format!("{}:{port}", a.host()),
             None => a.host().to_string(),
@@ -364,11 +571,29 @@ where
     }
 
     let mut up_parts = upstream.uri.clone().into_parts();
-    up_parts.path_and_query = parts.uri.path_and_query().cloned();
+    up_parts.path_and_query = match &strip {
+        Some((path, _)) => {
+            let pq = match parts.uri.query() {
+                Some(q) => format!("{path}?{q}"),
+                None => path.clone(),
+            };
+            match pq.parse() {
+                Ok(pq) => Some(pq),
+                Err(_) => {
+                    // Request-derived, so the client's fault.
+                    upstream.release(admission);
+                    record(cx, &route_label, &upstream.name, 400);
+                    return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
+                }
+            }
+        }
+        None => parts.uri.path_and_query().cloned(),
+    };
     parts.uri = match http::Uri::from_parts(up_parts) {
         Ok(uri) => uri,
         Err(e) => {
-            record(started, &route_label, &upstream.name, 502);
+            upstream.release(admission);
+            record(cx, &route_label, &upstream.name, 502);
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 format!("rebuilding upstream URI: {e}"),
@@ -379,12 +604,25 @@ where
     // what the inbound connection negotiated; an inbound HTTP/2 request
     // otherwise fails the client outright.
     parts.version = http::Version::HTTP_11;
+    if table.trusted_proxies().is_empty() && is_private_peer(peer.ip()) {
+        warn_private_peer_once();
+    }
     apply_forwarded_headers(
         &mut parts.headers,
         peer.ip(),
         proto,
-        table.trusted_proxies(),
+        client_host.as_deref(),
+        &FwdCfg {
+            trusted: table.trusted_proxies(),
+            forwarded_header: table.forwarded_header(),
+            xff: table.xff_mode(),
+        },
     );
+
+    // After apply_forwarded_headers (it strips untrusted values).
+    if let Some((_, prefix)) = strip.as_ref().filter(|(_, p)| !p.is_empty()) {
+        set_forwarded_prefix(&mut parts.headers, prefix);
+    }
 
     let fwd = Request::from_parts(parts, body);
 
@@ -436,7 +674,7 @@ where
             if counts_timeout {
                 upstream.record_failure(admission);
             }
-            record(started, &route_label, &upstream.name, 504);
+            record(cx, &route_label, &upstream.name, 504);
             Ok(error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream timeout",
@@ -444,8 +682,9 @@ where
         }
         Some(Err(e)) if is_body_idle_timeout(&e) => {
             // The client stalled or over-ran its upload: 408, no breaker effect.
+            upstream.release(admission);
             tracing::debug!("client request body idle timeout");
-            record(started, &route_label, &upstream.name, 408);
+            record(cx, &route_label, &upstream.name, 408);
             Ok(error_response(
                 StatusCode::REQUEST_TIMEOUT,
                 "request body timeout",
@@ -454,21 +693,22 @@ where
         Some(Err(e)) if is_client_body_error(&e) => {
             // The client's request body failed (e.g. it hung up mid-upload).
             // Not the upstream's fault, so the breaker stays out of it.
+            upstream.release(admission);
             tracing::debug!(error = %e, "client request body failed");
-            record(started, &route_label, &upstream.name, 400);
+            record(cx, &route_label, &upstream.name, 400);
             Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 "request body error",
             ))
         }
         Some(Err(e)) => {
-            // A stalled client is not evidence against the upstream: no result
-            // is recorded (as for the 408/400 arms above).
-            if !client_stalled() {
+            if client_stalled() {
+                upstream.release(admission);
+            } else {
                 upstream.record_failure(admission);
             }
             tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
-            record(started, &route_label, &upstream.name, 502);
+            record(cx, &route_label, &upstream.name, 502);
             Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
         }
         Some(Ok(resp)) => {
@@ -476,13 +716,20 @@ where
             // Health is judged on the response head; the body is streamed
             // afterwards with no timeout of its own.
             if matches!(status.as_u16(), 502..=504) {
-                if !client_stalled() {
+                if client_stalled() {
+                    upstream.release(admission);
+                } else {
                     upstream.record_failure(admission);
                 }
             } else {
                 upstream.record_success(admission);
             }
-            record(started, &route_label, &upstream.name, status.as_u16());
+            let len = resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            record_len(cx, &route_label, &upstream.name, status.as_u16(), len);
 
             let (mut rparts, rbody) = resp.into_parts();
             strip_hop_by_hop(&mut rparts.headers);
@@ -503,10 +750,53 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
         .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
         .collect();
     for name in named {
+        // The proxy relies on `Host`; a client must not delete it by naming
+        // it in `Connection` (applies to the response strip too).
+        // `ensure_request_id` ran first; the generated id must survive too.
+        if name == header::HOST || name == "x-request-id" {
+            continue;
+        }
         headers.remove(name);
     }
     for name in &HOP_BY_HOP_HEADERS {
         headers.remove(name);
+    }
+}
+
+/// More than one `Host`, or (when the request target has no authority, so the
+/// header is what gets forwarded) a missing one on HTTP/1.1 or one that is
+/// empty, `*`, or not a bare `host[:port]` (userinfo, list, path, obs-text,
+/// port not 1-5 digits <= 65535). h2 `:authority` / absolute form still win
+/// over `Host`, which is then not judged beyond the count. HTTP/1.0 without
+/// `Host` stays allowed.
+fn bad_host(headers: &HeaderMap, uri: &http::Uri, version: http::Version) -> bool {
+    let mut it = headers.get_all(header::HOST).iter();
+    match (it.next(), it.next()) {
+        (None, _) => uri.authority().is_none() && version == http::Version::HTTP_11,
+        (Some(v), None) => uri.authority().is_none() && !plain_authority(v.as_bytes()),
+        _ => true,
+    }
+}
+
+fn plain_authority(b: &[u8]) -> bool {
+    if b == b"*"
+        || b.iter()
+            .any(|c| matches!(c, b'@' | b',' | b'/') || *c >= 0x80)
+    {
+        return false;
+    }
+    if http::uri::Authority::try_from(b).is_err() {
+        return false;
+    }
+    // A port part after the host (not inside `[v6]`) must be 1-5 digits <= 65535.
+    match b.iter().rposition(|c| *c == b':') {
+        Some(i) if !b[i..].contains(&b']') => {
+            let p = &b[i + 1..];
+            !p.is_empty()
+                && p.iter().all(u8::is_ascii_digit)
+                && std::str::from_utf8(p).is_ok_and(|p| p.parse::<u16>().is_ok())
+        }
+        _ => true,
     }
 }
 
@@ -555,19 +845,96 @@ fn join_cookies(headers: &mut HeaderMap) {
     }
 }
 
-/// Canonical names of the headers ferryman asserts itself.
-const PROXY_ASSERTED: [&str; 5] = [
+/// Per-table forwarding policy for [`apply_forwarded_headers`].
+struct FwdCfg<'a> {
+    trusted: &'a TrustedProxies,
+    forwarded_header: bool,
+    xff: XffMode,
+}
+
+/// RFC 1918, 100.64/10, fc00::/7, fe80::/10, loopback.
+fn is_private_peer(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || (v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.segments()[0] & 0xfe00 == 0xfc00
+                || v6.segments()[0] & 0xffc0 == 0xfe80
+        }
+    }
+}
+
+/// One warning per process: with no `trusted_proxies`, a private-range peer
+/// is probably a proxy/LB whose forwarding headers are being discarded.
+fn warn_private_peer_once() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "request from a private/loopback peer while trusted_proxies is empty: if ferryman \
+             sits behind a proxy or load balancer, add its address range to trusted_proxies, \
+             otherwise client IP and scheme headers it sends are ignored"
+        );
+    }
+}
+
+/// `X-Forwarded-Prefix` for a stripped route: a trusted hop's single plain
+/// path value (untrusted ones are already gone) is kept in front of ours
+/// (`/outer` + `/api` gives `/outer/api`); anything else is replaced.
+fn set_forwarded_prefix(headers: &mut HeaderMap, prefix: &str) {
+    let name = HeaderName::from_static("x-forwarded-prefix");
+    let mut all = headers.get_all(&name).iter();
+    let outer = match (all.next(), all.next()) {
+        (Some(v), None) => v.to_str().ok().map(|v| v.trim().trim_end_matches('/')),
+        _ => None,
+    }
+    .filter(|v| {
+        v.starts_with('/')
+            && v.bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b',' | b'?' | b'#'))
+            && !v.contains("//")
+            && !ferryman_core::path::bad_path(v)
+    })
+    .unwrap_or("");
+    if let Ok(v) = HeaderValue::from_str(&format!("{outer}{prefix}")) {
+        headers.insert(name, v);
+    }
+}
+
+/// Client-supplied hop headers an untrusted peer must not set.
+const UNTRUSTED_STRIPPED: [&str; 6] = [
+    "forwarded",
+    "x-forwarded-host",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+];
+
+/// Canonical trust-governed names. A header whose name maps onto one of these
+/// (every non-alphanumeric byte read as `-`, as CGI-style backends do: WSGI,
+/// Rack, PHP-FPM fold `_`, `.` and space) without being spelled exactly so is
+/// dropped.
+const TRUST_GOVERNED: [&str; 9] = [
     "forwarded",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-ssl",
+    "x-forwarded-scheme",
+    "x-forwarded-prefix",
     "x-real-ip",
 ];
 
-/// Is `name` (lowercase) a non-canonical spelling of a proxy-asserted header?
-/// CGI-style backends (WSGI, Rack, PHP-FPM) fold `_`, `.` and space to `-`, so
-/// every non-alphanumeric byte is read as `-` (runs collapsed, ends trimmed).
-/// Allocation-free for names made only of `[a-z0-9-]` that are already normal.
+/// Is `name` (already lowercase) a non-canonical spelling of a trust-governed
+/// header? Allocation-free for names made only of `[a-z0-9-]`, which are
+/// either canonical or unrelated. Runs of separators are collapsed and
+/// the ends trimmed (`x__real_ip`, `-x-real-ip` -> `x-real-ip`).
 fn is_noncanonical_spelling(name: &str) -> bool {
     // Already normal (no leading/trailing `-`, no `--`): protected iff an exact
     // match, and exact matches are canonical, hence kept.
@@ -578,6 +945,7 @@ fn is_noncanonical_spelling(name: &str) -> bool {
     {
         return false;
     }
+    // Fold every non-alphanumeric byte to `-`, collapse runs, trim the ends.
     let mut folded = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_alphanumeric() {
@@ -586,10 +954,12 @@ fn is_noncanonical_spelling(name: &str) -> bool {
             folded.push('-');
         }
     }
-    PROXY_ASSERTED.contains(&folded.trim_end_matches('-'))
+    let folded = folded.trim_end_matches('-');
+    TRUST_GOVERNED.contains(&folded)
 }
 
-/// Remove, for every peer, non-canonical spellings of proxy-asserted headers.
+/// Remove, for every peer, non-canonical spellings (`X_Real_IP`, `x.forwarded.for`)
+/// of trust-governed headers.
 fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
     let bad: Vec<HeaderName> = headers
         .keys()
@@ -601,44 +971,74 @@ fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
     }
 }
 
+/// Rightmost comma-separated token across all lines of `name`.
+fn rightmost<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
+    headers
+        .get_all(name)
+        .iter()
+        .flat_map(|v| v.to_str().unwrap_or("!").split(','))
+        .map(str::trim)
+        .rfind(|v| !v.is_empty())
+}
+
+/// RFC 7239 §6 node: bare v4, quoted+bracketed v6.
+fn forwarded_node(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("\"[{v6}]\""),
+    }
+}
+
 /// Decide the forwarding headers the upstream sees (pure; unit-tested).
 ///
 /// Untrusted peer (every peer when `trusted_proxies` is empty): `x-forwarded-proto`
-/// is set from the connection, `x-forwarded-for` gets the peer appended,
-/// `x-real-ip` is overwritten with the peer, and client `forwarded` /
-/// `x-forwarded-host` are stripped.
+/// is set from the connection,
+/// `x-forwarded-for` gets the peer appended, `x-real-ip` is overwritten with
+/// the peer, and client `forwarded`, `x-forwarded-host`, `-ssl`, `-scheme`,
+/// `-prefix` and `-port` are stripped. `x-forwarded-port` is never synthesised.
 ///
-/// Trusted peer: incoming `x-forwarded-proto` (rightmost value), `x-forwarded-host`
-/// and `forwarded` are kept; missing `x-forwarded-proto` comes from the
-/// connection. `x-real-ip` is always overwritten with the rightmost
-/// `x-forwarded-for` entry that is not a trusted proxy (`:port` suffixes
-/// tolerated; an unparsable entry stops the walk), else the peer.
-/// `x-forwarded-for` always gets the peer appended.
+/// Trusted peer: incoming `x-forwarded-proto` / `x-forwarded-port`
+/// (rightmost value, port must be valid), `x-forwarded-host`, `-ssl`,
+/// `-scheme`, `-prefix` and `forwarded` are kept; a missing or invalid proto
+/// comes from the connection, a missing or invalid port is dropped. `x-real-ip` is always
+/// overwritten with the rightmost `x-forwarded-for` entry that is not a
+/// trusted proxy (`:port` suffixes tolerated; an unparsable entry stops the
+/// walk), else the peer. `x-forwarded-for` gets the peer appended
+/// (`xff = "append"`) or is set to that client address (`"replace"`).
+///
+/// With `forwarded_header`, a `for=<peer>;proto=;host=` element is appended
+/// to `forwarded` (fresh for untrusted peers, whose value was stripped).
+/// `proto=` is this hop's connection scheme;
+/// `host=` is the client's effective host (URI authority, else `Host`).
 fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     peer: IpAddr,
     proto: &'static str,
-    trusted: &TrustedProxies,
+    client_host: Option<&str>,
+    cfg: &FwdCfg<'_>,
 ) {
     strip_noncanonical_spellings(headers);
+    let trusted = cfg.trusted;
     let xfp = HeaderName::from_static("x-forwarded-proto");
+    let xport = HeaderName::from_static("x-forwarded-port");
     let peer_trusted = trusted.contains(peer);
-    if peer_trusted {
+    let client = if peer_trusted {
         // Rightmost non-empty value across all lines (the hop closest to us
         // wrote it); anything that isn't a scheme token falls back to the
         // connection's proto.
-        let scheme = headers
-            .get_all(&xfp)
-            .iter()
-            .flat_map(|v| v.to_str().unwrap_or("!").split(','))
-            .map(str::trim)
-            .rfind(|v| !v.is_empty())
+        let scheme = rightmost(headers, &xfp)
             .filter(|v| {
                 v.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
             })
             .and_then(|v| HeaderValue::from_str(v).ok());
         headers.insert(&xfp, scheme.unwrap_or(HeaderValue::from_static(proto)));
+        let port = rightmost(headers, &xport).and_then(|v| {
+            v.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0 && v.bytes().all(|b| b.is_ascii_digit()))
+        });
+        set_port(headers, &xport, port);
         // Always derived, never taken from the client: cloud LBs pass a
         // client's X-Real-IP through untouched.
         // A header line that isn't visible ASCII counts as one garbage entry.
@@ -650,20 +1050,74 @@ fn apply_forwarded_headers(
                 Err(_) => vec![None],
             })
             .collect();
-        let client = entries
+        entries
             .into_iter()
             .rev()
             .find(|e| !matches!(e, Some(ip) if trusted.contains(*ip)))
             .flatten()
-            .unwrap_or(peer);
-        set_real_ip(headers, client);
+            .unwrap_or(peer)
     } else {
         headers.insert(&xfp, HeaderValue::from_static(proto));
-        headers.remove(header::FORWARDED);
-        headers.remove("x-forwarded-host");
-        set_real_ip(headers, peer);
+        for h in UNTRUSTED_STRIPPED {
+            headers.remove(h);
+        }
+        headers.remove(&xport);
+        peer
+    };
+    set_real_ip(headers, client);
+    match cfg.xff {
+        XffMode::Replace => {
+            if let Ok(v) = HeaderValue::from_str(&client.to_canonical().to_string()) {
+                headers.insert("x-forwarded-for", v);
+            }
+        }
+        _ => append_forwarded_for(headers, peer),
     }
-    append_forwarded_for(headers, peer);
+    if cfg.forwarded_header {
+        append_forwarded(headers, peer, proto, client_host);
+    }
+}
+
+fn set_port(headers: &mut HeaderMap, name: &HeaderName, port: Option<u16>) {
+    match port {
+        Some(p) => {
+            headers.insert(name, HeaderValue::from(p));
+        }
+        None => {
+            headers.remove(name);
+        }
+    }
+}
+
+/// Append `for=<peer>;proto=<proto>;host=<Host>` to the `forwarded` list.
+fn append_forwarded(headers: &mut HeaderMap, peer: IpAddr, proto: &str, host: Option<&str>) {
+    let mut el = format!("for={};proto={proto}", forwarded_node(peer));
+    // `host` is a token only without ':' etc.; quote anything else.
+    if let Some(h) = host {
+        if h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        {
+            el.push_str(&format!(";host={h}"));
+        } else {
+            el.push_str(&format!(
+                ";host=\"{}\"",
+                h.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+        }
+    }
+    let existing: Vec<&str> = headers
+        .get_all(header::FORWARDED)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let value = if existing.is_empty() {
+        el
+    } else {
+        format!("{}, {el}", existing.join(", "))
+    };
+    if let Ok(v) = HeaderValue::from_str(&value) {
+        headers.insert(header::FORWARDED, v);
+    }
 }
 
 /// Overwrite `x-real-ip` (all instances) with `ip`, v4-mapped shown as v4.
@@ -698,7 +1152,32 @@ fn append_forwarded_for(headers: &mut HeaderMap, ip: IpAddr) {
     }
 }
 
-fn record(started: Instant, route: &str, upstream: &str, status: u16) {
+fn record(cx: &Cx, route: &str, upstream: &str, status: u16) {
+    record_len(cx, route, upstream, status, None);
+}
+
+/// Metrics plus the access log line. `bytes_out` is the response
+/// `Content-Length` when known (streamed bodies are not counted).
+fn record_len(cx: &Cx, route: &str, upstream: &str, status: u16, bytes_out: Option<u64>) {
+    let started = cx.started;
+    if let Some(a) = &cx.log {
+        tracing::info!(
+            target: "ferryman::access",
+            method = %a.method,
+            host = %a.host,
+            path = %a.path,
+            route,
+            upstream,
+            status,
+            bytes_out,
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            request_id = a.request_id.as_deref(),
+            peer = %a.peer,
+            scheme = a.proto,
+            version = ?a.version,
+            "request"
+        );
+    }
     metrics::counter!(
         "ferryman_requests_total",
         "route" => route.to_string(),
@@ -712,58 +1191,6 @@ fn record(started: Instant, route: &str, upstream: &str, status: u16) {
         "upstream" => upstream.to_string(),
     )
     .record(started.elapsed().as_secs_f64());
-}
-
-/// True if `path` could be read as a dot segment by a normalising
-/// upstream. `/`, `\`, `%2f` and `%5c` all count as separators, a `;param`
-/// suffix is ignored per piece (Tomcat), and a piece that is `.` or `..`
-/// (also `%2e`-encoded, any case) is rejected. Encoded separators inside an
-/// otherwise ordinary segment (`group%2Fproject`) are allowed. Also rejected:
-/// `%00`, `%u`/`%U` (non-standard) and double-encoded dot/slash (`%252e`,
-/// `%252f`, `%255c`). Detection only; the forwarded path is never rewritten.
-/// Not covered: overlong UTF-8 (`%c0%ae`) and Windows trailing-dot/space
-/// trimming.
-fn bad_path(path: &str) -> bool {
-    let b = path.as_bytes();
-    let (mut start, mut i) = (0, 0);
-    while i <= b.len() {
-        let sep = match b[i..] {
-            [] => Some(0),
-            [b'/' | b'\\', ..] => Some(1),
-            [b'%', b'2', b'f' | b'F', ..] | [b'%', b'5', b'c' | b'C', ..] => Some(3),
-            [b'%', b'0', b'0', ..] | [b'%', b'u' | b'U', ..] => return true,
-            [b'%', b'2', b'5', b'2', b'e' | b'E' | b'f' | b'F', ..]
-            | [b'%', b'2', b'5', b'5', b'c' | b'C', ..] => return true,
-            _ => None,
-        };
-        match sep {
-            Some(n) => {
-                if dot_piece(&b[start..i]) {
-                    return true;
-                }
-                i += n.max(1);
-                start = i;
-            }
-            None => i += 1,
-        }
-    }
-    false
-}
-
-/// `.` or `..` after dropping a `;...` suffix and decoding `%2e`.
-fn dot_piece(piece: &[u8]) -> bool {
-    let end = piece.iter().position(|&c| c == b';').unwrap_or(piece.len());
-    let b = &piece[..end];
-    let (mut i, mut dots) = (0, 0);
-    while i < b.len() {
-        match b[i..] {
-            [b'.', ..] => i += 1,
-            [b'%', b'2', b'e' | b'E', ..] => i += 3,
-            _ => return false,
-        }
-        dots += 1;
-    }
-    matches!(dots, 1 | 2)
 }
 
 fn error_response(status: StatusCode, body: impl Into<Bytes>) -> Response<ResponseBody> {
@@ -784,67 +1211,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dot_segments_are_rejected() {
-        for p in [
-            "/api/../admin",
-            "/api/%2e%2e/admin",
-            "/api/..%2fadmin",
-            "/api/./../admin",
-            "/api/..",
-            "/api/%2E%2E/x",
-            "/api/%2e%2E/x",
-            "/api/.%2e/x",
-            "/api/..;/admin",
-            "/api/.;x/y",
-            "/api/%2e%2e;/x",
-            "/api/..%5cx",
-            "/api/..%5Cx",
-            "/api/a\\..\\b",
-            "/api/%2e/x",
-            "/..",
-            "/api/a%2f..",
-            "/api/%2e%2e%2f",
-            "/api/..%00",
-            "/api/.%00.",
-            "/api/%u002e%u002e",
-            "/api/%U002e",
-            "/api/%252e%252e",
-            "/api/%252E",
-            "/api/%252f",
-            "/api/%252F",
-            "/api/%255c",
-            "/api/a%00b",
-            "/api/a%5c..",
-            "/api/a%5C..%5Cb",
+    fn host_validation() {
+        let h = |vals: &[&[u8]]| {
+            let mut m = HeaderMap::new();
+            for v in vals {
+                m.append("host", HeaderValue::from_bytes(v).unwrap());
+            }
+            m
+        };
+        use http::Version as V;
+        let root: http::Uri = "/".parse().unwrap();
+        for bad in [
+            &b"a, b"[..],
+            b"u@x",
+            b"x/y",
+            b"",
+            b"a\xe9.example",
+            b"a:b",
+            b"x:99999",
+            b"x:",
+            b"[::1]:",
+            b"[::1]:x",
+            b"x:+80",
+            b"*",
         ] {
-            assert!(bad_path(p), "{p}");
+            assert!(bad_host(&h(&[bad]), &root, V::HTTP_11), "{bad:?}");
         }
+        assert!(bad_host(&h(&[b"a", b"b"]), &root, V::HTTP_11));
+        for ok in [
+            "a.example",
+            "a.example:8443",
+            "a:65535",
+            "[::1]",
+            "[::1]:80",
+            "[::1]:8443",
+            "LOCALHOST",
+        ] {
+            assert!(!bad_host(&h(&[ok.as_bytes()]), &root, V::HTTP_11), "{ok}");
+        }
+        // No Host: 1.1 is bad, 1.0 allowed.
+        assert!(bad_host(&HeaderMap::new(), &root, V::HTTP_11));
+        assert!(!bad_host(&HeaderMap::new(), &root, V::HTTP_10));
+        let abs: http::Uri = "http://a.example/".parse().unwrap();
+        assert!(!bad_host(&HeaderMap::new(), &abs, V::HTTP_11));
+        assert!(!bad_host(&h(&[b"u@x"]), &abs, V::HTTP_11));
+        assert!(bad_host(&h(&[b"a", b"b"]), &abs, V::HTTP_11));
     }
 
     #[test]
-    fn legitimate_paths_are_allowed() {
-        for p in [
-            "/a..b/",
-            "/.well-known/acme",
-            "/file.tar.gz",
-            "/api/v1.2/x",
-            "/",
-            "/api/...",
-            "/api/a;..",
-            "/api/%2e%2e%2e/x",
-            "/api/%41/x",
-            "/api/.a/x",
-            "/api/a%2/",
-            "/api/v4/projects/group%2Fproject",
-            "/api/queues/%2F/q",
-            "/@scope%2fpkg",
-            "/%2F",
-            "/api/%25",
-            "/api/100%25",
-            "/api/%c0%ae",
-        ] {
-            assert!(!bad_path(p), "{p}");
-        }
+    fn connection_cannot_delete_host() {
+        let mut m = HeaderMap::new();
+        m.insert("host", HeaderValue::from_static("a.example"));
+        m.insert("connection", HeaderValue::from_static("Host, x-other"));
+        m.insert("x-other", HeaderValue::from_static("1"));
+        strip_hop_by_hop(&mut m);
+        assert!(m.get("host").is_some() && m.get("x-other").is_none());
+        // Same on a response strip.
+        let mut r = HeaderMap::new();
+        r.insert("host", HeaderValue::from_static("upstream"));
+        r.insert("connection", HeaderValue::from_static("host"));
+        strip_hop_by_hop(&mut r);
+        assert!(r.get("host").is_some() && r.get("connection").is_none());
     }
 
     fn tp(c: &[&str]) -> TrustedProxies {
@@ -859,7 +1286,50 @@ mod tests {
                 v.parse().unwrap(),
             );
         }
-        apply_forwarded_headers(&mut m, peer.parse().unwrap(), proto, &tp(trusted));
+        apply_forwarded_headers(
+            &mut m,
+            peer.parse().unwrap(),
+            proto,
+            None,
+            &cfg(&tp(trusted), false, XffMode::Append),
+        );
+        m
+    }
+
+    fn cfg(t: &TrustedProxies, forwarded_header: bool, xff: XffMode) -> FwdCfg<'_> {
+        FwdCfg {
+            trusted: t,
+            forwarded_header,
+            xff,
+        }
+    }
+
+    fn host_of<'a>(h: &[(&str, &'a str)]) -> Option<&'a str> {
+        h.iter().find(|(k, _)| *k == "host").map(|(_, v)| *v)
+    }
+
+    fn run_with(
+        trusted: &[&str],
+        peer: &str,
+        fh: bool,
+        xff: XffMode,
+        h: &[(&str, &str)],
+    ) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in h {
+            m.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        let t = tp(trusted);
+        apply_forwarded_headers(
+            &mut m,
+            peer.parse().unwrap(),
+            "http",
+            host_of(h),
+            &cfg(&t, fh, xff),
+        );
         m
     }
 
@@ -873,45 +1343,6 @@ mod tests {
         ("x-forwarded-host", "evil.example"),
         ("x-forwarded-proto", "https"),
     ];
-
-    #[test]
-    fn noncanonical_spellings_are_stripped_for_every_peer() {
-        let h = [
-            ("x_real_ip", "6.6.6.6"),
-            ("X_Forwarded_For", "6.6.6.6"),
-            ("x.forwarded.for", "6.6.6.6"),
-            ("x_forwarded-host", "evil.example"),
-            ("x_forwarded_proto", "https"),
-            ("x_forwarded_proto", "http"),
-            ("x__forwarded_for", "6.6.6.6"),
-            ("-x-real-ip", "6.6.6.6"),
-            ("x-forwarded-for--", "6.6.6.6"),
-            ("x--forwarded--for-", "6.6.6.6"),
-            ("-forwarded", "for=6.6.6.6"),
-            ("x--custom", "keep"),
-            ("x_custom", "keep"),
-            ("x.custom", "keep"),
-        ];
-        for trusted in [&[][..], &["10.0.0.0/8"][..]] {
-            let m = run(trusted, "10.1.2.3", "http", &h);
-            for k in [
-                "x_real_ip",
-                "x_forwarded_for",
-                "x.forwarded.for",
-                "x_forwarded-host",
-                "x_forwarded_proto",
-                "x__forwarded_for",
-                "-x-real-ip",
-                "x--forwarded--for-",
-                "-forwarded",
-            ] {
-                assert!(m.get(k).is_none(), "{k} kept (trusted={trusted:?})");
-            }
-            assert_eq!(get(&m, "x_custom"), Some("keep"));
-            assert_eq!(get(&m, "x--custom"), Some("keep"));
-            assert_eq!(get(&m, "x.custom"), Some("keep"));
-        }
-    }
 
     #[test]
     fn empty_list_is_untrusted_for_everyone() {
@@ -1025,7 +1456,8 @@ mod tests {
             &mut m,
             "10.1.2.3".parse().unwrap(),
             "http",
-            &tp(&["10.0.0.0/8"]),
+            None,
+            &cfg(&tp(&["10.0.0.0/8"]), false, XffMode::Append),
         );
         assert_eq!(get(&m, "x-real-ip"), Some("10.1.2.3"));
         // a bad line left of a good untrusted entry is never reached
@@ -1036,7 +1468,8 @@ mod tests {
             &mut m,
             "10.1.2.3".parse().unwrap(),
             "http",
-            &tp(&["10.0.0.0/8"]),
+            None,
+            &cfg(&tp(&["10.0.0.0/8"]), false, XffMode::Append),
         );
         assert_eq!(get(&m, "x-real-ip"), Some("5.5.5.5"));
     }
@@ -1095,5 +1528,219 @@ mod tests {
             &[("x-forwarded-for", "garbage, 5.5.5.5")],
         );
         assert_eq!(get(&m, "x-real-ip"), Some("5.5.5.5"));
+    }
+
+    const HOP: [(&str, &str); 4] = [
+        ("x-forwarded-ssl", "on"),
+        ("x-forwarded-scheme", "https"),
+        ("x-forwarded-prefix", "/evil"),
+        ("x-forwarded-port", "4443"),
+    ];
+
+    #[test]
+    fn untrusted_strips_ssl_scheme_prefix_port_all_instances() {
+        let mut h = HOP.to_vec();
+        h.push(("x-forwarded-prefix", "/evil2"));
+        h.push(("x-forwarded-port", "1"));
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
+        for k in [
+            "x-forwarded-ssl",
+            "x-forwarded-scheme",
+            "x-forwarded-prefix",
+        ] {
+            assert_eq!(m.get_all(k).iter().count(), 0, "{k}");
+        }
+        assert_eq!(m.get_all("x-forwarded-port").iter().count(), 0);
+    }
+
+    #[test]
+    fn trusted_keeps_ssl_scheme_prefix_and_valid_port() {
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Append, &HOP);
+        assert_eq!(get(&m, "x-forwarded-ssl"), Some("on"));
+        assert_eq!(get(&m, "x-forwarded-scheme"), Some("https"));
+        assert_eq!(get(&m, "x-forwarded-prefix"), Some("/evil"));
+        assert_eq!(get(&m, "x-forwarded-port"), Some("4443"));
+        let h = [
+            ("x-forwarded-port", "80"),
+            ("x-forwarded-port", "443, 8443"),
+        ];
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Append, &h);
+        assert_eq!(get(&m, "x-forwarded-port"), Some("8443"));
+        for bad in ["abc", "0", "70000", "-1", "+80", " "] {
+            let h = [("x-forwarded-port", bad)];
+            let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Append, &h);
+            assert_eq!(get(&m, "x-forwarded-port"), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn xff_replace_sets_client_only() {
+        let h = [("x-forwarded-for", "6.6.6.6, 5.5.5.5")];
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Replace, &h);
+        assert_eq!(get(&m, "x-forwarded-for"), Some("1.2.3.4"));
+        assert_eq!(m.get_all("x-forwarded-for").iter().count(), 1);
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", false, XffMode::Replace, &h);
+        assert_eq!(get(&m, "x-forwarded-for"), Some("5.5.5.5"));
+        assert_eq!(get(&m, "x-real-ip"), Some("5.5.5.5"));
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
+        assert_eq!(
+            get(&m, "x-forwarded-for"),
+            Some("6.6.6.6, 5.5.5.5, 1.2.3.4")
+        );
+    }
+
+    #[test]
+    fn forwarded_header_output() {
+        let host = [("host", "app.example")];
+        let m = run_with(&[], "1.2.3.4", true, XffMode::Append, &host);
+        assert_eq!(
+            get(&m, "forwarded"),
+            Some("for=1.2.3.4;proto=http;host=app.example")
+        );
+        // untrusted: client Forwarded is stripped, element is fresh
+        let h = [("host", "app.example:8080"), ("forwarded", "for=6.6.6.6")];
+        let m = run_with(&[], "1.2.3.4", true, XffMode::Append, &h);
+        assert_eq!(
+            get(&m, "forwarded"),
+            Some("for=1.2.3.4;proto=http;host=\"app.example:8080\"")
+        );
+        // trusted: appended to the list; proto= is this hop's connection scheme
+        let h = [("forwarded", "for=6.6.6.6"), ("x-forwarded-proto", "https")];
+        let m = run_with(&["10.0.0.0/8"], "10.1.2.3", true, XffMode::Append, &h);
+        assert_eq!(
+            get(&m, "forwarded"),
+            Some("for=6.6.6.6, for=10.1.2.3;proto=http")
+        );
+        // IPv6 quoted + bracketed (RFC 7239 section 6); v4-mapped shown as v4
+        let m = run_with(&[], "2001:db8::1", true, XffMode::Append, &[]);
+        assert_eq!(
+            get(&m, "forwarded"),
+            Some("for=\"[2001:db8::1]\";proto=http")
+        );
+        let m = run_with(&[], "::ffff:1.2.3.4", true, XffMode::Append, &[]);
+        assert_eq!(get(&m, "forwarded"), Some("for=1.2.3.4;proto=http"));
+        // off by default: untrusted Forwarded just stripped
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
+        assert_eq!(get(&m, "forwarded"), None);
+    }
+
+    #[test]
+    fn noncanonical_spellings_are_stripped_for_every_peer() {
+        let h = [
+            ("x_real_ip", "6.6.6.6"),
+            ("x_forwarded_prefix", "/evil"),
+            ("X_Forwarded_For", "6.6.6.6"),
+            ("forwarded", "for=1.1.1.1"),
+            ("x_custom", "keep"),
+            ("x.forwarded.for", "6.6.6.6"),
+            ("X.Real.IP", "6.6.6.6"),
+            ("x-forwarded.proto", "https"),
+            ("x__forwarded_for", "6.6.6.6"),
+            ("x-.forwarded.for", "6.6.6.6"),
+            ("-x-real-ip", "6.6.6.6"),
+            ("x-forwarded-for--", "6.6.6.6"),
+            ("x--forwarded--for-", "6.6.6.6"),
+            ("-forwarded", "for=6.6.6.6"),
+            ("x--custom", "keep"),
+            ("x.custom", "keep"),
+            ("x_forwarded-host", "evil.example"),
+            ("x_forwarded_proto", "https"),
+        ];
+        for trusted in [&[][..], &["10.0.0.0/8"][..]] {
+            let m = run_with(trusted, "10.1.2.3", false, XffMode::Append, &h);
+            for k in ["x_real_ip", "x_forwarded_prefix", "x_forwarded_for"] {
+                assert_eq!(get(&m, k), None, "{k}");
+            }
+            for k in [
+                "x.forwarded.for",
+                "x.real.ip",
+                "x-forwarded.proto",
+                "x_forwarded-host",
+                "x_forwarded_proto",
+            ] {
+                assert_eq!(get(&m, k), None, "{k}");
+            }
+            for k in [
+                "x__forwarded_for",
+                "x-.forwarded.for",
+                "-x-real-ip",
+                "x-forwarded-for--",
+                "x--forwarded--for-",
+                "-forwarded",
+            ] {
+                assert_eq!(get(&m, k), None, "{k}");
+            }
+            assert_eq!(get(&m, "x.custom"), Some("keep"));
+            assert_eq!(get(&m, "x_custom"), Some("keep"));
+            assert_eq!(get(&m, "x--custom"), Some("keep"));
+            assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
+        }
+    }
+
+    #[test]
+    fn forwarded_host_is_the_clients_even_when_rewritten_elsewhere() {
+        // host= comes from the caller-supplied client host, not the headers.
+        let mut m = HeaderMap::new();
+        m.insert("host", "upstream.internal:9".parse().unwrap());
+        let t = tp(&[]);
+        apply_forwarded_headers(
+            &mut m,
+            "1.2.3.4".parse().unwrap(),
+            "http",
+            Some("client.example"),
+            &cfg(&t, true, XffMode::Append),
+        );
+        assert_eq!(
+            get(&m, "forwarded"),
+            Some("for=1.2.3.4;proto=http;host=client.example")
+        );
+    }
+
+    #[test]
+    fn connection_header_cannot_strip_host_or_request_id() {
+        let mut h = HeaderMap::new();
+        h.insert("connection", "x-request-id, host, x-other".parse().unwrap());
+        h.insert("host", "a".parse().unwrap());
+        h.insert("x-request-id", "abc".parse().unwrap());
+        h.insert("x-other", "1".parse().unwrap());
+        strip_hop_by_hop(&mut h);
+        assert!(h.contains_key("host") && h.contains_key("x-request-id"));
+        assert!(!h.contains_key("x-other") && !h.contains_key("connection"));
+    }
+
+    #[test]
+    fn forwarded_port_never_derived_from_host() {
+        let h = [("host", "x:443")];
+        let m = run_with(&[], "1.2.3.4", false, XffMode::Append, &h);
+        assert_eq!(get(&m, "x-forwarded-port"), None);
+    }
+
+    #[test]
+    fn private_peer_detection() {
+        for ip in [
+            "10.1.1.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.1.1",
+            "::1",
+            "fd00::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(is_private_peer(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2001:db8::1",
+            "fec0::1",
+        ] {
+            assert!(!is_private_peer(ip.parse().unwrap()), "{ip}");
+        }
     }
 }

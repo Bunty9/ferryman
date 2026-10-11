@@ -45,6 +45,10 @@ jobs:
       # nextest does not run doctests.
       - name: cargo test --doc
         run: cargo test --doc --workspace --locked
+      - name: library without default features
+        run: |
+          cargo check -p ferryman --no-default-features --locked
+          cargo test -p ferryman --no-default-features --lib --locked
       - name: example crates are not publishable
         run: |
           cargo metadata --no-deps --format-version 1 \
@@ -144,6 +148,29 @@ jobs:
           persist-credentials: false
       - name: Run full-stack example demo
         run: bash examples/full-stack/demo.sh --ci
+
+  # Blocking on PRs and main: the Kubernetes recipe must stay admissible under
+  # the Restricted Pod Security Standard and reload its ConfigMap without a
+  # restart (kubelet sync, up to ~90 s).
+  kind:
+    name: kubernetes recipe (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          kubectl_version: v1.37.1
+          cluster_name: ferryman
+      - name: Build image and load it into kind
+        run: |
+          docker build -t ferryman:ci .
+          kind load docker-image ferryman:ci --name ferryman
+      - name: Deploy under the Restricted Pod Security Standard
+        run: bash deploy/k8s/test/kind-test.sh
 
   # The release binaries also ship for Windows and macOS; build them on
   # every PR so platform breakage shows up before a tag does.

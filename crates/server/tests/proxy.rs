@@ -1,7 +1,7 @@
 //! Integration tests for the proxy: real sockets, tiny hyper upstream
 //! stubs, and `ferryman::serve` driven end to end.
 
-use ferryman_core::{build_table, load_config, ConfigToml, SharedTable};
+use ferryman_core::{build_table, ConfigToml, SharedTable};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -159,6 +159,35 @@ async fn path_and_query_reach_upstream_intact() {
 }
 
 #[tokio::test]
+async fn routes_on_normalised_path_but_forwards_raw() {
+    let api =
+        spawn_stub(|req: Request<Incoming>| async move { ok(format!("api {}", req.uri())) }).await;
+    let root =
+        spawn_stub(|req: Request<Incoming>| async move { ok(format!("root {}", req.uri())) }).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{api}\"\n\
+         [[routes]]\nprefix = \"/\"\nupstream = \"http://{root}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let client = reqwest::Client::new();
+    for (path, want) in [
+        ("/%61pi/x", "api /%61pi/x"),
+        ("//api/x", "api //api/x"),
+        ("/API/x", "root /API/x"),
+    ] {
+        let body = client
+            .get(format!("http://{proxy}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, want);
+    }
+}
+
+#[tokio::test]
 async fn no_route_is_404() {
     let table = shared_table(parse_cfg(
         "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://127.0.0.1:1\"\n",
@@ -258,6 +287,16 @@ async fn forged_headers_echo(extra_cfg: &str) -> String {
         .header("x-forwarded-proto", "https")
         .header("X-Forwarded-Proto", "https")
         .header("x-forwarded-for", "6.6.6.6")
+        .header("x-forwarded-ssl", "on")
+        .header("X-Forwarded-Scheme", "https")
+        .header("x-forwarded-prefix", "/evil")
+        .header("X-Forwarded-Prefix", "/evil2")
+        .header("x-forwarded-port", "4443")
+        .header("X_Real_IP", "8.8.8.8")
+        .header("X_Forwarded_Prefix", "/evil3")
+        .header("X_Forwarded_Host", "evil3.example")
+        .header("x.forwarded.for", "9.9.9.9")
+        .header("X.Real.IP", "9.9.9.9")
         .send()
         .await
         .unwrap()
@@ -282,6 +321,19 @@ async fn untrusted_peer_cannot_forge_forwarded_headers() {
         assert!(!body.contains("x-forwarded-host"), "{body}");
         assert!(!body.contains("evil.example"), "{body}");
         assert!(body.contains("x-forwarded-proto: http\n"), "{body}");
+        for h in ["ssl", "scheme", "prefix"] {
+            assert!(!body.contains(&format!("x-forwarded-{h}")), "{h}: {body}");
+        }
+        assert!(!body.contains("evil"), "{body}");
+        assert!(!body.to_lowercase().contains("x_"), "{body}");
+        assert!(!body.contains("8.8.8.8"), "{body}");
+        assert!(!body.contains("9.9.9.9"), "{body}");
+        assert!(
+            !body.contains("x.real.ip") && !body.contains("x.forwarded"),
+            "{body}"
+        );
+        assert!(!body.contains("4443"), "{body}");
+        assert!(!body.contains("x-forwarded-port"), "{body}");
         // 0.2.2 behaviour: XFF is appended to, not replaced.
         assert!(
             body.contains("x-forwarded-for: 6.6.6.6, 127.0.0.1"),
@@ -295,6 +347,10 @@ async fn trusted_peer_forwarded_headers_are_preserved() {
     let body = forged_headers_echo("trusted_proxies = [\"127.0.0.1/32\"]").await;
     assert!(body.contains("x-forwarded-proto: https\n"), "{body}");
     assert!(body.contains("x-forwarded-host: evil.example"), "{body}");
+    assert!(body.contains("x-forwarded-ssl: on"), "{body}");
+    assert!(body.contains("x-forwarded-scheme: https"), "{body}");
+    assert!(body.contains("x-forwarded-prefix: /evil"), "{body}");
+    assert!(body.contains("x-forwarded-port: 4443"), "{body}");
     // Derived from XFF (rightmost untrusted = 6.6.6.6), never the forged header.
     assert!(body.contains("x-real-ip: 6.6.6.6"), "{body}");
     assert!(!body.contains("x-real-ip: 7.7.7.7"), "{body}");
@@ -307,6 +363,44 @@ async fn trusted_peer_forwarded_headers_are_preserved() {
         body.contains("x-forwarded-for: 6.6.6.6, 127.0.0.1"),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn forwarded_header_is_opt_in() {
+    let body = forged_headers_echo("").await;
+    assert!(!body.contains("\nforwarded:"), "{body}");
+}
+
+#[tokio::test]
+async fn forwarded_port_is_never_synthesised_and_host_is_the_clients() {
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "forwarded_header = true\nxff = \"replace\"\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\nrewrite_host = true\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let body = reqwest::Client::new()
+        .get(format!("http://{proxy}/svc-a/x"))
+        .header("x-forwarded-port", "4443")
+        .header("x-forwarded-for", "6.6.6.6")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let port = proxy.port();
+    assert!(!body.contains("x-forwarded-port"), "{body}");
+    assert!(!body.contains("4443"), "{body}");
+    // host= is the client's host even though Host was rewritten to the upstream's.
+    assert!(
+        body.contains(&format!(
+            "forwarded: for=127.0.0.1;proto=http;host=\"127.0.0.1:{port}\""
+        )),
+        "{body}"
+    );
+    assert!(body.contains(&format!("host: {upstream}\n")), "{body}");
+    assert!(!body.contains("6.6.6.6"), "{body}");
+    assert!(body.contains("x-forwarded-for: 127.0.0.1\n"), "{body}");
 }
 
 #[tokio::test]
@@ -783,6 +877,7 @@ async fn keepalive_timeout_is_configurable() {
     }
 }
 
+#[cfg(feature = "reload")]
 #[tokio::test]
 async fn hot_reload_picks_up_new_routes_via_rename_replace() {
     let upstream_a = spawn_stub(|_req| async { ok("a") }).await;
@@ -802,7 +897,7 @@ async fn hot_reload_picks_up_new_routes_via_rename_replace() {
     let initial = format!("[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream_a}\"\n");
     std::fs::write(&config_path, &initial).unwrap();
 
-    let cfg = load_config(&config_path).unwrap();
+    let cfg = ferryman_core::load_config(&config_path).unwrap();
     let table: SharedTable = Arc::new(arc_swap::ArcSwap::from_pointee(
         build_table(cfg, None).unwrap(),
     ));
@@ -874,6 +969,44 @@ async fn legacy_handle_and_proxy_client_still_work() {
     assert_eq!(resp.text().await.unwrap(), "legacy");
 }
 
+/// The legacy handler has no listener port: an untrusted client's `Host`
+/// port must not turn into `X-Forwarded-Port`.
+#[tokio::test]
+#[allow(deprecated)]
+async fn legacy_handle_never_derives_forwarded_port_from_host() {
+    use hyper_util::rt::TokioExecutor;
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let client: ferryman::ProxyClient =
+        hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let svc = service_fn(move |req| {
+            ferryman::proxy::handle(table.clone(), client.clone(), peer, "http", req)
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), svc)
+            .await;
+    });
+    let body = reqwest::Client::new()
+        .get(format!("http://{addr}/svc-a"))
+        .header("host", "x:443")
+        .header("x-forwarded-port", "4443")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("host: x:443"), "{body}");
+    assert!(!body.contains("x-forwarded-port"), "{body}");
+}
+
 #[tokio::test]
 async fn dot_segments_get_400_and_never_reach_upstream() {
     use std::sync::atomic::AtomicUsize;
@@ -908,6 +1041,8 @@ async fn dot_segments_get_400_and_never_reach_upstream() {
         "/api/a%5c..",
         "/api/..%2f",
         "/api/%252e",
+        "/api/%2%65%2%65/x",
+        "/api/%%32%65%%32%65/x",
         "/api/x?q=/../ok-in-query-only/../",
     ] {
         let out = get(p).await;
@@ -932,4 +1067,483 @@ async fn dot_segments_get_400_and_never_reach_upstream() {
         .await
         .contains("GET /api/group%2Fproject"));
     assert_eq!(hits.load(Ordering::SeqCst), 5);
+}
+
+/// Echo stub that drops connections while `down` (so the breaker can be
+/// tripped), and otherwise reads the whole request body before answering.
+async fn spawn_toggle_echo(down: Arc<AtomicBool>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            if down.load(Ordering::SeqCst) {
+                drop(stream);
+                continue;
+            }
+            tokio::spawn(serve_one(stream, echo));
+        }
+    });
+    addr
+}
+
+/// Open the circuit (threshold 1, cooldown 1 s), bring the upstream back and
+/// wait out the cooldown. Returns the proxy address.
+async fn open_then_cooled_down() -> SocketAddr {
+    let down = Arc::new(AtomicBool::new(true));
+    let addr = spawn_toggle_echo(down.clone()).await;
+    let table = shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\ndefault_cooldown_secs = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{addr}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let url = format!("http://{proxy}/svc-a");
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 502);
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 503);
+    down.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    proxy
+}
+
+/// Take the half-open probe with a partial upload, then hang up.
+async fn abandoned_probe(proxy: SocketAddr) {
+    use tokio::io::AsyncWriteExt;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"POST /svc-a HTTP/1.1\r\nhost: x\r\ncontent-length: 1000\r\n\r\npartial")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(s);
+}
+
+#[tokio::test]
+async fn abandoned_half_open_probe_is_released_immediately() {
+    let proxy = open_then_cooled_down().await;
+    abandoned_probe(proxy).await;
+    // Well inside the 1 s cooldown: the slot is handed back once the proxy
+    // notices the hang-up, so this request becomes the next probe (200
+    // closes the circuit). A 503 doesn't consume the probe; retry briefly.
+    let url = format!("http://{proxy}/svc-a");
+    let mut status = 503;
+    for _ in 0..12 {
+        status = reqwest::get(&url).await.unwrap().status().as_u16();
+        if status != 503 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn repeated_abandoned_probes_rearm_at_most_once_per_cooldown() {
+    let proxy = open_then_cooled_down().await;
+    abandoned_probe(proxy).await; // takes the probe, release re-arms
+                                  // Let the proxy notice the hang-up and release (nothing observable to poll).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    abandoned_probe(proxy).await; // takes it again, release must not re-arm
+    let url = format!("http://{proxy}/svc-a");
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 503);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn rewrite_host_sets_upstream_authority_on_h1_h2_and_absolute_form() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/rw\"\nupstream = \"http://{upstream}\"\nrewrite_host = true\n\n\
+         [[routes]]\nprefix = \"/keep\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let want = format!("host: {upstream}");
+
+    let h1 = reqwest::Client::new();
+    let body = h1
+        .get(format!("http://{proxy}/rw/x"))
+        .header("host", "client.example")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(&want), "{body}");
+    let body = h1
+        .get(format!("http://{proxy}/keep/x"))
+        .header("host", "client.example")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("host: client.example"), "{body}");
+
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let body = h2
+        .get(format!("http://{proxy}/rw/x"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(&want), "{body}");
+    assert!(!body.contains(&format!("host: {proxy}")), "{body}");
+    let body = h2
+        .get(format!("http://{proxy}/keep/x"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(&format!("host: {proxy}")), "{body}");
+
+    for (path, host) in [("rw", want.as_str()), ("keep", "host: a.example")] {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let req = format!(
+            "GET http://a.example/{path}/x HTTP/1.1\r\nhost: b.example\r\nconnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains(host), "{path}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_route_paths_get_400_and_never_reach_upstream() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |req| {
+        h.fetch_add(1, Ordering::SeqCst);
+        echo(req)
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\n\n\
+         [[routes]]\nprefix = \"/\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let get = |path: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    };
+    for p in [
+        "/api%2Fsecret",
+        "/api%2fsecret",
+        "/api%5Csecret",
+        "/api\\secret",
+        "/api;x/secret",
+        "/;%2Fx/api/y",
+        "/api%25%32%46secret",
+    ] {
+        let out = get(p).await;
+        assert!(out.starts_with("HTTP/1.1 400"), "{p}: {out}");
+        assert!(out.ends_with("bad path\n"), "{p}: {out}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    for p in ["/api/v4/projects/group%2Fproject", "/files/a%2Fb"] {
+        let out = get(p).await;
+        assert!(out.starts_with("HTTP/1.1 200"), "{p}: {out}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn local_health_path_is_answered_without_touching_upstream() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |_| {
+        let h = h.clone();
+        async move {
+            h.fetch_add(1, Ordering::SeqCst);
+            ok("up")
+        }
+    })
+    .await;
+    // "/" is a catch-all route; /up is shadowed by local_health_path.
+    let cfg = parse_cfg(&format!(
+        "local_health_path = \"/up\"\n[[routes]]\nprefix = \"/\"\nupstream = \"http://{upstream}\"\n"
+    ));
+    let proxy = start_proxy(shared_table(cfg)).await;
+    let c = reqwest::Client::new();
+
+    let r = c.get(format!("http://{proxy}/up")).send().await.unwrap();
+    assert_eq!(
+        (r.status().as_u16(), r.text().await.unwrap()),
+        (200, "ok".into())
+    );
+    let r = c
+        .head(format!("http://{proxy}/up?x=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    // Only exact path + GET/HEAD: everything else still routes upstream.
+    let r = c.post(format!("http://{proxy}/up")).send().await.unwrap();
+    assert_eq!(r.text().await.unwrap(), "up");
+    let r = c
+        .get(format!("http://{proxy}/up/more"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.text().await.unwrap(), "up");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+/// Malformed or repeated `Host` is a 400 before routing and never reaches the
+/// upstream; good ones pass; `Connection: host` cannot delete Host.
+#[tokio::test]
+async fn bad_host_headers_get_400_and_never_reach_upstream() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |req| {
+        h.fetch_add(1, Ordering::SeqCst);
+        echo(req)
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let get = |hosts: Vec<&'static [u8]>, extra: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut req = b"GET /api/x HTTP/1.1\r\n".to_vec();
+        for v in hosts {
+            req.extend_from_slice(b"host: ");
+            req.extend_from_slice(v);
+            req.extend_from_slice(b"\r\n");
+        }
+        req.extend_from_slice(format!("{extra}connection: close\r\n\r\n").as_bytes());
+        s.write_all(&req).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let bad: [Vec<&[u8]>; 8] = [
+        vec![b"a:b"],
+        vec![b"x:99999"],
+        vec![b"*"],
+        vec![b"a.example, b.example"],
+        vec![b"u@x"],
+        vec![b"x/y"],
+        vec![b"a\xe9.example"],
+        vec![b"a.example", b"b.example"],
+    ];
+    for hosts in bad {
+        let out = get(hosts.clone(), "").await;
+        assert!(out.starts_with("HTTP/1.1 400"), "{hosts:?}: {out}");
+        assert!(out.ends_with("bad host\n"), "{hosts:?}: {out}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let out = get(vec![b"example.com:8080"], "connection: host\r\n").await;
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.contains("host: example.com:8080"), "{out}");
+
+    // Missing Host: HTTP/1.1 is 400, HTTP/1.0 is forwarded.
+    let raw = |req: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    };
+    let before = hits.load(Ordering::SeqCst);
+    let out = raw("GET /api/x HTTP/1.1\r\nconnection: close\r\n\r\n").await;
+    assert!(
+        out.starts_with("HTTP/1.1 400") && out.ends_with("bad host\n"),
+        "{out}"
+    );
+    let out = raw("GET /api/x HTTP/1.0\r\n\r\n").await;
+    assert!(out.contains(" 200"), "{out}");
+    // Absolute form: authority wins over a bad Host, but duplicates are 400.
+    let out =
+        raw("GET http://a.example/api/x HTTP/1.1\r\nhost: u@x\r\nconnection: close\r\n\r\n").await;
+    assert!(
+        out.contains(" 200") && out.contains("host: a.example"),
+        "{out}"
+    );
+    let out = raw(
+        "GET http://a.example/api/x HTTP/1.1\r\nhost: a\r\nhost: b\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    assert_eq!(hits.load(Ordering::SeqCst), before + 2);
+}
+
+async fn strip_get(cfg_extra: &str, path: &str, hdrs: &[(&str, &str)]) -> String {
+    let upstream = spawn_stub(echo).await;
+    let table = shared_table(parse_cfg(&format!(
+        "{cfg_extra}\n[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\nstrip_prefix = true\n\n\
+         [[routes]]\nprefix = \"/keep\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut rb = reqwest::Client::new().get(format!("http://{proxy}{path}"));
+    for (k, v) in hdrs {
+        rb = rb.header(*k, *v);
+    }
+    rb.send().await.unwrap().text().await.unwrap()
+}
+
+#[tokio::test]
+async fn strip_prefix_forwards_remainder_and_sets_forwarded_prefix() {
+    let body = strip_get("", "/api/users?x=1&y=%2F", &[]).await;
+    assert!(body.starts_with("GET /users?x=1&y=%2F\n"), "{body}");
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    let body = strip_get("", "/api", &[]).await;
+    assert!(body.starts_with("GET /\n"), "{body}");
+    // Matched through normalisation: the normalised remainder is forwarded.
+    let body = strip_get("", "/%61pi/users", &[]).await;
+    assert!(body.starts_with("GET /users\n"), "{body}");
+    // strip_prefix = false: path untouched, no header.
+    let body = strip_get("", "/keep/users", &[]).await;
+    assert!(body.starts_with("GET /keep/users\n"), "{body}");
+    assert!(!body.contains("x-forwarded-prefix"), "{body}");
+}
+
+#[tokio::test]
+async fn strip_prefix_replaces_forged_prefix_from_untrusted_peer() {
+    let body = strip_get("", "/api/u", &[("x-forwarded-prefix", "/evil")]).await;
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    assert_eq!(body.matches("x-forwarded-prefix").count(), 1, "{body}");
+    assert!(!body.contains("evil"), "{body}");
+}
+
+#[tokio::test]
+async fn strip_prefix_prepends_trusted_prefix() {
+    let trusted = "trusted_proxies = [\"127.0.0.1/32\"]";
+    let body = strip_get(trusted, "/api/u", &[("x-forwarded-prefix", "/outer/")]).await;
+    assert!(body.contains("x-forwarded-prefix: /outer/api\n"), "{body}");
+    // Not a plain path: replaced.
+    let body = strip_get(trusted, "/api/u", &[("x-forwarded-prefix", "/a, /b")]).await;
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    let body = strip_get(trusted, "/api/u", &[("x-forwarded-prefix", "/../x")]).await;
+    assert!(body.contains("x-forwarded-prefix: /api\n"), "{body}");
+    // Route without strip_prefix leaves a trusted value alone.
+    let body = strip_get(trusted, "/keep/u", &[("x-forwarded-prefix", "/outer")]).await;
+    assert!(body.contains("x-forwarded-prefix: /outer\n"), "{body}");
+}
+
+#[tokio::test]
+async fn strip_prefix_does_not_bypass_bad_path() {
+    // Dot segments hidden behind the prefix are rejected before stripping
+    // (reqwest would normalise a literal `%2e%2e`, so use forms it keeps).
+    for p in ["/api/..%2Fx", "/api%2f../x"] {
+        let upstream = spawn_stub(echo).await;
+        let table = shared_table(parse_cfg(&format!(
+            "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\nstrip_prefix = true\n"
+        )));
+        let proxy = start_proxy(table).await;
+        let st = reqwest::get(format!("http://{proxy}{p}"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(st, 400, "{p}");
+    }
+}
+
+#[tokio::test]
+async fn strip_prefix_rechecks_remainder_after_normalisation() {
+    use tokio::io::AsyncWriteExt;
+    // `%2%65` passes bad_path and lookup, then normalises to `%2e`: the
+    // stripped remainder would hold dot segments, so it must be a 400 that
+    // never reaches the upstream.
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    let upstream = spawn_stub(move |_req| {
+        let h = h.clone();
+        async move {
+            h.fetch_add(1, Ordering::SeqCst);
+            ok("hit")
+        }
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/api\"\nupstream = \"http://{upstream}\"\nstrip_prefix = true\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"GET /api/%2%65%2%65/x HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let line = read_status_line(&mut s).await;
+    assert!(line.contains("400"), "{line}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn request_trailers_never_reach_the_upstream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The stub reports the trailers it received (none expected) in the body.
+    let upstream = spawn_stub(|req| async move {
+        let c = req.into_body().collect().await.unwrap();
+        let t = c.trailers().map(|t| format!("{t:?}")).unwrap_or_default();
+        ok(format!("data={} trailers={t}", c.to_bytes().len()))
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /svc-a HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\nte: trailers\r\ntrailer: x-real-ip\r\nconnection: close\r\n\r\n4\r\nabcd\r\n0\r\nx-real-ip: 6.6.6.6\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.contains("data=4 trailers="), "{out}");
+    assert!(!out.contains("6.6.6.6"), "{out}");
+}
+
+/// Dropping the trailer frame must still signal end-of-body, or the
+/// upstream timeout (which starts at body EOS) never fires.
+#[tokio::test]
+async fn chunked_upload_with_trailer_to_slow_upstream_is_504() {
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = spawn_stub(|req| async move {
+        let _ = req.into_body().collect().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        ok("too-slow")
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "upstream_timeout_secs = 1\n[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream}\"\n"
+    )));
+    let proxy = start_proxy(table).await;
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(
+        b"POST /svc-a HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\nte: trailers\r\n\r\n4\r\nabcd\r\n0\r\nx-a: b\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    let st = read_status_line(&mut s).await;
+    assert!(st.starts_with("HTTP/1.1 504"), "{st}");
+    assert!(start.elapsed() < Duration::from_millis(2500));
 }

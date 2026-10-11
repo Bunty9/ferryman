@@ -1698,13 +1698,21 @@ mod tests {
             ("-forwarded", "for=6.6.6.6"),
             ("x--custom", "keep"),
             ("x.custom", "keep"),
+            ("x_forwarded-host", "evil.example"),
+            ("x_forwarded_proto", "https"),
         ];
         for trusted in [&[][..], &["10.0.0.0/8"][..]] {
             let m = run_with(trusted, "10.1.2.3", None, false, XffMode::Append, &h);
             for k in ["x_real_ip", "x_forwarded_prefix", "x_forwarded_for"] {
                 assert_eq!(get(&m, k), None, "{k}");
             }
-            for k in ["x.forwarded.for", "x.real.ip", "x-forwarded.proto"] {
+            for k in [
+                "x.forwarded.for",
+                "x.real.ip",
+                "x-forwarded.proto",
+                "x_forwarded-host",
+                "x_forwarded_proto",
+            ] {
                 assert_eq!(get(&m, k), None, "{k}");
             }
             for k in [

@@ -54,7 +54,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/tags/$TAG" -q .sha)
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" -q .sha)
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           # Only the newest stable release may move X.Y / latest (no rollback).

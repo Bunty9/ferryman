@@ -2,7 +2,7 @@
 
 How the proxy works inside, and why it is built this way. The external
 contract (config keys, status codes, metrics) is in the
-[README](../README.md); the original design brief is in
+[book](https://bunty9.github.io/ferryman/) (config reference, routing, operations); the original design brief is in
 [`specs/2026-05-28-ferryman-design.md`](specs/2026-05-28-ferryman-design.md).
 
 ## Crates

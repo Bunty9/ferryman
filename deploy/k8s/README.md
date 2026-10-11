@@ -36,4 +36,4 @@ a Service named `app` in the same namespace.
   `deployment.yaml`. `fsGroup: 65532` makes the files readable. A renewed
   certificate (e.g. cert-manager) is picked up on reload like the config.
 - **Behind an ingress/LB.** Add its CIDR to `trusted_proxies` in the ConfigMap
-  (README "Forwarded headers and `trusted_proxies`").
+  ([Forwarded headers](https://bunty9.github.io/ferryman/forwarded-headers.html)).

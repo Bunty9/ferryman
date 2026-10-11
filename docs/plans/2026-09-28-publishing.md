@@ -269,3 +269,13 @@ uploads with `--clobber`, replacing the attested archives with a rebuild.
 - MSRV changes are a minor bump. Recommend `cargo install --locked`,
   since without it cargo may pick dependency versions newer than the
   MSRV.
+
+## Documentation site (one-time manual step)
+
+The mdBook in `book/` is built on every PR and deployed by
+`.github/workflows/docs.yml` on pushes to `main`. Before the first deploy,
+enable GitHub Pages once: repository **Settings > Pages > Build and
+deployment > Source: GitHub Actions**. The site lands at
+<https://bunty9.github.io/ferryman/> (`site-url` in `book/book.toml`). Bumping
+mdBook means changing `MDBOOK_VERSION` and `MDBOOK_SHA256` together in the
+workflow.

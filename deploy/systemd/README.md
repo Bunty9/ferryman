@@ -15,4 +15,4 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ferryman
 - Logs: JSON on stdout, `journalctl -u ferryman -o cat | jq .`.
 - `TimeoutStopSec` must exceed `shutdown_delay_secs` + drain time.
 
-See the "systemd" section of the top-level README.
+See the systemd quickstart in the [book](https://bunty9.github.io/ferryman/quickstarts.html#systemd).

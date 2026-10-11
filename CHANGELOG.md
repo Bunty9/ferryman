@@ -9,6 +9,13 @@ and `ferryman` are released together with the same version.
 
 ### Added
 
+- Documentation site (mdBook, `book/`, deployed to GitHub Pages by
+  `.github/workflows/docs.yml`): quickstarts (Docker/GHCR, binstall, systemd,
+  Kubernetes, Compose, PaaS), full configuration reference, routing,
+  forwarded headers, circuit breaker, timeouts, operations, embedding,
+  security, and an honest comparison with Caddy/Traefik/NGINX/rpxy/Pingora
+  with nginx and Caddy migration recipes. The README is now a short front
+  page that links into it.
 - Kubernetes recipe `deploy/k8s/` (Deployment, Service, ConfigMap, README):
   Restricted Pod Security Standard, httpGet probes on the admin port, ConfigMap
   mounted as a directory so edits hot-reload, termination grace sized for

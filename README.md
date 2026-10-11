@@ -1,23 +1,107 @@
 # ferryman
 
-> Small L7 reverse proxy in Rust — prefix routing, per-upstream circuit
-> breakers, active health checks, hot-reloaded TOML config. Pingora-pattern
-> at miniature scale. Built to be readable in one sitting.
+> The small, readable Rust reverse proxy with a production-grade circuit
+> breaker, which you can also embed as a crate. Prefix routing, per-upstream
+> circuit breakers, active health checks, hot-reloaded TOML config.
+> Pingora-pattern at miniature scale.
+
+**Documentation: <https://bunty9.github.io/ferryman/>**
 
 [![ci](https://github.com/Bunty9/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/ferryman/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/ferryman.svg)](https://crates.io/crates/ferryman)
 [![docs.rs](https://img.shields.io/docsrs/ferryman)](https://docs.rs/ferryman)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-## The problem
+## Features
 
-Typical self-hosted setups expose services on direct ports or tunnels with
-no L7 in front. Real teams put L7 proxies between clients and origin:
-routing, health checks, observability, TLS termination. **ferryman** is a
-hyper-based reverse proxy that does the boring parts well and exposes the
-interesting tradeoffs — circuit-breaker state machine, atomic config
-hot-reload, prefix-longest-match routing — in code small enough to read
-top-to-bottom.
+- Longest-prefix routing on path-segment boundaries; optional `strip_prefix`
+  and `rewrite_host` per route.
+- Lock-free per-upstream circuit breaker with `Admission` tickets, plus active
+  health checks that close a recovered circuit within one interval.
+- Hot reload of config and TLS certificate (file watch, `SIGHUP`, Kubernetes
+  ConfigMap/Secret swaps); a bad config never replaces a working one.
+- Streaming bodies, HTTP/1.1 and HTTP/2 listener (ALPN), TLS termination.
+- Forwarded headers that clients cannot forge (`trusted_proxies`).
+- Admin listener (`/metrics`, `/healthz`, `/readyz`), opt-in access log and
+  request ids, graceful drain tuned for load balancers and PaaS.
+- Publishable crates: embed the proxy (`ferryman`) or just the breaker
+  (`ferryman-core`).
+
+Limitations today: plain-HTTP upstreams only, one upstream per route, no
+WebSocket/`Upgrade` passthrough (501), no built-in ACME. See the
+[comparison](https://bunty9.github.io/ferryman/comparison.html) for when to
+choose Caddy, Traefik, NGINX, rpxy or Pingora instead.
+
+## Install
+
+```bash
+docker run --rm --read-only -p 8080:8080 -p 127.0.0.1:9090:9090 \
+  -v "$PWD/config:/etc/ferryman:ro" \
+  ghcr.io/bunty9/ferryman:latest --config /etc/ferryman/ferryman.toml
+
+cargo binstall ferryman          # downloads the release archive (releases after 0.2.1)
+cargo install --locked ferryman  # builds from crates.io (Rust 1.88+)
+```
+
+Prebuilt binaries (with checksums and build provenance attestations,
+`gh attestation verify`) are attached to every
+[GitHub release](https://github.com/Bunty9/ferryman/releases). The image is
+`FROM scratch`, multi-arch and runs as uid 65532; mounted files must be
+readable by it. Details: [Quickstarts](https://bunty9.github.io/ferryman/quickstarts.html).
+
+## Quick start
+
+```bash
+ferryman --config config.toml
+curl -i http://localhost:8080/svc-a/hello     # 502, then 503 once the circuit opens
+curl -i http://localhost:8080/no-such-route   # 404 no route
+curl -s http://localhost:9090/metrics | head
+```
+
+```toml
+[[routes]]
+prefix = "/app"
+upstream = "http://app:8000"
+```
+
+Edit the file while ferryman runs: the routing table reloads atomically
+without dropping live connections. Unknown keys are rejected;
+`ferryman check --config X` validates a file without binding.
+
+## Documentation
+
+The [book](https://bunty9.github.io/ferryman/) is the detailed home:
+
+| Topic | Chapter |
+| --- | --- |
+| Docker, binstall, systemd, Kubernetes, Compose, Cloud Run/Render/Railway/Heroku/Fly | [Quickstarts](https://bunty9.github.io/ferryman/quickstarts.html) |
+| Every config key, default and reload behaviour | [Configuration reference](https://bunty9.github.io/ferryman/configuration.html) |
+| Prefix matching, normalisation, `strip_prefix`, `rewrite_host` | [Routing](https://bunty9.github.io/ferryman/routing.html) |
+| `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `trusted_proxies` | [Forwarded headers](https://bunty9.github.io/ferryman/forwarded-headers.html) |
+| States, `Admission`, health-driven recovery, failure statuses | [Circuit breaker](https://bunty9.github.io/ferryman/circuit-breaker.html) |
+| Keep-alive/ALB, body and upstream timeouts, shutdown sizing | [Timeouts & limits](https://bunty9.github.io/ferryman/timeouts.html) |
+| Admin endpoints, probes, reload, drain, access log, metrics, Grafana | [Operations](https://bunty9.github.io/ferryman/operations.html) |
+| Cargo features, `serve`, standalone `Breaker` | [Embedding the library](https://bunty9.github.io/ferryman/embedding.html) |
+| Reporting, attestations, hardening | [Security](https://bunty9.github.io/ferryman/security.html) |
+| vs Caddy/Traefik/NGINX/rpxy/Pingora; nginx and Caddy migration | [Comparison & migration](https://bunty9.github.io/ferryman/comparison.html) |
+
+## Deploy
+
+| Where | Recipe | Checked in CI |
+| --- | --- | --- |
+| Docker Compose | [`examples/full-stack/`](./examples/full-stack): TLS, upstreams, Prometheus, Grafana | `demo.sh --ci` |
+| Kubernetes | [`deploy/k8s/`](./deploy/k8s): Restricted PSS, probes, ConfigMap reload, graceful shutdown | kind job |
+| systemd | [`deploy/systemd/`](./deploy/systemd) | unit tests |
+| Fly.io | [`fly.toml`](./fly.toml) | n/a |
+| Cloud Run, Render, Railway, Heroku, ECS | [Quickstarts](https://bunty9.github.io/ferryman/quickstarts.html#paas-and-orchestrators) | `crates/server/tests/paas.rs` |
+
+## Examples
+
+Reference examples live under [`examples/`](./examples) (index:
+[`examples/README.md`](./examples/README.md)): `full-stack` (Compose with TLS,
+Prometheus, Grafana), `embedded` (`ferryman::serve` inside your own app, plus
+a standalone `Breaker` around a `reqwest` call) and the core crate's
+[`guarded_client.rs`](./crates/core/examples/guarded_client.rs).
 
 ## Architecture
 
@@ -49,573 +133,6 @@ top-to-bottom.
 
 Routing rules: TOML, hot-reloaded via `notify` filesystem watch + arc-swap.
 ```
-
-## Stack
-
-| Layer                | Crate / Tool                                                  |
-| -------------------- | ------------------------------------------------------------- |
-| Async runtime        | `tokio` 1.47 (full)                                           |
-| HTTP server          | `hyper` 1.x + `hyper-util` auto (HTTP/1.1 + HTTP/2)           |
-| HTTP client (proxy)  | `hyper-util` legacy `Client<HttpConnector>`                   |
-| HTTP client (health) | `reqwest` 0.12 (plain HTTP, no TLS stack)                     |
-| TLS termination      | `rustls` 0.23 (`ring`) + `tokio-rustls`, ALPN h2 / http/1.1   |
-| Config               | `serde` + `toml` + `notify` (FS watch)                        |
-| Hot-swap             | `arc-swap` (atomic `RouteTable` swap)                         |
-| Observability        | `tracing` + `metrics-exporter-prometheus`                     |
-| CLI                  | `clap` 4                                                      |
-| Container build      | `cargo-chef` multi-stage, `FROM scratch`                      |
-| Deploy               | Fly.io 2-region (`sin` + `iad`)                               |
-| CI                   | GHA (stable + beta) + `cargo-deny` + `cargo-nextest` + `wrk2` |
-
-Full pinned versions live in [`Cargo.toml`](./Cargo.toml). Default routing
-rules: [`config.toml`](./config.toml).
-
-## Install
-
-**Prebuilt binaries** are attached to every
-[GitHub release](https://github.com/Bunty9/ferryman/releases) as
-`ferryman-v<version>-<target>.tar.gz` (`.zip` on Windows), each holding
-the binary, README, CHANGELOG, both licenses and an example `config.toml`.
-Required targets: `x86_64`/`aarch64-unknown-linux-musl` (static),
-`x86_64`/`aarch64-apple-darwin`, `x86_64-pc-windows-msvc`. Best effort
-(may be missing from a release): `armv7`/`arm-unknown-linux-musleabihf`,
-`i686-unknown-linux-musl`, `riscv64gc-unknown-linux-gnu`,
-`aarch64-pc-windows-msvc`, `x86_64-unknown-freebsd`.
-
-```bash
-v=0.2.4   # or the latest release (binaries ship from 0.2.2 on)
-t=x86_64-unknown-linux-musl
-base=https://github.com/Bunty9/ferryman/releases/download/v$v
-curl -fsSLO $base/ferryman-v$v-$t.tar.gz -O $base/SHA256SUMS
-sha256sum -c --ignore-missing SHA256SUMS      # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
-tar xzf ferryman-v$v-$t.tar.gz
-./ferryman-v$v-$t/ferryman --version
-```
-
-Each archive also has a standalone `<archive>.sha256` file. Releases from
-0.2.3 on also carry build provenance attestations; verify an archive with:
-
-```bash
-gh attestation verify ferryman-v$v-$t.tar.gz --repo Bunty9/ferryman
-```
-
-Tier-1 binaries embed their dependency list (`cargo auditable`), so
-`cargo audit bin ./ferryman` works on them.
-
-```bash
-cargo binstall ferryman          # downloads the release archive above (releases after 0.2.1)
-cargo install --locked ferryman  # builds from crates.io (Rust 1.88+)
-docker build -t ferryman .       # static musl binary in a scratch image
-```
-
-### Docker image
-
-Multi-arch (linux/amd64, linux/arm64) images are published to GHCR from the
-release binaries, with build provenance attached:
-`ghcr.io/bunty9/ferryman:X.Y.Z`, `:X.Y` and `:latest` (prereleases get only
-the exact tag). Verify with
-`gh attestation verify oci://ghcr.io/bunty9/ferryman:X.Y.Z --repo Bunty9/ferryman`.
-
-```bash
-docker run --rm --read-only -p 8080:8080 -p 127.0.0.1:9090:9090 \
-  -v "$PWD/config:/etc/ferryman:ro" \
-  ghcr.io/bunty9/ferryman:latest --config /etc/ferryman/ferryman.toml
-```
-
-```yaml
-# docker-compose.yml
-services:
-  ferryman:
-    image: ghcr.io/bunty9/ferryman:latest
-    read_only: true
-    command: ["--config", "/etc/ferryman/ferryman.toml"]
-    volumes: ["./config:/etc/ferryman:ro"]
-    ports: ["8080:8080", "127.0.0.1:9090:9090"]
-```
-
-The image is `FROM scratch` and runs as **uid/gid 65532** (non-root) with no
-writable paths, so `--read-only` / `read_only: true` works. Mounted config,
-TLS certificate and key files must be readable by 65532: mode `0644`, or
-group-readable plus `--group-add <gid>` (compose `group_add`, Kubernetes
-`fsGroup`). A `0600` file owned by your own user is not readable and the
-container fails at startup with a permission error. Mount the config as a
-directory so hot reload sees rename-replace saves.
-
-On Windows, Ctrl-C drains gracefully; console close / system shutdown
-starts the drain, but Windows terminates the process after about 5 s.
-
-## Quick start
-
-```bash
-ferryman --config config.toml
-
-# Build and run against the example config (2 upstreams, 5s health interval).
-cargo run -p ferryman -- --config config.toml
-
-# Optional: local upstreams that answer 200 on every path.
-cargo run --release -p ferryman --example echo_upstream -- 127.0.0.1:8001 &
-
-# In another shell, hit a route:
-curl -i http://localhost:8080/svc-a/hello
-# HTTP/1.1 502 bad gateway          (no svc-a:8001 listening yet)
-# HTTP/1.1 503 upstream unavailable (once its circuit has opened)
-curl -i http://localhost:8080/no-such-route
-# HTTP/1.1 404 no route
-
-# Optional TLS termination (HTTP/2 via ALPN):
-cargo run -p ferryman -- --config config.toml \
-    --tls-cert cert.pem --tls-key key.pem
-
-# Scrape Prometheus metrics:
-curl -s http://localhost:9090/metrics | head
-```
-
-Edit `config.toml` while ferryman is running — the routing table reloads
-atomically without dropping live connections.
-
-### Reloading
-
-- **File watch.** ferryman watches the *directory* of the config file (and of
-  the TLS cert/key). Any change there schedules a reload after 200 ms of quiet,
-  but only if the file's bytes actually changed (content hash), so `touch` and
-  identical rewrites are ignored. This covers editors that rename-replace and
-  Kubernetes ConfigMap/Secret mounts, which swap a `..data` symlink instead of
-  touching `config.toml`. Mount the whole ConfigMap as a directory (not with
-  `subPath`, which never updates) and point `--config` at the file in it.
-- **SIGHUP (Unix).** Forces a reload of the config and the TLS certificate even
-  if nothing changed. systemd: `ExecReload=/bin/kill -HUP $MAINPID`. With inline
-  `FERRYMAN_CONFIG_TOML` it logs "reload not applicable": the config is not
-  re-read, but TLS files still are. Windows has no SIGHUP; only the file watch applies. (Before 0.3,
-  SIGHUP terminated the process.)
-- **TLS cert/key.** A changed `--tls-cert`/`--tls-key` pair (e.g. a cert-manager
-  Secret renewal) is picked up the same way and used for *new* handshakes;
-  open connections keep their old session. A bad or mismatched pair is logged
-  and the previous certificate stays. Turning TLS on or off, or changing the
-  cert/key paths, needs a restart.
-- **Failure.** A config that fails to parse or validate is logged and the old
-  table stays live. Bind addresses, the metrics bind and `health_interval_secs`
-  need a restart.
-
-### systemd
-
-`deploy/systemd/ferryman.service` is a hardened unit (`DynamicUser`,
-`ProtectSystem=strict`, only `CAP_NET_BIND_SERVICE`, `@system-service` syscalls).
-
-```sh
-sudo install -m755 ferryman /usr/local/bin/ferryman
-sudo install -d /etc/ferryman && sudo cp config.toml /etc/ferryman/
-sudo cp deploy/systemd/ferryman.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ferryman
-```
-
-- **Notify.** With `NOTIFY_SOCKET` set (`Type=notify`) ferryman sends `READY=1`
-  once the proxy and admin listeners are bound, `RELOADING=1` +
-  `MONOTONIC_USEC` / `READY=1` around each SIGHUP reload (also when the reload
-  is rejected and the old config is kept), and `STOPPING=1` when shutdown
-  begins. It is a no-op when the variable is unset. File-watch reloads are not
-  announced; watchdog (`WATCHDOG=1`) is not implemented.
-- **Reload.** `systemctl reload ferryman` runs `kill -HUP $MAINPID`. On systemd
-  253+ you can use `Type=notify-reload` instead and drop `ExecReload`.
-- **TLS.** `LoadCredential=` copies the cert and key into a private directory;
-  the unit passes them as `--tls-cert %d/tls.crt --tls-key %d/tls.key`.
-  Renewing `/etc/ferryman/tls.*` takes effect with `systemctl reload`.
-- **Stopping.** `TimeoutStopSec=35s` covers the default 25 s drain; raise it if
-  you raise `shutdown_delay_secs` or the drain.
-- **Logs.** JSON on stdout lands in the journal: `journalctl -u ferryman -o cat | jq .`
-  (or `--log-format text`).
-
-## Deploy
-
-| Where | Recipe | Checked in CI |
-| --- | --- | --- |
-| Docker Compose | [`examples/full-stack/`](./examples/full-stack): TLS, upstreams, Prometheus, Grafana | `demo.sh --ci` |
-| Kubernetes | [`deploy/k8s/`](./deploy/k8s): Restricted PSS, probes, ConfigMap reload, graceful shutdown | kind job |
-| systemd | [`deploy/systemd/`](./deploy/systemd) (see "systemd" above) | unit tests |
-| Fly.io | [`fly.toml`](./fly.toml) (see "Fly.io" below) | n/a |
-| Cloud Run, Render, Railway, Heroku, ECS | "PaaS and orchestrators" above | `crates/server/tests/paas.rs` |
-
-### Fly.io
-
-`fly.toml` publishes only the proxy (`internal_port` 8080); the admin listener
-(`[::]:9090`, dual-stack because Fly's private network is IPv6) is never
-exposed. Fly's Prometheus scrapes `9090/metrics` (`[metrics]`) and a machine
-check probes `9090/healthz`. If you prefer to probe the proxy port, set
-`local_health_path = "/up"` in the config and point the check at it.
-`kill_signal = "SIGINT"` with `kill_timeout = "30s"` covers the default 25 s
-drain.
-
-## Examples
-
-Reference examples live under [`examples/`](./examples) (index:
-[`examples/README.md`](./examples/README.md)):
-
-| Example | What it shows |
-| --- | --- |
-| [`examples/full-stack/`](./examples/full-stack) | Full Docker Compose deployment: ferryman, TLS, three demo upstreams, Prometheus + Grafana, an asserted `demo.sh` tour. |
-| [`examples/embedded/`](./examples/embedded) | Embedding `ferryman::serve` as a library inside your own async Rust app, with its own admin server. |
-| [`examples/embedded/src/guarded.rs`](./examples/embedded/src/guarded.rs) | A standalone `ferryman_core::Breaker` guarding a `reqwest` call. |
-| [`crates/core/examples/guarded_client.rs`](./crates/core/examples/guarded_client.rs) | `ferryman-core`'s circuit breaker guarding any fallible async call, no proxy involved. |
-
-### Library use and cargo features
-
-Embedding `ferryman` as a library? Turn off the default features so the CLI's
-dependencies (`clap`, `tracing-subscriber`, ...) are not pulled in:
-
-```toml
-ferryman = { version = "0.3", default-features = false, features = ["reload"] }
-```
-
-| Feature | Default | Adds |
-| --- | --- | --- |
-| `bin` | yes | the `ferryman` binary (`clap`, `tracing-subscriber`, `metrics-util`); implies `admin` and `reload` |
-| `admin` | via `bin` | `ferryman::admin` (admin server; its API takes a `metrics-exporter-prometheus` `PrometheusHandle`) |
-| `reload` | via `bin` | `ferryman::reload` (config/TLS file watcher, uses `notify`) |
-
-Without features you still get `serve`, `proxy` and `tls`. `cargo install`,
-`cargo binstall`, the release archives and the Docker image keep the defaults.
-
-## Configuration
-
-See [`config.toml`](./config.toml). Unknown keys are rejected, so typos
-fail loudly instead of silently falling back to defaults.
-
-| Key                              | Default | Meaning                                                                          |
-| -------------------------------- | ------- | -------------------------------------------------------------------------------- |
-| `health_interval_secs`           | 5       | Active `/health` probe interval (restart to change).                             |
-| `default_cooldown_secs`          | 30      | How long an open circuit refuses traffic before one probe.                       |
-| `failure_threshold`              | 3       | Consecutive failures that open a closed circuit.                                 |
-| `upstream_timeout_secs`          | 30      | Time allowed for an upstream to send response headers.                           |
-| `keepalive_timeout_secs`         | 10      | HTTP/1 keep-alive idle timeout, 1-86400 (ALB: 75, GCLB: 620).                    |
-| `request_body_idle_timeout_secs` | 30      | Longest gap between request-body frames, 1-86400.                                |
-| `request_body_timeout_secs`      | 300     | Total time to receive a request body, 1-86400 (408 when exceeded).               |
-| `drain_timeout_secs`             | 25      | After the listener closes on shutdown, how long to wait for in-flight requests before cutting them, 1-86400. Delay + drain must stay under the platform kill timeout. |
-| `shutdown_delay_secs`            | 0       | On SIGTERM/SIGINT, `/readyz` flips to 503 at once and ferryman keeps accepting for this long (0-86400) before the drain starts. Read at shutdown, so a reload applies. |
-| `local_health_path`              | none    | Path the proxy answers itself (`GET`/`HEAD` -> `200 ok`, no upstream, no breaker; metric `route="local_health"`), for PaaS platforms that only probe the serving port. Absolute, no `?`/`#`; rejected if equal to a route prefix; shadows a route prefix it falls under (e.g. `/up` under a `/` catch-all). Hot-reloads. |
-| `forwarded_header`               | `false` | Also add an RFC 7239 `Forwarded` element `for=<peer>;proto=<scheme>;host=<Host>` (IPv6 as `for="[2001:db8::1]"`). Untrusted peer: a fresh element; trusted: appended to the incoming list. Hot-reloads. |
-| `access_log`                     | `false` | One `ferryman::access` log line per request (see "Logging"). Hot-reloads. |
-| `request_id`                     | `false` | Generate `x-request-id` when absent (or invalid) and set it on the upstream request and the response. Hot-reloads. |
-| `xff`                            | `"append"` | `"append"`: peer added to the incoming `X-Forwarded-For`. `"replace"`: set to the single client address ferryman puts in `X-Real-IP`. Hot-reloads. |
-| `trusted_proxies`                | `[]`    | CIDRs/IPs whose forwarding headers are trusted (see below); v4 clients match only v4 ranges. Hot-reloads (applied per request). |
-| `[[routes]] prefix`              | —       | Path prefix, matched on segment boundaries (`/a` ≠ `/ab`) against the normalised, case-sensitive request path (see "Routing and access control"). |
-| `[[routes]] upstream`            | —       | `http://host:port` — no path, no query, no https.                                |
-| `[[routes]] cooldown_secs`       | default | Per-route cooldown override.                                                     |
-| `[[routes]] health_path`         | `/health` | Health probe path: absolute, no `?` or `#`. Hot-reloads.                       |
-| `[[routes]] rewrite_host`        | `false` | `true` sends the upstream's `host[:port]` as `Host` (HTTP/1 and HTTP/2); default keeps the client's. |
-| `[[routes]] strip_prefix`        | `false` | `true` removes the matched prefix before forwarding (`/api/users?x=1` under `/api` becomes `/users?x=1`; `/api` becomes `/`) and sets `X-Forwarded-Prefix: /api`. The path is checked (`bad_path`) before and after stripping and is forwarded normalised (repeated `/` merged, unreserved `%XX` decoded, other escapes' hex uppercased); the query is untouched. A `/` route has nothing to strip. |
-| `[[routes]] health_disabled`     | `false` | Skip active probing of this route's upstream (see "Health-driven recovery").     |
-
-All `*_secs` values must be between 1 and 86400 (one day). An upstream
-with an empty host (`http://:80`) is rejected.
-
-Routes pointing at the same `host:port` share one circuit breaker, so they
-must also agree on `cooldown_secs`, `health_path` and `health_disabled`
-(a mismatch is rejected). A hot
-reload keeps each surviving upstream's breaker, so an open circuit stays
-open across a config edit. An invalid config on reload is logged and the
-old table stays live.
-
-### Routing and access control
-
-Prefixes match the normalised, case-sensitive request path on a segment
-boundary. Normalisation, for matching only (the forwarded path stays raw):
-`%XX` escapes of unreserved characters (`A-Za-z0-9-._~`) are decoded, hex
-digits of the remaining escapes are uppercased, and repeated `/` are merged.
-Decoding is a single pass: double-encoded characters (`%2561`) are not
-decoded further. Prefixes must be written in this normalised form (rejected
-at load otherwise). Nothing else is decoded, so `/api%2fx` does not match `/api`, and `/API/x`
-does not either. Routes are still not access control: case variants and
-`%2f` variants fall to a less specific route (especially `/`) and may be
-decoded or merged into a more specific path by the upstream. Don't rely on
-a route to hide paths of an upstream that another route also reaches.
-
-### Health-driven recovery
-
-The `ferryman` binary runs a health loop: every `health_interval_secs` it
-probes each upstream's `health_path` (default `/health`; any answer below 500 is healthy;
-transport errors, timeouts and 5xx are not). An embedder calling
-`ferryman::serve` alone has no health loop unless it spawns `health_loop`
-itself. Health results are authoritative, like the half-open probe:
-
-- A passing check closes an open or half-open circuit immediately; it does
-  not wait for the cooldown. Passing while already closed is a no-op and
-  does not reset the request failure count. A recovered upstream is
-  routable again within about one `health_interval_secs`.
-- A failing check while already open changes nothing: it does not restart
-  the cooldown. Once the cooldown has elapsed, one request is let through
-  as the half-open probe whether or not `/health` is failing, and if it
-  succeeds the circuit closes. So a broken health endpoint no longer pins a
-  circuit open while real traffic works (failing checks while closed still count toward `failure_threshold`, and
-  a failed half-open probe or a failing check landing while half-open
-  reopens it).
-  Without a running health loop, recovery is the same: cooldown expiry plus
-  one successful half-open request.
-- Health failures while the circuit is closed do count toward
-  `failure_threshold`, like request failures. With a broken health endpoint
-  and sparse traffic the circuit can flap (open on health failures, close
-  on the next half-open request). Set `health_disabled = true` for an
-  upstream whose health endpoint is broken or absent-by-design.
-- `health_path` (default `/health`) sets the probed path;
-  `health_disabled = true` makes the loop skip the upstream entirely: no
-  probe and no effect on its breaker, so only request traffic drives it.
-  For a disabled upstream `ferryman_upstream_alive` is still published
-  from the circuit state (1 = closed, 0 = open/half-open), not from probes.
-  Changing either key on reload keeps the breaker's state.
-
-State changes are logged with `upstream`, `from` and `to` fields: `warn`
-when a circuit opens, `info` otherwise. Failing checks while open
-are not logged.
-
-CLI flags (env var in brackets): `--config` (`FERRYMAN_CONFIG`), `--bind`
-(`FERRYMAN_BIND`; resolution order `--bind` > `FERRYMAN_BIND` >
-`0.0.0.0:$PORT` (ignored with a warning if not a valid port) >
-`0.0.0.0:8080`), `--metrics-bind`
-(`FERRYMAN_METRICS_BIND`, `0.0.0.0:9090`), `--tls-cert` / `--tls-key`
-(`FERRYMAN_TLS_CERT` / `FERRYMAN_TLS_KEY`), `--log-format text|json`
-(`FERRYMAN_LOG_FORMAT`, default `json`).
-
-### Logging
-
-Logs go to stdout as JSON by default; `--log-format text` (or
-`FERRYMAN_LOG_FORMAT=text`) gives the human-readable format. Filter with
-`RUST_LOG` (default `info`).
-
-With `access_log = true` (opt-in; off by default to keep log volume down at high request rates) every request, including early rejections
-(400, 404, 501, 503, 408, 502, 504 and `local_health_path`), logs one `info`
-line with target `ferryman::access` and fields: `method`, `host` (URI
-authority or `Host`, `-` if none), `path`, `route` (config prefix, `none`,
-or `local_health`), `upstream` (`host:port` or `none`), `status`, `bytes_out`,
-`duration_ms`, `request_id`, `peer` (connecting IP, not `X-Forwarded-For`),
-`scheme`, `version`. Notes:
-
-- The query string is never logged (it may carry secrets). `path` is the raw
-  path, non-visible-ASCII bytes replaced by `?`, truncated to 512 bytes.
-- `duration_ms` runs to the response headers (like the metric), not the end
-  of the streamed body. `bytes_out` is the response `Content-Length` when the
-  upstream sent one; it is omitted otherwise and for ferryman's own error
-  responses.
-- Each request runs in a `request` span with bounded fields `method`, `route`,
-  `upstream` (never the raw path), so breaker transition logs emitted during
-  the request appear under it. The span is only created when `access_log` or
-  `request_id` is on.
-- Not logged: requests hyper rejects before the service runs (malformed
-  request line, 431 oversized headers) and requests whose client aborts
-  before a response is produced.
-- `request_id = true`: a valid incoming `x-request-id` (1-128 visible ASCII
-  bytes, a single header) is kept, else a random 32-hex id replaces it. It is sent upstream,
-  echoed on the response (unless the upstream sets its own) and logged. With
-  `request_id = false` ferryman touches the headers not at all (the response
-  never gets an `x-request-id` from ferryman) but the access log still shows a
-  valid incoming id.
-- `traceparent` and `tracestate` are end-to-end headers: forwarded to the
-  upstream and returned untouched. ferryman does not emit spans over OTLP.
-
-### Inline config (`FERRYMAN_CONFIG_TOML`)
-
-When `FERRYMAN_CONFIG_TOML` is set and non-empty, its value is the whole
-TOML config and `--config` / `FERRYMAN_CONFIG` are ignored (the Docker
-image's default `CMD` passes `--config`, so a flag cannot be the
-tiebreaker). No file is watched, so the config is not hot-reloaded (a startup
-log line says so; SIGHUP logs "reload not applicable"); change the env var and
-restart. `ferryman check` honours it
-too.
-
-### Subcommands
-
-- `ferryman` (no subcommand) runs the proxy, as before.
-- `ferryman check [--config PATH]` validates the config (parse, route table,
-  and TLS cert/key when `--tls-cert`/`--tls-key` are set) without binding
-  anything. Prints `config ok: N routes` or the error chain to stderr; exit 0
-  or 1. Use it as a CI gate before deploying a config. It checks the config
-  file and TLS files only; bind addresses are parsed by clap, not tested for
-  availability.
-- `ferryman healthcheck [--url URL]` does an HTTP/1 GET (3 s budget) on
-  `http://127.0.0.1:<--metrics-bind port>/healthz` and exits 0 on 2xx, else 1.
-  The Docker image has no shell or curl, so this is its `HEALTHCHECK`
-  (`CMD ["/usr/local/bin/ferryman", "healthcheck"]`, built into the image);
-  in an ECS task definition use `"healthCheck": {"command": ["CMD",
-  "/usr/local/bin/ferryman", "healthcheck"]}`. If you set a non-default
-  metrics port via flag, pass `--metrics-bind` (or `FERRYMAN_METRICS_BIND`) to
-  the healthcheck too, or give `--url`.
-
-## Running behind a load balancer
-
-An LB that reuses backend connections needs ferryman to keep them open
-longer than the LB does, or it may send a request just as ferryman closes
-the socket and return 502. Set `keepalive_timeout_secs` accordingly:
-
-| Load balancer | Setting |
-| ------------- | ------- |
-| AWS ALB       | ALB idle timeout + 15 s: `75` at the default 60 s. (Or set the ALB idle timeout to 9 s or less and keep the default 10.) |
-| Google Cloud LB | `620` (GCLB holds backend connections 600 s). |
-| Direct clients | keep the default `10`. |
-
-The first request on a new connection is always bounded at 10 s. A larger
-value also widens the header-read window on reused connections: a client
-can send one request and then hold the connection for up to this value, so
-raise it only behind a load balancer. Changes apply to new connections on
-hot reload.
-
-### PaaS and orchestrators
-
-Platforms that inject `PORT` need no flags: `PORT=10000
-FERRYMAN_CONFIG_TOML='[[routes]]...' ferryman` listens on `0.0.0.0:10000`
-with the inline config.
-
-- Cloud Run (SIGTERM, then SIGKILL after 10 s): `shutdown_delay_secs` 0,
-  `drain_timeout_secs` at most 8. It probes the serving port, so set
-  `local_health_path` if you use probes.
-- Render, Railway, Heroku: all set `PORT`; Heroku sends SIGTERM and kills
-  after 30 s (the default 25 fits), Render and Railway are configurable.
-  Use inline config or a file committed in the image.
-- ECS behind an ALB: the target group's deregistration delay already keeps
-  the task in service before SIGTERM is sent, so `shutdown_delay_secs` is
-  usually unnecessary. Keep `stopTimeout` above delay + drain.
-- Kubernetes: endpoint removal takes about 5-15 s to reach kube-proxy and
-  ingress controllers after the pod starts terminating. Use
-  `shutdown_delay_secs` for that gap (the scratch image has no `sleep`, so
-  an exec `preStop` hook is not an option; newer clusters have the native
-  `lifecycle.preStop.sleep`). Delay + drain must fit
-  `terminationGracePeriodSeconds` (default 30), e.g. delay 10, drain 15.
-  Point the readiness probe at the admin `/readyz`.
-
-On shutdown only the admin `/readyz` signals draining; `local_health_path`
-keeps answering `200 ok` through the delay. A second SIGTERM/SIGINT during
-the delay or drain exits immediately with code 130. Signals received before
-the listeners are up use the OS default action.
-
-## Behaviour
-
-| Situation                                              | Response | Counts against breaker |
-| ------------------------------------------------------ | -------- | ---------------------- |
-| No route matches                                       | 404      | —                      |
-| Path has a `.`/`..` segment (also `%2e`, `..;`, or after an encoded `%2f`/`%5c`/`\` separator), or contains `%00`, `%u`, or a double-encoded dot or slash (`%252e`, `%252f`) | 400 (`bad path`) | no |
-| Path whose reading as `%2F`/`%5C`/`\` = `/` with `;params` dropped selects a different route than the raw path (`/api%2Fsecret`, `/api;x/secret`; `group%2Fproject` under `/api` is fine). `;params` are also dropped up to the next raw `/` before decoding. Routes are case-sensitive and `%c0%af`/`%3B` are not interpreted, so case-folding or overlong-UTF-8 upstreams are not detected. Route prefixes may not contain `;`, `\`, `%2F`, `%5C` | 400 (`bad path`) | no |
-| No URI authority and `Host` is empty, has userinfo (`u@x`), a comma list, a path, non-ASCII bytes, `*`, or a port that is not 1-5 digits <= 65535; HTTP/1.1 with no `Host` (HTTP/1.0 is allowed); or more than one `Host` header (checked after the path checks, before routing) | 400 (`bad host`) | no |
-| Circuit open                                           | 503      | —                      |
-| `Upgrade` / `CONNECT` (e.g. WebSocket)                 | 501      | —                      |
-| Connect / transport error                              | 502      | yes                    |
-| No response headers within `upstream_timeout_secs` of the request body completing (of the request start if bodyless) | 504 | yes |
-| Client's request body fails mid-upload                 | 400      | no                     |
-| Client stalls its upload for `request_body_idle_timeout_secs`, or exceeds `request_body_timeout_secs` in total | 408 | no |
-| Upstream stops reading the upload for a whole `upstream_timeout_secs` window | 504 | yes |
-| Transport error or upstream 502/503/504, after the client left its upload idle for >= min(1 s, `request_body_idle_timeout_secs` / 2) | 502 / passed through | no |
-| Upstream answers 502/503/504                           | passed through | yes              |
-| Anything else from upstream                            | passed through | success          |
-
-Request and response bodies are streamed, never buffered. Hop-by-hop
-headers are stripped both ways; forwarding headers are set as described
-under "Forwarded headers" below; the client's `Host` is kept (HTTP/2
-`:authority` becomes `Host`) unless the route sets `rewrite_host = true`.
-Upstreams always get HTTP/1.1. The TLS handshake and the first request on a
-connection must complete within 10s; later HTTP/1 request heads are bounded
-by `keepalive_timeout_secs` (default 10). On SIGINT/SIGTERM `/readyz` goes
-503 immediately, ferryman keeps serving for `shutdown_delay_secs` (default 0),
-then stops accepting and drains in-flight connections for up to
-`drain_timeout_secs` (default 25) before exiting.
-
-### Forwarded headers and `trusted_proxies`
-
-What the upstream sees depends on whether the connecting peer is in
-`trusted_proxies` (an empty list means every peer is untrusted):
-
-| Header                 | Untrusted peer                       | Trusted peer                                                                                   |
-| ---------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `X-Forwarded-Proto`    | set from the connection              | incoming kept (rightmost value); set from the connection if absent                             |
-| `X-Forwarded-Port`     | client values stripped; set to the listener's port | rightmost incoming value kept if a valid port, else the listener's port        |
-| `X-Forwarded-For`      | peer IP appended (`xff = "replace"`: only the peer) | peer IP appended (`xff = "replace"`: only the derived client)       |
-| `X-Real-IP`            | overwritten with the peer IP         | always overwritten: the rightmost `X-Forwarded-For` entry that is not a trusted proxy (`ip:port` / `[v6]:port` tolerated; an unparsable entry stops the walk), else the peer |
-| `Forwarded`            | stripped; with `forwarded_header = true` a fresh `for=peer;proto;host` element | kept; with `forwarded_header = true` the element is appended |
-| `X-Forwarded-Host`     | stripped                             | kept                                                                                           |
-| `X-Forwarded-Ssl`      | stripped                             | kept                                                                                           |
-| `X-Forwarded-Scheme`   | stripped                             | kept                                                                                           |
-| `X-Forwarded-Prefix`   | stripped; set to the prefix on `strip_prefix` routes | kept; on `strip_prefix` routes a single plain-path value is prepended (`/outer` + `/api` = `/outer/api`), anything else is replaced |
-
-Apps mounted under a prefix need `strip_prefix = true` plus their own
-setting to honour `X-Forwarded-Prefix`: FastAPI `root_path` (or
-`uvicorn --root-path`), Grafana `server.serve_from_sub_path = true` with a
-`root_url` ending in the prefix, Spring `server.forward-headers-strategy =
-framework` (`ForwardedHeaderFilter`).
-
-Without a known listener port (the deprecated `proxy::handle`, or
-`handle_streaming` called directly) `X-Forwarded-Port` is omitted for
-untrusted peers; it is never derived from `Host`. In `Forwarded`, `for=` is the
-connecting peer, `proto=` this hop's connection scheme and `host=` the client's
-own host (URI authority, else `Host`), also with `rewrite_host = true`.
-Request headers that differ from a trust-governed header only by `_` for `-`
-(e.g. `X_Real_IP`) are removed for every peer.
-
-If `trusted_proxies` is empty and a request arrives from a private, loopback
-or link-local peer, ferryman logs one warning (per process) suggesting
-`trusted_proxies`, in case it sits behind a proxy or load balancer.
-
-ferryman does not add `X-Forwarded-Host` itself; the `Host` header is
-unchanged. Before 0.2.3 clients could forge `X-Real-IP`, `Forwarded` and
-`X-Forwarded-Host`; if ferryman sits behind nginx or a load balancer, add that
-hop's address range to `trusted_proxies`, otherwise its values are replaced or
-stripped.
-
-**Only trust a hop that overwrites or strips `Forwarded` and
-`X-Forwarded-Host`.** AWS ALB and most cloud load balancers pass
-client-supplied values of these through, so downstream apps should not trust
-those headers behind such a load balancer. (`X-Real-IP` is safe either way:
-ferryman derives it itself.)
-
-**Vaultwarden:** upgrade to 0.2.3. ferryman then sets `X-Real-IP` from the TCP
-peer (or, behind a trusted proxy, from `X-Forwarded-For`), so Vaultwarden's
-default `IP_HEADER=X-Real-IP` is correct. On 0.2.2 the only non-spoofable
-setting is `IP_HEADER=none`, which makes all clients share ferryman's IP for
-rate limiting.
-
-## Admin endpoints and metrics
-
-A small admin server binds a separate listener (`--metrics-bind`, default
-`:9090`):
-
-| Path       | Response                                                                 |
-| ---------- | ------------------------------------------------------------------------ |
-| `/metrics` | Prometheus text format.                                                  |
-| `/healthz` | `200 ok` while the process is alive (liveness).                          |
-| `/readyz`  | `200 ok` while serving; `503` once shutdown (SIGTERM/SIGINT) has begun. Not tied to upstream health: a dead upstream never takes ferryman out of rotation. |
-
-Anything else is `404`; methods other than `GET`/`HEAD` are `405`.
-
-Probes: Kubernetes `livenessProbe` -> `/healthz` and `readinessProbe` ->
-`/readyz` on port 9090; ECS/ALB health checks can target 9090 `/healthz` (or
-the proxy port with `local_health_path`). PaaS platforms that only probe the
-serving port (Fly, Render, Railway) should set `local_health_path = "/up"`
-and probe that. Keep the admin port off the public internet.
-
-Metrics surface:
-
-| Metric                              | Labels                                          | Description                                                  |
-| ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------ |
-| `ferryman_requests_total`           | `route`, `upstream`, `status` (`"none"` on 404 and 400 bad path) | Counter of inbound requests.                                 |
-| `ferryman_request_duration_seconds` | `route`, `upstream`                             | Histogram (buckets `le`), time from request start (includes the upload) to upstream response headers. |
-| `ferryman_upstream_alive`           | `upstream`                                      | Gauge: 1 = circuit closed, 0 otherwise (also for `health_disabled` upstreams).                      |
-| `ferryman_circuit_state`            | `upstream`                                      | Gauge: 0 closed / 1 open / 2 half-open.                      |
-
-`route` is the configured prefix and `upstream` is `host:port`, so label
-cardinality is bounded by the config, never by client input.
-
-## Bench targets (per `projects-l3-l4.md` § P2)
-
-Run with [`benches/wrk2.lua`](./benches/wrk2.lua):
-
-```bash
-wrk2 -c 1000 -t 16 -R 50000 -d 60s \
-     -s benches/wrk2.lua \
-     http://localhost:8080/svc-a/echo
-```
-
-| Metric                                  | Target                                 |
-| --------------------------------------- | -------------------------------------- |
-| Throughput                              | 50,000 rps                             |
-| p50 latency                             | < 1 ms                                 |
-| p99 latency                             | < 5 ms                                 |
-| p999 latency                            | < 20 ms                                |
-| RSS at 50k rps idle                     | < 20 MB                                |
-| Failover recovery after upstream `kill` | < 5 s (one health interval)            |
-| CPU vs NGINX on same hardware           | >= 50% reduction (Pingora story: ~70%) |
 
 ## Repository layout
 
@@ -652,13 +169,7 @@ ferryman/
 
 ## Limitations
 
-- Upstreams are plain HTTP only; `https://` upstreams are rejected.
-- No WebSocket / `Upgrade` passthrough (501).
-- No per-upstream load balancing: one route, one upstream.
-- Kubernetes ConfigMap/Secret mounts reload via the `..data` symlink swap, but
-  a `subPath` mount is never updated by the kubelet (restart the pod). Point
-  `--config` at the mount's top-level file, not at `…/..data/config.toml`.
-- The response body has no idle timeout once headers have arrived.
+See [Comparison & migration](https://bunty9.github.io/ferryman/comparison.html#current-limitations).
 
 ## Roadmap
 

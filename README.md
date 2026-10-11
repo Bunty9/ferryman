@@ -175,6 +175,24 @@ Reference examples live under [`examples/`](./examples) (index:
 | [`examples/embedded/src/guarded.rs`](./examples/embedded/src/guarded.rs) | A standalone `ferryman_core::Breaker` guarding a `reqwest` call. |
 | [`crates/core/examples/guarded_client.rs`](./crates/core/examples/guarded_client.rs) | `ferryman-core`'s circuit breaker guarding any fallible async call, no proxy involved. |
 
+### Library use and cargo features
+
+Embedding `ferryman` as a library? Turn off the default features so the CLI's
+dependencies (`clap`, `tracing-subscriber`, ...) are not pulled in:
+
+```toml
+ferryman = { version = "0.3", default-features = false, features = ["reload"] }
+```
+
+| Feature | Default | Adds |
+| --- | --- | --- |
+| `bin` | yes | the `ferryman` binary (`clap`, `tracing-subscriber`, `metrics-util`); implies `admin` and `reload` |
+| `admin` | via `bin` | `ferryman::admin` (admin server; its API takes a `metrics-exporter-prometheus` `PrometheusHandle`) |
+| `reload` | via `bin` | `ferryman::reload` (config/TLS file watcher, uses `notify`) |
+
+Without features you still get `serve`, `proxy` and `tls`. `cargo install`,
+`cargo binstall`, the release archives and the Docker image keep the defaults.
+
 ## Configuration
 
 See [`config.toml`](./config.toml). Unknown keys are rejected, so typos

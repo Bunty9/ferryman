@@ -41,6 +41,8 @@ jobs:
           . "$HOME/.cargo/env"
           cargo test --workspace --locked
           cargo test --doc --workspace --locked
+      - name: Library without default features
+        run: . "$HOME/.cargo/env" && cargo check -p ferryman --no-default-features --locked && cargo test -p ferryman --no-default-features --lib --locked
       - name: Docs
         run: . "$HOME/.cargo/env" && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
       - name: Bench compiles

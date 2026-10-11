@@ -45,6 +45,10 @@ jobs:
       # nextest does not run doctests.
       - name: cargo test --doc
         run: cargo test --doc --workspace --locked
+      - name: library without default features
+        run: |
+          cargo check -p ferryman --no-default-features --locked
+          cargo test -p ferryman --no-default-features --lib --locked
       - name: example crates are not publishable
         run: |
           cargo metadata --no-deps --format-version 1 \

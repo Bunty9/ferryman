@@ -1,12 +1,15 @@
 //! ferryman — hyper-based reverse proxy service: the per-request
 //! handler ([`proxy`]), optional TLS termination ([`tls`]), and the
-//! hot-reload watcher ([`reload`]).
+//! hot-reload watcher (`reload`, feature `reload`), plus the admin server
+//! (`admin`, feature `admin`). The `bin` feature (default) adds the CLI.
 //!
 //! `main.rs` is a thin CLI wrapper around [`serve`] so integration tests can
 //! drive the same accept loop on an ephemeral port.
 
+#[cfg(feature = "admin")]
 pub mod admin;
 pub mod proxy;
+#[cfg(feature = "reload")]
 pub mod reload;
 pub mod tls;
 

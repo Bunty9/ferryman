@@ -1,7 +1,7 @@
 //! Integration tests for the proxy: real sockets, tiny hyper upstream
 //! stubs, and `ferryman::serve` driven end to end.
 
-use ferryman_core::{build_table, load_config, ConfigToml, SharedTable};
+use ferryman_core::{build_table, ConfigToml, SharedTable};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -881,6 +881,7 @@ async fn keepalive_timeout_is_configurable() {
     }
 }
 
+#[cfg(feature = "reload")]
 #[tokio::test]
 async fn hot_reload_picks_up_new_routes_via_rename_replace() {
     let upstream_a = spawn_stub(|_req| async { ok("a") }).await;
@@ -900,7 +901,7 @@ async fn hot_reload_picks_up_new_routes_via_rename_replace() {
     let initial = format!("[[routes]]\nprefix = \"/svc-a\"\nupstream = \"http://{upstream_a}\"\n");
     std::fs::write(&config_path, &initial).unwrap();
 
-    let cfg = load_config(&config_path).unwrap();
+    let cfg = ferryman_core::load_config(&config_path).unwrap();
     let table: SharedTable = Arc::new(arc_swap::ArcSwap::from_pointee(
         build_table(cfg, None).unwrap(),
     ));

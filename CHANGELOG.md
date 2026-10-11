@@ -25,6 +25,17 @@ and `ferryman` are released together with the same version.
   is the normalised one; a remainder that fails `bad_path` answers 400.
   Trusted peers' single plain-path `X-Forwarded-Prefix` is prepended.
 
+### Changed (breaking)
+
+- Cargo features: the new default `bin` feature gates the binary and its
+  dependencies (`clap`, `tracing-subscriber`, `metrics-util`); `ferryman::admin`
+  now needs feature `admin` (`metrics-exporter-prometheus`) and
+  `ferryman::reload` needs feature `reload` (`notify`). Default builds
+  (`cargo install`, binstall, Docker, release archives) are unchanged. Library
+  users with `default-features = false` must enable `admin` and/or `reload`
+  to keep using those modules; without them the library has 150 instead of
+  209 crates in its dependency tree.
+
 ### Security
 
 - Dot segments hidden behind mixed encodings (`/api/%2%65%2%65/x`,

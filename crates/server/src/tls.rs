@@ -87,7 +87,7 @@ impl TlsReloader {
 
 /// Like [`load_acceptor`], but the certificate can later be replaced through
 /// the returned [`TlsReloader`] (pass it to
-/// [`reload::Reloader`](crate::reload::Reloader) for file-watch and SIGHUP
+/// `reload::Reloader` for file-watch and SIGHUP
 /// driven rotation). The acceptor is passed to [`serve`](crate::serve) as usual.
 pub fn load_reloadable(
     cert_path: &Path,

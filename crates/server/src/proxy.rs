@@ -567,12 +567,53 @@ fn join_cookies(headers: &mut HeaderMap) {
 /// `x-forwarded-for` entry that is not a trusted proxy (`:port` suffixes
 /// tolerated; an unparsable entry stops the walk), else the peer.
 /// `x-forwarded-for` always gets the peer appended.
+/// Canonical names of the headers ferryman asserts itself.
+const PROXY_ASSERTED: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
+
+/// Is `name` (lowercase) a non-canonical spelling of a proxy-asserted header?
+/// CGI-style backends (WSGI, Rack, PHP-FPM) fold `_`, `.` and space to `-`, so
+/// every non-alphanumeric byte is read as `-` (runs collapsed, ends trimmed).
+/// Allocation-free for names made only of `[a-z0-9-]`.
+fn is_noncanonical_spelling(name: &str) -> bool {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return false;
+    }
+    let mut folded = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            folded.push(c);
+        } else if !folded.is_empty() && !folded.ends_with('-') {
+            folded.push('-');
+        }
+    }
+    PROXY_ASSERTED.contains(&folded.trim_end_matches('-'))
+}
+
+/// Remove, for every peer, non-canonical spellings of proxy-asserted headers.
+fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
+    let bad: Vec<HeaderName> = headers
+        .keys()
+        .filter(|k| is_noncanonical_spelling(k.as_str()))
+        .cloned()
+        .collect();
+    for k in bad {
+        headers.remove(k);
+    }
+}
+
 fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     peer: IpAddr,
     proto: &'static str,
     trusted: &TrustedProxies,
 ) {
+    strip_noncanonical_spellings(headers);
     let xfp = HeaderName::from_static("x-forwarded-proto");
     let peer_trusted = trusted.contains(peer);
     if peer_trusted {
@@ -825,6 +866,36 @@ mod tests {
         ("x-forwarded-host", "evil.example"),
         ("x-forwarded-proto", "https"),
     ];
+
+    #[test]
+    fn noncanonical_spellings_are_stripped_for_every_peer() {
+        let h = [
+            ("x_real_ip", "6.6.6.6"),
+            ("X_Forwarded_For", "6.6.6.6"),
+            ("x.forwarded.for", "6.6.6.6"),
+            ("x_forwarded-host", "evil.example"),
+            ("x_forwarded_proto", "https"),
+            ("x_forwarded_proto", "http"),
+            ("x__forwarded_for", "6.6.6.6"),
+            ("x_custom", "keep"),
+            ("x.custom", "keep"),
+        ];
+        for trusted in [&[][..], &["10.0.0.0/8"][..]] {
+            let m = run(trusted, "10.1.2.3", "http", &h);
+            for k in [
+                "x_real_ip",
+                "x_forwarded_for",
+                "x.forwarded.for",
+                "x_forwarded-host",
+                "x_forwarded_proto",
+                "x__forwarded_for",
+            ] {
+                assert!(m.get(k).is_none(), "{k} kept (trusted={trusted:?})");
+            }
+            assert_eq!(get(&m, "x_custom"), Some("keep"));
+            assert_eq!(get(&m, "x.custom"), Some("keep"));
+        }
+    }
 
     #[test]
     fn empty_list_is_untrusted_for_everyone() {

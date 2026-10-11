@@ -29,7 +29,7 @@ impl std::io::Write for Buf {
 fn access_lines(buf: &Buf, needle: &str) -> Vec<String> {
     let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     out.lines()
-        .filter(|l| l.contains("ferryman::access") && l.contains(needle))
+        .filter(|l| l.contains("\"target\":\"ferryman::access\"") && l.contains(needle))
         .map(str::to_owned)
         .collect()
 }
@@ -73,11 +73,15 @@ async fn proxy(toml: String) -> SocketAddr {
 }
 
 async fn raw(addr: SocketAddr, req: &str) -> String {
+    raw_bytes(addr, req.as_bytes()).await
+}
+
+async fn raw_bytes(addr: SocketAddr, req: &[u8]) -> String {
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-    s.write_all(req.as_bytes()).await.unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).await.unwrap();
-    out
+    s.write_all(req).await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[tokio::test]
@@ -86,12 +90,12 @@ async fn one_access_line_per_request_request_id_and_traceparent() {
     let w = buf.clone();
     tracing_subscriber::fmt()
         .with_writer(move || w.clone())
-        .with_ansi(false)
+        .json()
         .init();
 
     let up = stub().await;
     let p = proxy(format!(
-        "request_id = true\nfailure_threshold = 1\n\
+        "access_log = true\nrequest_id = true\nfailure_threshold = 1\n\
          [[routes]]\nprefix = \"/api\"\nupstream = \"http://{up}\"\n\
          [[routes]]\nprefix = \"/dead\"\nupstream = \"http://127.0.0.1:1\"\n"
     ))
@@ -117,19 +121,19 @@ async fn one_access_line_per_request_request_id_and_traceparent() {
     assert!(body.contains(&format!("x-request-id: {id}")), "{body}");
     assert!(body.contains("traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"));
     assert!(body.contains("tracestate: vendor=1"));
-    let l = access_lines(&buf, " path=/api/ok ");
+    let l = access_lines(&buf, "\"path\":\"/api/ok\"");
     assert_eq!(l.len(), 1, "{l:?}");
     for want in [
-        "method=GET",
-        "route=\"/api\"",
-        "status=200",
-        &format!("request_id=\"{id}\""),
-        "peer=127.0.0.1",
-        "duration_ms=",
+        "\"method\":\"GET\"",
+        "\"route\":\"/api\"",
+        "\"status\":200",
+        &format!("\"request_id\":\"{id}\""),
+        "\"peer\":\"127.0.0.1\"",
+        "\"duration_ms\":",
     ] {
         assert!(l[0].contains(want), "{want} in {}", l[0]);
     }
-    assert!(l[0].contains(&format!("upstream=\"{up}\"")), "{}", l[0]);
+    assert!(l[0].contains(&format!("\"upstream\":\"{up}\"")), "{}", l[0]);
     assert!(!l[0].contains("hunter2"), "query leaked: {}", l[0]);
 
     // A valid incoming id is kept; an over-long one is replaced.
@@ -158,10 +162,10 @@ async fn one_access_line_per_request_request_id_and_traceparent() {
             .status(),
         404
     );
-    let l = access_lines(&buf, " path=/nope ");
+    let l = access_lines(&buf, "\"path\":\"/nope\"");
     assert_eq!(l.len(), 1, "{l:?}");
     assert!(
-        l[0].contains("status=404") && l[0].contains("route=\"none\""),
+        l[0].contains("\"status\":404") && l[0].contains("\"route\":\"none\""),
         "{}",
         l[0]
     );
@@ -173,10 +177,10 @@ async fn one_access_line_per_request_request_id_and_traceparent() {
     .await;
     assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
     assert!(resp.to_lowercase().contains("x-request-id:"), "{resp}");
-    let l = access_lines(&buf, "status=400");
+    let l = access_lines(&buf, "\"status\":400");
     assert_eq!(l.len(), 1, "{l:?}");
     assert!(
-        l[0].contains("path=/api/%2e%2e/x") && l[0].contains("host=t"),
+        l[0].contains("\"path\":\"/api/%2e%2e/x\"") && l[0].contains("\"host\":\"t\""),
         "{}",
         l[0]
     );
@@ -197,17 +201,80 @@ async fn one_access_line_per_request_request_id_and_traceparent() {
             .status(),
         503
     );
-    let l = access_lines(&buf, " path=/dead/a ");
-    assert!(l.len() == 1 && l[0].contains("status=502"), "{l:?}");
-    let l = access_lines(&buf, " path=/dead/b ");
-    assert!(l.len() == 1 && l[0].contains("status=503"), "{l:?}");
+    let l = access_lines(&buf, "\"path\":\"/dead/a\"");
+    assert!(l.len() == 1 && l[0].contains("\"status\":502"), "{l:?}");
+    let l = access_lines(&buf, "\"path\":\"/dead/b\"");
+    assert!(l.len() == 1 && l[0].contains("\"status\":503"), "{l:?}");
 
-    // Defaults: no request id generated; access_log = false is silent.
-    let q = proxy(format!(
-        "access_log = false\n[[routes]]\nprefix = \"/quiet\"\nupstream = \"http://{up}\"\n"
+    // Duplicate ids are ambiguous: replaced.
+    let resp = raw(
+        p,
+        "GET /api/dup HTTP/1.1\r\nHost: t\r\nx-request-id: a\r\nx-request-id: b\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        !resp.contains("x-request-id: a\r\n") && !resp.contains("x-request-id: b\r\n"),
+        "{resp}"
+    );
+
+    // Bytes that could forge log lines are sanitised.
+    let resp = raw_bytes(
+        p,
+        b"GET /api/ctl HTTP/1.1\r\nHost: ev\xffil\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+    let l = access_lines(&buf, "\"path\":\"/api/ctl\"");
+    assert!(l.len() == 1 && l[0].contains("\"host\":\"ev?il\""), "{l:?}");
+
+    // 504 logs one line.
+    let hang = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_addr = hang.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut keep = Vec::new();
+        loop {
+            keep.push(hang.accept().await.unwrap());
+        }
+    });
+    let t = proxy(format!(
+        "access_log = true\nupstream_timeout_secs = 1\n[[routes]]\nprefix = \"/slow\"\nupstream = \"http://{hang_addr}\"\n"
     ))
     .await;
-    let r = c.get(format!("http://{q}/quiet/z")).send().await.unwrap();
+    assert_eq!(
+        c.get(format!("http://{t}/slow/x"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        504
+    );
+    let l = access_lines(&buf, "\"path\":\"/slow/x\"");
+    assert!(l.len() == 1 && l[0].contains("\"status\":504"), "{l:?}");
+
+    // request_id off: client id reaches upstream untouched but is NOT echoed.
+    let q = proxy(format!(
+        "access_log = true\n[[routes]]\nprefix = \"/q\"\nupstream = \"http://{up}\"\n"
+    ))
+    .await;
+    let r = c
+        .get(format!("http://{q}/q/z"))
+        .header("x-request-id", "client-1")
+        .send()
+        .await
+        .unwrap();
     assert!(r.headers().get("x-request-id").is_none());
+    assert!(r.text().await.unwrap().contains("x-request-id: client-1"));
+    let l = access_lines(&buf, "\"path\":\"/q/z\"");
+    assert!(
+        l.len() == 1 && l[0].contains("\"request_id\":\"client-1\""),
+        "{l:?}"
+    );
+
+    // Default (access_log unset): silent.
+    let n = proxy(format!(
+        "[[routes]]\nprefix = \"/quiet\"\nupstream = \"http://{up}\"\n"
+    ))
+    .await;
+    c.get(format!("http://{n}/quiet/z")).send().await.unwrap();
     assert!(access_lines(&buf, "/quiet/z").is_empty());
 }

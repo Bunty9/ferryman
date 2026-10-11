@@ -321,8 +321,9 @@ const MAX_REQUEST_ID: usize = 128;
 
 /// Log-safe copy: at most `max` bytes, anything but visible ASCII becomes `?`
 /// (no newline/ANSI injection into text logs).
-fn sanitize(s: &str, max: usize) -> String {
-    s.bytes()
+fn sanitize(s: &[u8], max: usize) -> String {
+    s.iter()
+        .copied()
         .take(max)
         .map(|b| {
             if (0x21..=0x7e).contains(&b) {
@@ -344,20 +345,22 @@ fn valid_request_id(v: &HeaderValue) -> bool {
 fn generate_request_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     static N: AtomicU64 = AtomicU64::new(0);
-    let mut out = String::with_capacity(32);
-    for _ in 0..2 {
+    let word = || {
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
         h.write_u64(N.fetch_add(1, Ordering::Relaxed));
-        out.push_str(&format!("{:016x}", h.finish()));
-    }
-    out
+        h.finish()
+    };
+    format!("{:016x}{:016x}", word(), word())
 }
 
 /// Keeps a valid incoming `x-request-id`, else replaces it with a fresh one.
 fn ensure_request_id(headers: &mut HeaderMap) -> String {
     const NAME: HeaderName = HeaderName::from_static("x-request-id");
-    if let Some(v) = headers.get(NAME).filter(|v| valid_request_id(v)) {
-        return String::from_utf8_lossy(v.as_bytes()).into_owned();
+    // More than one header is ambiguous: replace (insert drops them all).
+    if headers.get_all(NAME).iter().count() == 1 {
+        if let Some(v) = headers.get(NAME).filter(|v| valid_request_id(v)) {
+            return String::from_utf8_lossy(v.as_bytes()).into_owned();
+        }
     }
     let id = generate_request_id();
     headers.insert(
@@ -387,7 +390,8 @@ where
     // `.await` points below; `load`'s guard is meant for short critical
     // sections only.
     let table = table.load_full();
-    let request_id = if table.request_id() {
+    let echo_id = table.request_id();
+    let request_id = if echo_id {
         Some(ensure_request_id(req.headers_mut()))
     } else if table.access_log() {
         req.headers()
@@ -399,17 +403,16 @@ where
     };
     let log = table.access_log().then(|| {
         let host = match req.uri().authority() {
-            Some(a) => sanitize(a.as_str(), 255),
+            Some(a) => sanitize(a.as_str().as_bytes(), 255),
             None => req
                 .headers()
                 .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map_or_else(|| "-".to_string(), |h| sanitize(h, 255)),
+                .map_or_else(|| "-".to_string(), |h| sanitize(h.as_bytes(), 255)),
         };
         AccessInfo {
             method: req.method().clone(),
             host,
-            path: sanitize(req.uri().path(), MAX_LOGGED_PATH),
+            path: sanitize(req.uri().path().as_bytes(), MAX_LOGGED_PATH),
             version: req.version(),
             peer: peer.ip(),
             proto,
@@ -417,17 +420,26 @@ where
         }
     });
     // Bounded fields only: never the raw path.
-    let span = tracing::info_span!(
-        "request",
-        method = %req.method(),
-        route = tracing::field::Empty,
-        upstream = tracing::field::Empty,
-    );
+    // Skipped entirely when neither the access log nor request ids are on.
+    let span = if log.is_some() || echo_id {
+        tracing::info_span!(
+            "request",
+            method = %req.method(),
+            route = tracing::field::Empty,
+            upstream = tracing::field::Empty,
+        )
+    } else {
+        tracing::Span::none()
+    };
     let cx = Cx { started, log };
     let Ok(mut resp) = handle_core(table, client, peer, local_port, proto, req, wrap, &cx)
         .instrument(span)
         .await;
-    if let Some(v) = request_id.and_then(|id| HeaderValue::from_str(&id).ok()) {
+    // Only with `request_id = true`; a client-supplied id is never echoed otherwise.
+    if let Some(v) = request_id
+        .filter(|_| echo_id)
+        .and_then(|id| HeaderValue::from_str(&id).ok())
+    {
         resp.headers_mut().entry("x-request-id").or_insert(v);
     }
     Ok(resp)

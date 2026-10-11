@@ -59,9 +59,9 @@ default_cooldown_secs = 30
 # forwarded_header = false
 # xff = "append"
 
-# One `ferryman::access` log line per request (default true; query string is
+# One `ferryman::access` log line per request (default false; query string is
 # never logged) and optional x-request-id generation (default false).
-# access_log = true
+# access_log = false
 # request_id = false
 
 # Shutdown (SIGTERM/SIGINT). /readyz goes 503 immediately; ferryman keeps

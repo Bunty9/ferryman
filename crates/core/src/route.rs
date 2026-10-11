@@ -224,7 +224,7 @@ impl RouteTable {
             forwarded_header: false,
             xff_mode: crate::config::XffMode::default(),
             local_health_path: None,
-            access_log: true,
+            access_log: false,
             request_id: false,
         }
     }
@@ -300,7 +300,7 @@ impl RouteTable {
         self
     }
 
-    /// Emit the per-request access log line (config `access_log`; default true).
+    /// Emit the per-request access log line (config `access_log`; default false).
     pub fn with_access_log(mut self, on: bool) -> Self {
         self.access_log = on;
         self

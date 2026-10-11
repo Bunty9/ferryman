@@ -13,18 +13,12 @@ and `ferryman` are released together with the same version.
   path without query, route, upstream, status, `bytes_out` when
   `Content-Length` is known, `duration_ms` to response headers, request id,
   peer, scheme, version), emitted on every path including early rejections.
-  Each request runs in a `request` span with bounded fields. New top-level
-  `access_log` key (default `true`).
+  Each request runs in a `request` span with bounded fields. Opt-in via the new
+  top-level `access_log` key (default `false`).
 - `--log-format text|json` / `FERRYMAN_LOG_FORMAT` (default `json`, as before).
 - `request_id` key (default `false`): generate/validate `x-request-id`, send it
   upstream and on the response. `traceparent`/`tracestate` pass through
   untouched (documented). `RouteTable::{with_,}access_log`/`request_id`.
-
-### Changed
-
-- The access log is on by default, so log volume rises versus 0.2.x. Migration:
-  set `access_log = false` to restore the old output.
-
 - Per-route `strip_prefix` (default `false`; `RouteToml::strip_prefix`,
   `Route::strip_prefix`, `Route::with_strip_prefix`) removes the matched prefix
   from the path sent upstream and sets `X-Forwarded-Prefix`. The stripped path

@@ -72,18 +72,14 @@ pub struct ConfigToml {
     /// that goes into `X-Real-IP`.
     #[serde(default)]
     pub xff: XffMode,
-    /// Emit one `ferryman::access` log line per request. Default true.
-    #[serde(default = "default_true")]
+    /// Emit one `ferryman::access` log line per request. Default false.
+    #[serde(default)]
     pub access_log: bool,
     /// Generate `x-request-id` when absent (and replace invalid ones), set it
     /// on the upstream request and the response. Default false.
     #[serde(default)]
     pub request_id: bool,
     pub routes: Vec<RouteToml>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// `xff` config key: how the upstream-bound `X-Forwarded-For` is built.
@@ -548,7 +544,7 @@ mod tests {
             shutdown_delay_secs: 0,
             forwarded_header: false,
             xff: XffMode::Append,
-            access_log: true,
+            access_log: false,
             request_id: false,
             routes,
         }
@@ -557,12 +553,12 @@ mod tests {
     #[test]
     fn log_keys_default_and_parse() {
         let t = build_table(cfg(vec![route("/a", "http://h:1")]), None).unwrap();
-        assert!(t.access_log() && !t.request_id());
-        let c: ConfigToml = "access_log = false\nrequest_id = true\n[[routes]]\nprefix = \"/\"\nupstream = \"http://h:1\"\n"
+        assert!(!t.access_log() && !t.request_id());
+        let c: ConfigToml = "access_log = true\nrequest_id = true\n[[routes]]\nprefix = \"/\"\nupstream = \"http://h:1\"\n"
             .parse()
             .unwrap();
         let t = build_table(c, None).unwrap();
-        assert!(!t.access_log() && t.request_id());
+        assert!(t.access_log() && t.request_id());
     }
 
     #[test]

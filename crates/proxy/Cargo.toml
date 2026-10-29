@@ -25,3 +25,8 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 metrics = { workspace = true }
 tracing = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+arc-swap = { workspace = true }
+toml = { workspace = true }

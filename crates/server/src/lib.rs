@@ -30,7 +30,7 @@ use tokio_rustls::TlsAcceptor;
 
 #[allow(deprecated)]
 pub use ferryman_proxy::ProxyClient;
-pub use ferryman_proxy::{StreamingClient, LATENCY_BUCKETS};
+pub use ferryman_proxy::{ConnCtx, Policy, Proxy, StreamingClient, TlsInfo, LATENCY_BUCKETS};
 
 /// Deadline for a client to finish the TLS handshake and to send its first
 /// request. Stops idle sockets from pinning file descriptors (slowloris).
@@ -59,7 +59,8 @@ pub async fn serve(
     tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let client: StreamingClient = ferryman_proxy::client();
+    let proxy = Proxy::new(table.clone(), Policy::default());
+    let local_default = listener.local_addr()?;
     let mut builder = HttpAutoBuilder::new(TokioExecutor::new());
     builder.http1().timer(TokioTimer::new());
     builder
@@ -67,7 +68,6 @@ pub async fn serve(
         .timer(TokioTimer::new())
         .keep_alive_interval(H2_KEEP_ALIVE);
     let graceful = GracefulShutdown::new();
-    let proto = if tls.is_some() { "https" } else { "http" };
     tokio::pin!(shutdown);
 
     loop {
@@ -85,7 +85,9 @@ pub async fn serve(
                 };
                 let _ = stream.set_nodelay(true);
                 let table = table.clone();
-                let client = client.clone();
+                let proxy = proxy.clone();
+                ferryman_proxy::warn_if_private_peer(&table.load(), peer);
+                let local = stream.local_addr().unwrap_or(local_default);
                 let tls = tls.clone();
                 // Read per connection: a hot-reloaded `keepalive_timeout_secs`
                 // applies to new connections only. hyper re-arms this timer
@@ -101,10 +103,14 @@ pub async fn serve(
                 // is bounded so it can't hold the drain open.
                 let watcher = graceful.watcher();
                 tokio::spawn(async move {
+                    let mut conn = ConnCtx::new(peer, local);
                     let stream = match tls {
                         Some(acceptor) => {
                             match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-                                Ok(Ok(s)) => MaybeTlsStream::Tls(Box::new(s)),
+                                Ok(Ok(s)) => {
+                                    conn = conn.with_tls(TlsInfo::from_rustls(s.get_ref().1));
+                                    MaybeTlsStream::Tls(Box::new(s))
+                                }
                                 Ok(Err(e)) => {
                                     tracing::debug!(?peer, ?e, "tls handshake failed");
                                     return;
@@ -120,9 +126,11 @@ pub async fn serve(
                     let io = TokioIo::new(stream);
                     let seen_request = Arc::new(AtomicBool::new(false));
                     let seen = seen_request.clone();
+                    let conn_ctx = Arc::new(conn);
                     let svc = service_fn(move |req| {
                         seen.store(true, Ordering::Relaxed);
-                        proxy::handle_streaming(table.clone(), client.clone(), peer, proto, req)
+                        let (p, c) = (proxy.clone(), conn_ctx.clone());
+                        async move { Ok::<_, std::convert::Infallible>(p.handle(req, &c).await) }
                     });
                     let conn = watcher.watch(builder.serve_connection(io, svc));
                     tokio::pin!(conn);

@@ -435,13 +435,16 @@ dependencies = [
 name = "ferryman-proxy"
 version = "0.3.0"
 dependencies = [
+ "arc-swap",
  "ferryman-core",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "metrics",
+ "rustls",
  "tokio",
+ "toml",
  "tracing",
 ]
 

@@ -25,6 +25,7 @@ use tracing::Instrument;
 #[allow(deprecated)]
 use crate::ProxyClient;
 use crate::StreamingClient;
+use crate::{ConnCtx, TlsInfo};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 
@@ -241,16 +242,76 @@ const HOP_BY_HOP_HEADERS: [HeaderName; 8] = [
     header::UPGRADE,
 ];
 
-/// Handle a single inbound request. Never returns `Err` — every expected
-/// failure (no route, breaker open, timeout, transport error) becomes an
-/// error response instead, per hyper service conventions.
-///
+/// Per-process pipeline handler: routing table, upstream client and policy.
+/// Cheap to clone (`Arc` inside).
+#[derive(Clone)]
+pub struct Proxy {
+    inner: Arc<ProxyInner>,
+}
+
+struct ProxyInner {
+    table: SharedTable,
+    client: StreamingClient,
+    // Fields arrive in step 3; held so `Proxy::new` already takes it.
+    #[allow(dead_code)]
+    policy: Policy,
+}
+
+/// Behaviour knobs for [`Proxy`]. Empty for now; fields are added additively.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Policy {}
+
+impl Proxy {
+    /// Builds its own upstream client (HTTP/1.1, TCP_NODELAY).
+    pub fn new(table: SharedTable, policy: Policy) -> Self {
+        Self::with_client(table, crate::client(), policy)
+    }
+
+    /// Like [`Proxy::new`] with a caller-supplied upstream client (tests,
+    /// embedders).
+    pub fn with_client(table: SharedTable, client: StreamingClient, policy: Policy) -> Self {
+        Self {
+            inner: Arc::new(ProxyInner {
+                table,
+                client,
+                policy,
+            }),
+        }
+    }
+
+    /// Handle a single inbound request. Never fails: every expected failure
+    /// (no route, breaker open, timeout, transport error) becomes an error
+    /// response. `conn` describes the connection the request arrived on; its
+    /// peer address and TLS state drive the forwarding headers.
+    ///
+    /// Streaming semantics: `upstream_timeout_secs` starts once the request
+    /// body is complete, `request_body_idle_timeout_secs` applies between
+    /// body frames, and `request_body_timeout_secs` caps the whole upload.
+    /// The private-peer `trusted_proxies` warning is the caller's job, see
+    /// [`warn_if_private_peer`].
+    pub async fn handle(&self, req: Request<Incoming>, conn: &ConnCtx) -> Response<ResponseBody> {
+        let wrap = |body, idle, total| {
+            let (b, eos) = RequestBody::new(body, idle, total);
+            (b, Some(eos))
+        };
+        let Ok(resp) = handle_inner(
+            self.inner.table.clone(),
+            self.inner.client.clone(),
+            conn,
+            req,
+            wrap,
+        )
+        .await;
+        resp
+    }
+}
+
 /// `proto` is `"http"` or `"https"`, reflecting whether this connection was
 /// TLS-terminated, and is forwarded as `x-forwarded-proto`.
 ///
-/// This is the streaming handler: `upstream_timeout_secs` starts once the
-/// request body is complete, `request_body_idle_timeout_secs` applies between
-/// body frames, and `request_body_timeout_secs` caps the whole upload.
+/// Thin shim over [`Proxy::handle`]: builds a [`ConnCtx`] from its arguments
+/// (the local address is unknown and set to `0.0.0.0:0`).
 pub async fn handle_streaming(
     table: SharedTable,
     client: StreamingClient,
@@ -258,11 +319,20 @@ pub async fn handle_streaming(
     proto: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    let wrap = |body, idle, total| {
-        let (b, eos) = RequestBody::new(body, idle, total);
-        (b, Some(eos))
-    };
-    handle_inner(table, client, peer, proto, req, wrap).await
+    warn_if_private_peer(&table.load(), peer);
+    let conn = shim_ctx(peer, proto);
+    Ok(Proxy::with_client(table, client, Policy::default())
+        .handle(req, &conn)
+        .await)
+}
+
+fn shim_ctx(peer: SocketAddr, proto: &str) -> ConnCtx {
+    let ctx = ConnCtx::new(peer, SocketAddr::from(([0, 0, 0, 0], 0)));
+    if proto == "https" {
+        ctx.with_tls(TlsInfo::default())
+    } else {
+        ctx
+    }
 }
 
 /// The 0.2.2 handler, kept for compatibility: `upstream_timeout_secs` covers
@@ -285,7 +355,11 @@ pub async fn handle(
     proto: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    handle_inner(table, client, peer, proto, req, |b, _, _| (b, None)).await
+    warn_if_private_peer(&table.load(), peer);
+    handle_inner(table, client, &shim_ctx(peer, proto), req, |b, _, _| {
+        (b, None)
+    })
+    .await
 }
 
 /// Per-request state for the access log line (`None` = `access_log = false`).
@@ -363,8 +437,7 @@ fn ensure_request_id(headers: &mut HeaderMap) -> String {
 async fn handle_inner<B>(
     table: SharedTable,
     client: Client<HttpConnector, B>,
-    peer: SocketAddr,
-    proto: &'static str,
+    conn: &ConnCtx,
     mut req: Request<Incoming>,
     wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
 ) -> Result<Response<ResponseBody>, Infallible>
@@ -372,6 +445,7 @@ where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let (peer, proto) = (conn.peer, conn.proto());
     let started = Instant::now();
     // `load_full` (not `load`) because the returned `Arc` is held across
     // `.await` points below; `load`'s guard is meant for short critical
@@ -410,6 +484,7 @@ where
     // Skipped entirely when neither the access log nor request ids are on.
     let span = if log.is_some() || echo_id {
         tracing::info_span!(
+            target: "ferryman::proxy",
             "request",
             method = %req.method(),
             route = tracing::field::Empty,
@@ -419,7 +494,7 @@ where
         tracing::Span::none()
     };
     let cx = Cx { started, log };
-    let Ok(mut resp) = handle_core(table, client, peer, proto, req, wrap, &cx)
+    let Ok(mut resp) = handle_core(table, client, conn, req, wrap, &cx)
         .instrument(span)
         .await;
     // Only with `request_id = true`; a client-supplied id is never echoed otherwise.
@@ -439,8 +514,7 @@ where
 async fn handle_core<B>(
     table: Arc<RouteTable>,
     client: Client<HttpConnector, B>,
-    peer: SocketAddr,
-    proto: &'static str,
+    conn: &ConnCtx,
     req: Request<Incoming>,
     wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
     cx: &Cx,
@@ -449,6 +523,7 @@ where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let (peer, proto) = (conn.peer, conn.proto());
     // Answered before bad_path/lookup: no upstream, no breaker. Exact match
     // on the raw path. Metric label is the fixed "local_health".
     if table.local_health_path() == Some(req.uri().path())
@@ -612,9 +687,6 @@ where
     // what the inbound connection negotiated; an inbound HTTP/2 request
     // otherwise fails the client outright.
     parts.version = http::Version::HTTP_11;
-    if table.trusted_proxies().is_empty() && is_private_peer(peer.ip()) {
-        warn_private_peer_once();
-    }
     apply_forwarded_headers(
         &mut parts.headers,
         peer.ip(),
@@ -691,7 +763,7 @@ where
         Some(Err(e)) if is_body_idle_timeout(&e) => {
             // The client stalled or over-ran its upload: 408, no breaker effect.
             upstream.release(admission);
-            tracing::debug!("client request body idle timeout");
+            tracing::debug!(target: "ferryman::proxy", "client request body idle timeout");
             record(cx, &route_label, &upstream.name, 408);
             Ok(error_response(
                 StatusCode::REQUEST_TIMEOUT,
@@ -702,7 +774,7 @@ where
             // The client's request body failed (e.g. it hung up mid-upload).
             // Not the upstream's fault, so the breaker stays out of it.
             upstream.release(admission);
-            tracing::debug!(error = %e, "client request body failed");
+            tracing::debug!(target: "ferryman::proxy", error = %e, "client request body failed");
             record(cx, &route_label, &upstream.name, 400);
             Ok(error_response(
                 StatusCode::BAD_REQUEST,
@@ -715,7 +787,7 @@ where
             } else {
                 upstream.record_failure(admission);
             }
-            tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
+            tracing::warn!(target: "ferryman::proxy", upstream = %upstream.name, error = %e, "upstream request failed");
             record(cx, &route_label, &upstream.name, 502);
             Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
         }
@@ -877,12 +949,20 @@ fn is_private_peer(ip: IpAddr) -> bool {
     }
 }
 
-/// One warning per process: with no `trusted_proxies`, a private-range peer
-/// is probably a proxy/LB whose forwarding headers are being discarded.
+/// Call once per connection (or request): with no `trusted_proxies`, a
+/// private-range peer is probably a proxy/LB whose forwarding headers are
+/// being discarded; logs one warning per process.
+pub fn warn_if_private_peer(table: &RouteTable, peer: SocketAddr) {
+    if table.trusted_proxies().is_empty() && is_private_peer(peer.ip()) {
+        warn_private_peer_once();
+    }
+}
+
 fn warn_private_peer_once() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
+            target: "ferryman::proxy",
             "request from a private/loopback peer while trusted_proxies is empty: if ferryman \
              sits behind a proxy or load balancer, add its address range to trusted_proxies, \
              otherwise client IP and scheme headers it sends are ignored"

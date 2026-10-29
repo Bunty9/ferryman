@@ -3,7 +3,11 @@
 //! public paths (`ferryman::proxy`, `ferryman::StreamingClient`, ...) are
 //! unchanged.
 
+pub mod conn;
 pub mod pipeline;
+
+pub use conn::{ConnCtx, TlsInfo};
+pub use pipeline::{warn_if_private_peer, Policy, Proxy};
 
 use hyper::body::Incoming;
 use hyper_util::client::legacy::connect::HttpConnector;

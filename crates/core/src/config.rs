@@ -8,6 +8,7 @@
 use crate::error::Error;
 use crate::proxies::TrustedProxies;
 use crate::route::{Route, RouteTable, Upstream};
+use crate::upstream_set::{Endpoint, LbPolicy, UpstreamSet, MAX_WEIGHT};
 use crate::BreakerConfig;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -133,8 +134,24 @@ const MAX_SECS: u64 = 86_400;
 pub struct RouteToml {
     /// Path prefix to match (e.g. `/svc-a`).
     pub prefix: String,
-    /// Upstream URI, e.g. `http://localhost:8001`.
-    pub upstream: String,
+    /// Limit the route to a request host: `a.example.com` or `*.example.com`
+    /// (one or more leading labels, never `example.com` itself). Lowercase
+    /// ASCII (IDN as `xn--` punycode), no port, no trailing dot, not an IP.
+    /// Without it the route is in the default (hostless) set. Matching:
+    /// [`RouteTable::lookup_host`].
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Upstream URI, e.g. `http://localhost:8001`: one endpoint. Exactly
+    /// one of `upstream` / `upstreams` must be set.
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// Several endpoints: bare URI strings or `{ addr, weight }` tables.
+    /// Non-empty, no duplicate endpoint.
+    #[serde(default)]
+    pub upstreams: Option<Vec<UpstreamToml>>,
+    /// How `upstreams` are picked (default `round_robin`).
+    #[serde(default)]
+    pub lb: LbPolicy,
     /// Per-route circuit-breaker cooldown override.
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
@@ -156,6 +173,26 @@ pub struct RouteToml {
     /// then the normalised one.
     #[serde(default)]
     pub strip_prefix: bool,
+}
+
+/// One entry of `upstreams`: `"http://a:1"` or `{ addr = "http://a:1", weight = 3 }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum UpstreamToml {
+    Addr(String),
+    Detailed(UpstreamDetail),
+}
+
+/// The table form of an [`UpstreamToml`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct UpstreamDetail {
+    pub addr: String,
+    /// `1..=1000`, default 1. Used by `round_robin` and `p2c`.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// Read and parse the TOML config at `path`. Shared by the server's initial
@@ -205,6 +242,115 @@ impl ConfigToml {
             .try_into()
             .map_err(|source| Error::Toml { path: None, source })
     }
+}
+
+/// Parse and check one upstream URI of route `route`.
+/// A route `host`: lowercase ASCII DNS name, or `*.` + one. Not an IP, so a
+/// request with an IP `Host` can only reach hostless routes.
+fn validate_host(route: &str, host: &str) -> Result<(), Error> {
+    let bad = |reason: &str| Error::InvalidHost {
+        route: route.to_string(),
+        host: host.to_string(),
+        reason: reason.to_string(),
+    };
+    if !host.is_ascii() {
+        return Err(bad("must be ASCII (write an IDN as xn-- punycode)"));
+    }
+    if host.bytes().any(|c| c.is_ascii_uppercase()) {
+        return Err(bad("must be lowercase"));
+    }
+    if host.ends_with('.') {
+        return Err(bad("must not end with '.'"));
+    }
+    let name = host.strip_prefix("*.").unwrap_or(host);
+    if name.len() > 253 {
+        return Err(bad("longer than 253 bytes"));
+    }
+    if name.is_empty() {
+        return Err(bad("empty"));
+    }
+    if name.contains('*') {
+        return Err(bad(
+            "'*' is only allowed as the whole first label (\"*.example.com\")",
+        ));
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    for l in &labels {
+        let ok = (1..=63).contains(&l.len())
+            && l.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-');
+        if !ok {
+            return Err(bad(
+                "labels must be 1-63 characters of [a-z0-9-], not starting or ending with '-' (no port, no IPv6)",
+            ));
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|l| l.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return Err(bad(
+            "IP addresses are not allowed; host routes are for DNS names",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_endpoint(route: &str, addr: &str) -> Result<http::Uri, Error> {
+    let bad = |reason: String, source| Error::InvalidUpstream {
+        route: route.to_string(),
+        upstream: addr.to_string(),
+        reason,
+        source,
+    };
+    let uri: http::Uri = addr
+        .parse()
+        .map_err(|e| bad(format!("invalid upstream URI {addr:?}"), Some(e)))?;
+
+    match uri.scheme_str() {
+        Some("http") => {}
+        Some(other) => {
+            return Err(bad(
+                format!(
+                    "upstream {addr:?} has scheme {other:?} — https upstreams are not supported"
+                ),
+                None,
+            ))
+        }
+        None => {
+            return Err(bad(
+                format!("upstream {addr:?} has no scheme (expected e.g. http://host:port)"),
+                None,
+            ))
+        }
+    }
+    // Also catches an empty IPv6 literal (`http://[]:80`).
+    if uri
+        .host()
+        .is_none_or(|h| h.trim_matches(['[', ']']).is_empty())
+    {
+        return Err(bad(format!("upstream {addr:?} has no host"), None));
+    }
+    if let Some(pq) = uri.path_and_query() {
+        if pq.query().is_some() {
+            return Err(bad(
+                format!("upstream {addr:?} must not include a query string"),
+                None,
+            ));
+        }
+        if !pq.path().is_empty() && pq.path() != "/" {
+            return Err(bad(
+                format!(
+                    "upstream {addr:?} must not include a path (got {:?})",
+                    pq.path()
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(uri)
 }
 
 /// Build a [`RouteTable`] from a parsed [`ConfigToml`], validating routes
@@ -327,69 +473,61 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 normal: "prefixes may not contain ';', '\\', %2F or %5C (such requests are rejected as ambiguous)".to_string(),
             });
         }
-        if !seen_prefixes.insert(r.prefix.clone()) {
-            return Err(Error::DuplicatePrefix { prefix: r.prefix });
+        if let Some(h) = &r.host {
+            validate_host(&r.prefix, h)?;
+        }
+        if !seen_prefixes.insert((r.host.clone(), r.prefix.clone())) {
+            return Err(match r.host {
+                Some(host) => Error::DuplicateHostPrefix {
+                    host,
+                    prefix: r.prefix,
+                },
+                None => Error::DuplicatePrefix { prefix: r.prefix },
+            });
         }
 
-        let bad = |reason: String, source| Error::InvalidUpstream {
+        let bad_set = |reason: String| Error::InvalidUpstreamSet {
             route: r.prefix.clone(),
-            upstream: r.upstream.clone(),
             reason,
-            source,
         };
-        let uri: http::Uri = r
-            .upstream
-            .parse()
-            .map_err(|e| bad(format!("invalid upstream URI {:?}", r.upstream), Some(e)))?;
-
-        match uri.scheme_str() {
-            Some("http") => {}
-            Some(other) => {
-                return Err(bad(
-                    format!(
-                        "upstream {:?} has scheme {:?} — https upstreams are not supported",
-                        r.upstream, other
-                    ),
-                    None,
-                ))
+        let entries: Vec<(String, u32)> = match (r.upstream, r.upstreams) {
+            (Some(_), Some(_)) => {
+                return Err(bad_set("set either upstream or upstreams, not both".into()))
             }
-            None => {
-                return Err(bad(
-                    format!(
-                        "upstream {:?} has no scheme (expected e.g. http://host:port)",
-                        r.upstream
-                    ),
-                    None,
-                ))
+            (None, None) => return Err(bad_set("one of upstream or upstreams is required".into())),
+            (Some(a), None) => vec![(a, 1)],
+            (None, Some(list)) if list.is_empty() => {
+                return Err(bad_set("upstreams must not be empty".into()))
             }
-        }
-        // Also catches an empty IPv6 literal (`http://[]:80`).
-        if uri
-            .host()
-            .is_none_or(|h| h.trim_matches(['[', ']']).is_empty())
-        {
-            return Err(bad(format!("upstream {:?} has no host", r.upstream), None));
-        }
-        if let Some(pq) = uri.path_and_query() {
-            if pq.query().is_some() {
-                return Err(bad(
-                    format!("upstream {:?} must not include a query string", r.upstream),
-                    None,
-                ));
+            (None, Some(list)) => list
+                .into_iter()
+                .map(|e| match e {
+                    UpstreamToml::Addr(a) => (a, 1),
+                    UpstreamToml::Detailed(d) => (d.addr, d.weight.unwrap_or(1)),
+                })
+                .collect(),
+        };
+        let mut endpoints = Vec::with_capacity(entries.len());
+        let mut names_in_route = HashSet::new();
+        for (addr, weight) in entries {
+            if !(1..=MAX_WEIGHT).contains(&weight) {
+                return Err(bad_set(format!(
+                    "weight of {addr:?} must be 1..={MAX_WEIGHT}, got {weight}"
+                )));
             }
-            if !pq.path().is_empty() && pq.path() != "/" {
-                return Err(bad(
-                    format!(
-                        "upstream {:?} must not include a path (got {:?})",
-                        r.upstream,
-                        pq.path()
-                    ),
-                    None,
-                ));
+            if r.lb == LbPolicy::LeastConn && weight != 1 {
+                return Err(bad_set(format!(
+                    "weight of {addr:?} must be 1 under lb = \"least_conn\" (weights are ignored there), got {weight}"
+                )));
             }
+            let uri = parse_endpoint(&r.prefix, &addr)?;
+            let name = crate::route::upstream_name(&uri);
+            if !names_in_route.insert(name.clone()) {
+                return Err(bad_set(format!("duplicate endpoint {name}")));
+            }
+            endpoints.push((uri, name, weight));
         }
 
-        let name = crate::route::upstream_name(&uri);
         let cooldown = r
             .cooldown_secs
             .map(Duration::from_secs)
@@ -411,22 +549,6 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
         let breaker = BreakerConfig::default()
             .with_cooldown(cooldown)
             .with_failure_threshold(cfg.failure_threshold);
-        breaker.validate().map_err(|e| match e {
-            Error::InvalidBreakerConfig { reason, .. } => Error::InvalidBreakerConfig {
-                reason,
-                upstream: Some(name.clone()),
-            },
-            e => e,
-        })?;
-        let first = *cooldown_by_name.entry(name.clone()).or_insert(cooldown);
-        if first != cooldown {
-            return Err(Error::ConflictingCooldown {
-                route: r.prefix,
-                upstream: name,
-                cooldown_secs: cooldown.as_secs(),
-                other_secs: first.as_secs(),
-            });
-        }
         if let Some(p) = &r.health_path {
             if !(p.starts_with('/')
                 && !p.contains(['?', '#'])
@@ -442,29 +564,49 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
             r.health_path.unwrap_or_else(|| "/health".to_string()),
             r.health_disabled,
         );
-        let first = health_by_name
-            .entry(name.clone())
-            .or_insert_with(|| health.clone());
-        let conflict = if first.0 != health.0 {
-            Some(("health_path", health.0.clone(), first.0.clone()))
-        } else if first.1 != health.1 {
-            Some(("health_disabled", health.1.to_string(), first.1.to_string()))
-        } else {
-            None
-        };
-        if let Some((setting, value, other)) = conflict {
-            return Err(Error::ConflictingHealth {
-                route: r.prefix,
-                upstream: name,
-                setting,
-                value,
-                other,
-            });
+        // The agreement rules apply per endpoint (= per breaker).
+        for (_, name, _) in &endpoints {
+            breaker.validate().map_err(|e| match e {
+                Error::InvalidBreakerConfig { reason, .. } => Error::InvalidBreakerConfig {
+                    reason,
+                    upstream: Some(name.clone()),
+                },
+                e => e,
+            })?;
+            let first = *cooldown_by_name.entry(name.clone()).or_insert(cooldown);
+            if first != cooldown {
+                return Err(Error::ConflictingCooldown {
+                    route: r.prefix,
+                    upstream: name.clone(),
+                    cooldown_secs: cooldown.as_secs(),
+                    other_secs: first.as_secs(),
+                });
+            }
+            let first = health_by_name
+                .entry(name.clone())
+                .or_insert_with(|| health.clone());
+            let conflict = if first.0 != health.0 {
+                Some(("health_path", health.0.clone(), first.0.clone()))
+            } else if first.1 != health.1 {
+                Some(("health_disabled", health.1.to_string(), first.1.to_string()))
+            } else {
+                None
+            };
+            if let Some((setting, value, other)) = conflict {
+                return Err(Error::ConflictingHealth {
+                    route: r.prefix,
+                    upstream: name.clone(),
+                    setting,
+                    value,
+                    other,
+                });
+            }
         }
         validated.push((
             r.prefix,
-            uri,
-            name,
+            r.host,
+            endpoints,
+            r.lb,
             cooldown,
             breaker,
             health,
@@ -476,38 +618,46 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
     let mut routes = Vec::with_capacity(validated.len());
     for (
         prefix,
-        uri,
-        name,
+        host,
+        endpoints,
+        lb,
         cooldown,
         breaker,
         (health_path, health_disabled),
         (rewrite_host, strip_prefix),
     ) in validated
     {
-        let upstream = match upstreams_by_name.get(&name) {
-            Some(u) => u.clone(),
-            None => {
-                let health_path = Some(health_path);
-                let u = match prev_by_name.get(name.as_str()) {
-                    // Breaker (and its state) is kept; health settings are
-                    // simply replaced on the new table's Upstream.
-                    Some(prev_u) => prev_u.reuse(
-                        cooldown,
-                        cfg.failure_threshold,
-                        health_path,
-                        health_disabled,
-                    ),
-                    None => Upstream::new(uri, breaker)?.with_health(health_path, health_disabled),
-                };
-                upstreams_by_name.insert(name, u.clone());
-                u
-            }
-        };
-        routes.push(
-            Route::new(prefix, upstream)
+        let mut eps = Vec::with_capacity(endpoints.len());
+        for (uri, name, weight) in endpoints {
+            let upstream = match upstreams_by_name.get(&name) {
+                Some(u) => u.clone(),
+                None => {
+                    let health_path = Some(health_path.clone());
+                    let u = match prev_by_name.get(name.as_str()) {
+                        // Breaker (and its state) is kept; health settings are
+                        // simply replaced on the new table's Upstream.
+                        Some(prev_u) => prev_u.reuse(
+                            cooldown,
+                            cfg.failure_threshold,
+                            health_path,
+                            health_disabled,
+                        ),
+                        None => Upstream::new(uri, breaker.clone())
+                            .expect("validated above")
+                            .with_health(health_path, health_disabled),
+                    };
+                    upstreams_by_name.insert(name, u.clone());
+                    u
+                }
+            };
+            eps.push(Endpoint::new(upstream, weight));
+        }
+        let mut route =
+            Route::with_upstreams(prefix, UpstreamSet::new(eps, lb).expect("validated above"))
                 .with_rewrite_host(rewrite_host)
-                .with_strip_prefix(strip_prefix),
-        );
+                .with_strip_prefix(strip_prefix);
+        route.host = host;
+        routes.push(route);
     }
 
     Ok(RouteTable::new(routes, upstream_timeout)
@@ -576,7 +726,10 @@ mod tests {
     fn route(prefix: &str, upstream: &str) -> RouteToml {
         RouteToml {
             prefix: prefix.to_string(),
-            upstream: upstream.to_string(),
+            host: None,
+            upstream: Some(upstream.to_string()),
+            upstreams: None,
+            lb: LbPolicy::default(),
             cooldown_secs: None,
             health_path: None,
             health_disabled: false,
@@ -782,6 +935,134 @@ mod tests {
         assert_eq!(t.upstreams().count(), 1);
     }
 
+    fn build(routes: &str) -> Result<RouteTable, Error> {
+        build_table(routes.parse()?, None)
+    }
+
+    #[test]
+    fn upstreams_list_forms_and_lb_parse() {
+        let t = build(
+            r#"[[routes]]
+prefix = "/a"
+lb = "p2c"
+upstreams = ["http://h:1", { addr = "http://h:2", weight = 3 }]
+[[routes]]
+prefix = "/b"
+upstream = "http://h:1"
+"#,
+        )
+        .unwrap();
+        let a = t.lookup("/a").unwrap();
+        assert_eq!(a.upstreams.policy(), LbPolicy::P2c);
+        let w: Vec<_> = a.upstreams.endpoints().iter().map(|e| e.weight).collect();
+        assert_eq!(w, [1, 3]);
+        assert_eq!(
+            t.lookup("/b").unwrap().upstreams.policy(),
+            LbPolicy::RoundRobin
+        );
+        // h:1 shared by both routes, h:2 only in /a.
+        assert_eq!(t.upstreams().count(), 2);
+        // Shared endpoint = shared breaker.
+        for _ in 0..3 {
+            t.lookup("/b")
+                .unwrap()
+                .upstream()
+                .record_failure(Admission::Normal);
+        }
+        assert_eq!(
+            a.upstreams.endpoints()[0].upstream.state(),
+            CircuitState::Open
+        );
+        assert_eq!(
+            a.upstreams.endpoints()[1].upstream.state(),
+            CircuitState::Closed
+        );
+    }
+
+    #[test]
+    fn upstream_set_validation_errors() {
+        let bad = |body: &str| build(&format!("[[routes]]\nprefix = \"/a\"\n{body}\n"));
+        for body in [
+            "",
+            "upstream = \"http://h:1\"\nupstreams = [\"http://h:2\"]",
+            "upstreams = []",
+            "upstreams = [\"http://h:1\", \"http://H:1\"]",
+            "upstreams = [{ addr = \"http://h:1\", weight = 0 }]",
+            "upstreams = [{ addr = \"http://h:1\", weight = 1001 }]",
+            "lb = \"least_conn\"\nupstreams = [\"http://h:1\", { addr = \"http://h:2\", weight = 2 }]",
+        ] {
+            assert!(
+                matches!(bad(body), Err(Error::InvalidUpstreamSet { .. })),
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            bad("upstreams = [\"http://h:1\", \"https://h:2\"]"),
+            Err(Error::InvalidUpstream { .. })
+        ));
+        assert!(matches!(
+            bad("lb = \"random\"\nupstream = \"http://h:1\""),
+            Err(Error::Toml { .. })
+        ));
+        assert!(matches!(
+            bad("upstreams = [{ addr = \"http://h:1\", wieght = 2 }]"),
+            Err(Error::Toml { .. })
+        ));
+    }
+
+    #[test]
+    fn agreement_rules_apply_per_endpoint() {
+        let r = build(
+            r#"[[routes]]
+prefix = "/a"
+upstreams = ["http://h:1", "http://h:2"]
+cooldown_secs = 5
+[[routes]]
+prefix = "/b"
+upstream = "http://h:2"
+cooldown_secs = 9
+"#,
+        );
+        assert!(matches!(r, Err(Error::ConflictingCooldown { .. })));
+        let r = build(
+            r#"[[routes]]
+prefix = "/a"
+upstreams = ["http://h:1", "http://h:2"]
+[[routes]]
+prefix = "/b"
+upstream = "http://h:2"
+health_disabled = true
+"#,
+        );
+        assert!(matches!(r, Err(Error::ConflictingHealth { .. })));
+    }
+
+    #[test]
+    fn reload_keeps_breaker_per_endpoint_and_resets_cursor() {
+        let one = "[[routes]]\nprefix = \"/a\"\nupstreams = [\"http://h:1\", \"http://h:2\"]\n";
+        let old = build_table(one.parse().unwrap(), None).unwrap();
+        let eps = old.lookup("/a").unwrap().upstreams.endpoints();
+        for _ in 0..3 {
+            eps[1].upstream.record_failure(Admission::Normal);
+        }
+        // New table drops h:1, keeps h:2, adds h:3.
+        let new = build_table(
+            "[[routes]]\nprefix = \"/a\"\nupstreams = [\"http://h:2\", \"http://h:3\"]\n"
+                .parse()
+                .unwrap(),
+            Some(&old),
+        )
+        .unwrap();
+        let n = new.lookup("/a").unwrap().upstreams.endpoints();
+        assert_eq!(n[0].upstream.state(), CircuitState::Open, "h:2 state kept");
+        assert_eq!(n[1].upstream.state(), CircuitState::Closed);
+        eps[1].upstream.record_success(Admission::Probe);
+        assert_eq!(n[0].upstream.state(), CircuitState::Closed, "same breaker");
+        // A bad reload leaves prev breakers alone.
+        let bad = "[[routes]]\nprefix = \"/a\"\nupstreams = [\"http://h:2\", \"http://h:2\"]\n";
+        assert!(build_table(bad.parse().unwrap(), Some(&new)).is_err());
+    }
+
     fn parse(extra: &str) -> Result<RouteTable, Error> {
         let raw = format!("{extra}\n[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n");
         build_table(toml::from_str(&raw).unwrap(), None)
@@ -882,13 +1163,13 @@ mod tests {
     #[test]
     fn health_keys_default_and_parse() {
         let t = parse("").unwrap();
-        let u = t.lookup("/a").unwrap().upstream.clone();
+        let u = t.lookup("/a").unwrap().upstream().clone();
         assert_eq!((u.health_path(), u.health_disabled()), ("/health", false));
 
         let raw = "[[routes]]\nprefix = \"/a\"\nupstream = \"http://h:1\"\n\
                    health_path = \"/ready\"\nhealth_disabled = true\n";
         let t = build_table(toml::from_str(raw).unwrap(), None).unwrap();
-        let u = &t.lookup("/a").unwrap().upstream;
+        let u = &t.lookup("/a").unwrap().upstream();
         assert_eq!((u.health_path(), u.health_disabled()), ("/ready", true));
     }
 
@@ -959,5 +1240,155 @@ mod tests {
         assert_eq!((up.health_path(), up.health_disabled()), ("/health", false));
         up.record_success(Admission::Probe);
         assert_eq!(new_up.state(), CircuitState::Closed);
+    }
+
+    fn hroute(host: &str, prefix: &str, upstream: &str) -> RouteToml {
+        RouteToml {
+            host: Some(host.to_string()),
+            ..route(prefix, upstream)
+        }
+    }
+
+    #[test]
+    fn host_validation() {
+        for bad in [
+            "Example.com",
+            "bücher.example",
+            "exa mple.com",
+            "example.com.",
+            "example.com:8080",
+            "*.example.com.",
+            "*",
+            "*.",
+            "a.*.example.com",
+            "*a.example.com",
+            "**.example.com",
+            "*.*.example.com",
+            "-a.example.com",
+            "a-.example.com",
+            "a..example.com",
+            ".example.com",
+            "",
+            "1.2.3.4",
+            "[::1]",
+            "*.4",
+            &format!("{}.com", "a".repeat(64)),
+            &format!("{}.com", vec!["a".repeat(60); 5].join(".")),
+        ] {
+            let r = build_table(cfg(vec![hroute(bad, "/", "http://h:1")]), None);
+            assert!(matches!(r, Err(Error::InvalidHost { .. })), "{bad:?}");
+        }
+        for ok in [
+            "example.com",
+            "a.example.com",
+            "*.example.com",
+            "xn--bcher-kva.example",
+            "localhost",
+            "a-b.c1.example",
+            &format!("{}.com", "a".repeat(63)),
+        ] {
+            build_table(cfg(vec![hroute(ok, "/", "http://h:1")]), None)
+                .unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn duplicate_host_prefix_is_rejected_but_same_prefix_across_hosts_is_not() {
+        let r = build_table(
+            cfg(vec![
+                hroute("a.example.com", "/", "http://h:1"),
+                hroute("a.example.com", "/", "http://h:2"),
+            ]),
+            None,
+        );
+        assert!(matches!(r, Err(Error::DuplicateHostPrefix { .. })));
+        build_table(
+            cfg(vec![
+                route("/", "http://h:1"),
+                hroute("a.example.com", "/", "http://h:2"),
+                hroute("*.example.com", "/", "http://h:3"),
+                hroute("b.example.com", "/", "http://h:4"),
+            ]),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn host_matching_precedence() {
+        let t = build_table(
+            cfg(vec![
+                route("/", "http://h:1"),
+                route("/only-default", "http://h:9"),
+                hroute("a.example.com", "/", "http://h:2"),
+                hroute("a.example.com", "/api", "http://h:3"),
+                hroute("*.example.com", "/", "http://h:4"),
+                hroute("*.b.example.com", "/", "http://h:5"),
+                hroute("only.example.com", "/x", "http://h:6"),
+            ]),
+            None,
+        )
+        .unwrap();
+        let up = |h: Option<&str>, p: &str| {
+            t.lookup_host(h, p)
+                .map(|r| r.upstream().uri.port_u16().unwrap())
+        };
+        // exact > wildcard > hostless; longest prefix inside the group
+        assert_eq!(up(Some("a.example.com"), "/api/x"), Some(3));
+        assert_eq!(up(Some("a.example.com"), "/other"), Some(2));
+        // case, port, ONE trailing dot
+        assert_eq!(up(Some("A.Example.COM:8443"), "/"), Some(2));
+        assert_eq!(up(Some("a.example.com."), "/"), Some(2));
+        assert_eq!(up(Some("a.example.com.."), "/"), Some(1));
+        // wildcard: longest suffix, multi-label, never the apex
+        assert_eq!(up(Some("z.example.com"), "/"), Some(4));
+        assert_eq!(up(Some("x.y.example.com"), "/"), Some(4));
+        assert_eq!(up(Some("x.b.example.com"), "/"), Some(5));
+        assert_eq!(up(Some("b.example.com"), "/"), Some(4));
+        assert_eq!(up(Some("example.com"), "/"), Some(1));
+        assert_eq!(up(Some("..example.com"), "/"), Some(1));
+        assert_eq!(up(Some("evilexample.com"), "/"), Some(1));
+        // unknown host, none, IPs, empty: hostless only
+        for h in [
+            Some("other.org"),
+            None,
+            Some(""),
+            Some("1.2.3.4:80"),
+            Some("[::1]:80"),
+        ] {
+            assert_eq!(up(h, "/only-default"), Some(9), "{h:?}");
+        }
+        // chosen group without a matching prefix: no fallback (404)
+        assert_eq!(up(Some("only.example.com"), "/other"), None);
+        assert_eq!(up(Some("only.example.com"), "/only-default"), None);
+        assert_eq!(up(Some("only.example.com"), "/x/y"), Some(6));
+        // exact group present but unmatched does not fall to the wildcard
+        assert_eq!(up(Some("a.example.com"), "/only-default"), Some(2));
+        // lookup(path) is hostless-only
+        assert_eq!(t.lookup("/").unwrap().host, None);
+        assert_eq!(
+            t.lookup_host(Some("a.example.com"), "/api")
+                .unwrap()
+                .label(),
+            "a.example.com/api"
+        );
+        assert_eq!(t.lookup("/only-default").unwrap().label(), "/only-default");
+    }
+
+    #[test]
+    fn ambiguity_check_uses_the_requests_host_group() {
+        // `/a%2Fb` flattens to `/a/b`: only host x has a route that tells them apart.
+        let t = build_table(
+            cfg(vec![
+                route("/", "http://h:1"),
+                hroute("x.example.com", "/a/b", "http://h:2"),
+            ]),
+            None,
+        )
+        .unwrap();
+        use crate::path::ambiguous_route_host as amb;
+        assert!(!amb(&t, None, "/a%2Fb"));
+        assert!(amb(&t, Some("x.example.com"), "/a%2Fb"));
+        assert!(!amb(&t, Some("y.example.com"), "/a%2Fb"));
     }
 }

@@ -28,9 +28,11 @@ let cfg: ConfigToml = toml::from_str(r#"
 let table = build_table(cfg, None)?;
 
 let route = table.lookup("/svc-a/users").expect("route");
-if let Some(ticket) = route.upstream.try_acquire() {
+// `route.upstream()` is the single-endpoint shortcut; `acquire` also
+// load-balances across `upstreams = [...]`.
+if let Some((up, admission)) = route.upstreams.acquire() {
     // ... forward the request, then report the outcome:
-    route.upstream.record_success(ticket);
+    up.record_success(admission);
 } else {
     // circuit open: answer 503
 }

@@ -8,16 +8,18 @@
 
 #[cfg(feature = "admin")]
 pub mod admin;
-pub mod proxy;
 #[cfg(feature = "reload")]
 pub mod reload;
 pub mod tls;
 
+/// The per-request handler (re-exported from `ferryman-proxy`).
+pub use ferryman_proxy::pipeline as proxy;
+
+/// The request pipeline crate, re-exported so embedders can name it (`Proxy`, `Policy`, `ConnCtx`).
+pub use ferryman_proxy;
+
 use ferryman_core::SharedTable;
-use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as HttpAutoBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -29,26 +31,11 @@ use tls::MaybeTlsStream;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// The 0.2.2 client type, kept for compatibility with [`proxy::handle`].
-#[deprecated(
-    since = "0.2.3",
-    note = "use `StreamingClient` with `proxy::handle_streaming`"
-)]
-pub type ProxyClient = Client<HttpConnector, Incoming>;
-
-/// Shared hyper client used by [`serve`] to forward requests to upstreams.
-/// Bodies are streamed straight through, no buffering; the request body is
-/// wrapped in [`proxy::RequestBody`] (idle timeout, end-of-body signal).
-pub type StreamingClient = Client<HttpConnector, proxy::RequestBody>;
-
-/// Latency buckets (seconds) for `ferryman_request_duration_seconds`,
-/// spanning sub-millisecond proxy hops up to `upstream_timeout_secs`'s
-/// default of 30s, so the slowest (about-to-time-out) requests still land
-/// in a real bucket instead of falling into `+Inf`. The duration is measured
-/// from request start to response headers, so it includes the request upload.
-pub const LATENCY_BUCKETS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-];
+#[allow(deprecated)]
+pub use ferryman_proxy::ProxyClient;
+pub use ferryman_proxy::{
+    ConnCtx, HeaderPolicy, Policy, Proxy, StreamingClient, TlsInfo, LATENCY_BUCKETS,
+};
 
 /// Deadline for a client to finish the TLS handshake and to send its first
 /// request. Stops idle sockets from pinning file descriptors (slowloris).
@@ -77,11 +64,8 @@ pub async fn serve(
     tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let mut connector = HttpConnector::new();
-    // Streamed bodies are many small writes; Nagle + delayed ACK would add
-    // ~40ms stalls.
-    connector.set_nodelay(true);
-    let client: StreamingClient = Client::builder(TokioExecutor::new()).build(connector);
+    let proxy = Proxy::new(table.clone(), Policy::default());
+    let local_default = listener.local_addr()?;
     let mut builder = HttpAutoBuilder::new(TokioExecutor::new());
     builder.http1().timer(TokioTimer::new());
     builder
@@ -89,7 +73,6 @@ pub async fn serve(
         .timer(TokioTimer::new())
         .keep_alive_interval(H2_KEEP_ALIVE);
     let graceful = GracefulShutdown::new();
-    let proto = if tls.is_some() { "https" } else { "http" };
     tokio::pin!(shutdown);
 
     loop {
@@ -107,7 +90,9 @@ pub async fn serve(
                 };
                 let _ = stream.set_nodelay(true);
                 let table = table.clone();
-                let client = client.clone();
+                let proxy = proxy.clone();
+                ferryman_proxy::warn_if_private_peer(&table.load(), peer);
+                let local = stream.local_addr().unwrap_or(local_default);
                 let tls = tls.clone();
                 // Read per connection: a hot-reloaded `keepalive_timeout_secs`
                 // applies to new connections only. hyper re-arms this timer
@@ -123,10 +108,14 @@ pub async fn serve(
                 // is bounded so it can't hold the drain open.
                 let watcher = graceful.watcher();
                 tokio::spawn(async move {
+                    let mut conn = ConnCtx::new(peer, local);
                     let stream = match tls {
                         Some(acceptor) => {
                             match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-                                Ok(Ok(s)) => MaybeTlsStream::Tls(Box::new(s)),
+                                Ok(Ok(s)) => {
+                                    conn = conn.with_tls(TlsInfo::from_rustls(s.get_ref().1));
+                                    MaybeTlsStream::Tls(Box::new(s))
+                                }
                                 Ok(Err(e)) => {
                                     tracing::debug!(?peer, ?e, "tls handshake failed");
                                     return;
@@ -142,9 +131,11 @@ pub async fn serve(
                     let io = TokioIo::new(stream);
                     let seen_request = Arc::new(AtomicBool::new(false));
                     let seen = seen_request.clone();
+                    let conn_ctx = Arc::new(conn);
                     let svc = service_fn(move |req| {
                         seen.store(true, Ordering::Relaxed);
-                        proxy::handle_streaming(table.clone(), client.clone(), peer, proto, req)
+                        let (p, c) = (proxy.clone(), conn_ctx.clone());
+                        async move { Ok::<_, std::convert::Infallible>(p.handle(req, &c).await) }
                     });
                     let conn = watcher.watch(builder.serve_connection(io, svc));
                     tokio::pin!(conn);

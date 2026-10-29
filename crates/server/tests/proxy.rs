@@ -1341,9 +1341,10 @@ async fn bad_host_headers_get_400_and_never_reach_upstream() {
         s.read_to_end(&mut out).await.unwrap();
         String::from_utf8_lossy(&out).into_owned()
     };
-    let bad: [Vec<&[u8]>; 8] = [
+    let bad: [Vec<&[u8]>; 9] = [
         vec![b"a:b"],
         vec![b"x:99999"],
+        vec![b"x:000080"],
         vec![b"*"],
         vec![b"a.example, b.example"],
         vec![b"u@x"],
@@ -1546,4 +1547,388 @@ async fn chunked_upload_with_trailer_to_slow_upstream_is_504() {
     let st = read_status_line(&mut s).await;
     assert!(st.starts_with("HTTP/1.1 504"), "{st}");
     assert!(start.elapsed() < Duration::from_millis(2500));
+}
+
+// --- upstreams / load balancing ---
+
+async fn body_of(client: &reqwest::Client, url: &str) -> (u16, String) {
+    let r = client.get(url).send().await.unwrap();
+    (r.status().as_u16(), r.text().await.unwrap())
+}
+
+#[tokio::test]
+async fn round_robin_alternates_across_upstreams() {
+    let a = spawn_stub(|_req| async { ok("A") }).await;
+    let b = spawn_stub(|_req| async { ok("B") }).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let mut got = String::new();
+    for _ in 0..6 {
+        got += &body_of(&client, &format!("http://{proxy}/s")).await.1;
+    }
+    assert_eq!(got, "ABABAB");
+}
+
+#[tokio::test]
+async fn weighted_round_robin_follows_weights() {
+    let a = spawn_stub(|_req| async { ok("A") }).await;
+    let b = spawn_stub(|_req| async { ok("B") }).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\n\
+         [[routes.upstreams]]\naddr = \"http://{a}\"\nweight = 3\n\
+         [[routes.upstreams]]\naddr = \"http://{b}\"\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let mut got = String::new();
+    for _ in 0..8 {
+        got += &body_of(&client, &format!("http://{proxy}/s")).await.1;
+    }
+    assert_eq!(got.matches('A').count(), 6);
+    assert_eq!(got.matches('B').count(), 2);
+}
+
+#[tokio::test]
+async fn dead_endpoint_is_skipped_after_breaker_opens() {
+    let a = spawn_toggle_stub(Arc::new(AtomicBool::new(true))).await;
+    let b = spawn_toggle_stub(Arc::new(AtomicBool::new(false))).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\n[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy}/s");
+    // Round robin offers `a` first: one 502 opens its breaker.
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    for _ in 0..6 {
+        assert_eq!(body_of(&client, &url).await, (200, "up".into()));
+    }
+}
+
+#[tokio::test]
+async fn all_endpoints_dead_is_503_and_health_loop_recovers() {
+    let down = Arc::new(AtomicBool::new(true));
+    let a = spawn_toggle_stub(down.clone()).await;
+    let b = spawn_toggle_stub(down.clone()).await;
+    let table = shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\n[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    )));
+    let proxy = start_proxy(table.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy}/s");
+    // One 502 per endpoint opens both breakers; then everything refuses.
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    for _ in 0..3 {
+        assert_eq!(body_of(&client, &url).await.0, 503);
+    }
+    // Probe results are authoritative: the health loop re-closes both
+    // (cooldown is the 30 s default, so nothing else could).
+    down.store(false, Ordering::SeqCst);
+    let h = tokio::spawn(ferryman_core::health_loop(table, Duration::from_millis(50)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while body_of(&client, &url).await.0 != 200 {
+        assert!(std::time::Instant::now() < deadline, "never recovered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h.abort();
+}
+
+// --- in-flight accounting / least_conn / recovery ---
+
+/// Raw upstream: answers every request with `content-length: 4`, sends "A"
+/// at once and the remaining "AAA" after `delay`.
+async fn spawn_slow_body_stub(delay: Duration) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nA",
+                    )
+                    .await;
+                tokio::time::sleep(delay).await;
+                let _ = s.write_all(b"AAA").await;
+            });
+        }
+    });
+    addr
+}
+
+async fn read_head_and_first_byte(s: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let mut b = [0u8; 256];
+    let mut got = Vec::new();
+    while !(got.ends_with(b"A") && got.windows(4).any(|w| w == b"\r\n\r\n")) {
+        let n = s.read(&mut b).await.unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&b[..n]);
+    }
+}
+
+fn inflight(table: &SharedTable, idx: usize) -> usize {
+    table.load().lookup("/s").unwrap().upstreams.endpoints()[idx]
+        .upstream
+        .inflight()
+}
+
+async fn wait_inflight_zero(table: &SharedTable, idx: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while inflight(table, idx) != 0 {
+        assert!(std::time::Instant::now() < deadline, "inflight stuck");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn inflight_covers_the_response_body_until_end_or_hangup() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let a = spawn_slow_body_stub(Duration::from_millis(600)).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\"]\n"
+    )));
+    let proxy = start_proxy(table.clone()).await;
+    let req = b"GET /s HTTP/1.1\r\nhost: x\r\n\r\n";
+    // Body runs to its end.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(req).await.unwrap();
+    read_head_and_first_byte(&mut s).await;
+    assert_eq!(inflight(&table, 0), 1, "mid-body");
+    let mut rest = [0u8; 3];
+    s.read_exact(&mut rest).await.unwrap();
+    drop(s);
+    wait_inflight_zero(&table, 0).await;
+
+    // Client hangs up mid-body.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(req).await.unwrap();
+    read_head_and_first_byte(&mut s).await;
+    assert_eq!(inflight(&table, 0), 1);
+    drop(s);
+    wait_inflight_zero(&table, 0).await;
+}
+
+#[tokio::test]
+async fn inflight_returns_to_zero_after_mixed_outcomes() {
+    use tokio::io::AsyncWriteExt;
+    let a = spawn_stub(|req| async move {
+        let bad = req.uri().path().ends_with("/bad");
+        let _ = req.into_body().collect().await;
+        if bad {
+            let mut r = ok("x");
+            *r.status_mut() = hyper::StatusCode::BAD_GATEWAY;
+            r
+        } else {
+            ok("fine")
+        }
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "failure_threshold = 100\nrequest_body_idle_timeout_secs = 1\n\
+         [[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\"]\n"
+    )));
+    let proxy = start_proxy(table.clone()).await;
+    let client = reqwest::Client::new();
+    assert_eq!(body_of(&client, &format!("http://{proxy}/s")).await.0, 200);
+    assert_eq!(
+        body_of(&client, &format!("http://{proxy}/s/bad")).await.0,
+        502
+    );
+    // Stalled upload: 408.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"POST /s HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nabc")
+        .await
+        .unwrap();
+    assert!(read_status_line(&mut s).await.contains("408"));
+    drop(s);
+    // Hang-up mid-upload.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"POST /s HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nabc")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(s);
+    wait_inflight_zero(&table, 0).await;
+}
+
+#[tokio::test]
+async fn least_conn_steers_away_from_an_endpoint_streaming_a_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let a = spawn_slow_body_stub(Duration::from_secs(3)).await;
+    let b = spawn_stub(|_req| async { ok("B") }).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\nlb = \"least_conn\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    // Tie: first request goes to A and keeps streaming.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"GET /s HTTP/1.1\r\nhost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    assert!(s.read(&mut buf).await.unwrap() > 0);
+    let client = reqwest::Client::new();
+    for _ in 0..4 {
+        assert_eq!(
+            body_of(&client, &format!("http://{proxy}/s")).await,
+            (200, "B".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_path_half_open_recovers_on_a_multi_endpoint_health_disabled_route() {
+    let down = Arc::new(AtomicBool::new(true));
+    let a = spawn_toggle_stub(down.clone()).await;
+    let b = spawn_toggle_stub(down.clone()).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\ndefault_cooldown_secs = 1\n\
+         [[routes]]\nprefix = \"/s\"\nhealth_disabled = true\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy}/s");
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    assert_eq!(body_of(&client, &url).await.0, 503);
+    down.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Each half-open probe waits for its round-robin turn; both close soon.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut ok_seen = 0;
+    while ok_seen < 6 {
+        assert!(std::time::Instant::now() < deadline, "never recovered");
+        if body_of(&client, &url).await.0 == 200 {
+            ok_seen += 1;
+        } else {
+            ok_seen = 0;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+async fn tagged(tag: &'static str) -> SocketAddr {
+    spawn_stub(move |_| async move { ok(tag) }).await
+}
+
+/// Send one raw request (`target`, optional `Host`) and return the whole reply.
+async fn raw_get(proxy: SocketAddr, target: &str, host: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host = host.map(|h| format!("host: {h}\r\n")).unwrap_or_default();
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(format!("GET {target} HTTP/1.1\r\n{host}connection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    out
+}
+
+async fn host_proxy() -> SocketAddr {
+    let (a, b, w, d, only) = (
+        tagged("A").await,
+        tagged("B").await,
+        tagged("W").await,
+        tagged("D").await,
+        tagged("ONLY").await,
+    );
+    let table = shared_table(parse_cfg(&format!(
+        r#"
+[[routes]]
+prefix = "/"
+upstream = "http://{d}"
+[[routes]]
+host = "a.example.com"
+prefix = "/api"
+upstream = "http://{a}"
+[[routes]]
+host = "b.example.com"
+prefix = "/api"
+upstream = "http://{b}"
+[[routes]]
+host = "*.example.com"
+prefix = "/"
+upstream = "http://{w}"
+[[routes]]
+host = "only.example.com"
+prefix = "/x"
+upstream = "http://{only}"
+"#
+    )));
+    start_proxy(table).await
+}
+
+#[tokio::test]
+async fn host_routes_pick_upstream_by_host() {
+    let p = host_proxy().await;
+    let body = |r: String| r.rsplit("\r\n\r\n").next().unwrap().to_string();
+    // same prefix, different hosts; case and port ignored
+    assert_eq!(body(raw_get(p, "/api/x", Some("a.example.com")).await), "A");
+    assert_eq!(
+        body(raw_get(p, "/api/x", Some("B.Example.COM:8080")).await),
+        "B"
+    );
+    // exact group without matching prefix: 404, not the wildcard or default
+    let r = raw_get(p, "/other", Some("a.example.com")).await;
+    assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    // wildcard, then unknown host / IP host -> hostless default
+    assert_eq!(body(raw_get(p, "/z", Some("q.example.com")).await), "W");
+    assert_eq!(body(raw_get(p, "/z", Some("example.com")).await), "D");
+    assert_eq!(body(raw_get(p, "/z", Some("other.org")).await), "D");
+    assert_eq!(body(raw_get(p, "/z", Some("127.0.0.1")).await), "D");
+    // trailing dot
+    assert_eq!(
+        body(raw_get(p, "/api/x", Some("a.example.com.")).await),
+        "A"
+    );
+    // host group present, prefix missing: no hostless fallback
+    let r = raw_get(p, "/y", Some("only.example.com")).await;
+    assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    assert_eq!(
+        body(raw_get(p, "/x", Some("only.example.com")).await),
+        "ONLY"
+    );
+}
+
+#[tokio::test]
+async fn absolute_form_authority_beats_host_header_for_routing() {
+    let p = host_proxy().await;
+    let r = raw_get(p, "http://a.example.com/api/x", Some("b.example.com")).await;
+    assert!(r.ends_with("\r\n\r\nA"), "{r}");
+    let r = raw_get(p, "http://b.example.com/api/x", Some("a.example.com")).await;
+    assert!(r.ends_with("\r\n\r\nB"), "{r}");
+    // userinfo and port in the authority do not leak into the match
+    let r = raw_get(p, "http://u@a.example.com:81/api/x", Some("b.example.com")).await;
+    assert!(r.ends_with("\r\n\r\nA"), "{r}");
+    // bad Host headers are still 400 before routing
+    let r = raw_get(p, "/api/x", Some("a.example.com/evil")).await;
+    assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+}
+
+#[tokio::test]
+async fn http2_authority_routes_by_host() {
+    let p = host_proxy().await;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .resolve("b.example.com", p)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("http://b.example.com:{}/api/x", p.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(resp.text().await.unwrap(), "B");
 }

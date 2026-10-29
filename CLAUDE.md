@@ -1,7 +1,7 @@
 # ferryman — notes for Claude
 
 Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, health loop.
-`crates/server` = lib (`serve`, proxy, tls, reload) + thin `main.rs`. Internals: `docs/architecture.md`.
+`crates/proxy` = request pipeline (`ferryman-proxy`, re-exported as `ferryman::proxy`). `crates/server` = lib (`serve`, tls, reload) + thin `main.rs`. Internals: `docs/architecture.md`.
 
 ## Commands
 
@@ -15,7 +15,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `bash scripts/wrk2-smoke.sh` - compose fixture + wrk2; runs in CI (wrk2 isn't buildable locally: no OpenSSL headers)
 - `bash examples/full-stack/demo.sh --ci` - full-stack reference example; runs in CI (`examples` job)
 - `cargo test -p ferryman-embedded-example` - embedded-library reference example's tests
-- `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`
+- `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`. Re-running it at an unchanged version can verify against a stale extracted copy (unresolved imports from a sibling crate): delete `~/.cargo/registry/src/*/ferryman-{proxy,}-<ver>` and retry
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` - no intra-doc links to private items
 - CI jobs beyond test/deny: `semver` (cargo-semver-checks vs the latest crates.io release, blocking; additive-only public API), `msrv` (`cargo check` on 1.88 via `RUSTUP_TOOLCHAIN`), doctests run in the `test` job (`cargo test --doc`, nextest skips them)
 - `gh run list -L 3` / `gh run view <id> --log` - CI status and smoke-bench numbers
@@ -28,11 +28,17 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `release(Probe)` only re-arms the probe slot while HalfOpen, at most once per cooldown, and never changes state or counts; client-side failures (408, client body error, URI-rebuild 502) `release`, they never `record_*`.
 - Routes sharing an upstream must agree on `cooldown_secs`, `health_path`, `health_disabled` (build_table error). Reload with changed health keys reuses the `Arc<Breaker>` (state kept); `health_disabled` upstreams are skipped by the health loop.
 - `build_table` validates everything before touching `prev` breakers; reload reuses the same `Arc<Breaker>` per `host:port`.
+- Host routing (`lookup_host`): host = URI authority host, else the single `Host` (the value `bad_host` validated), lowercased, port and ONE trailing dot stripped; group = exact host > wildcard with longest suffix (`*.x.com` = one or more extra labels, never the apex) > hostless; then longest prefix. A chosen host group with no matching prefix is 404, NEVER a fallback to another group (hostless only when no host route applies). Config hosts are lowercase ASCII/punycode DNS names, never IPs, unique per (host, prefix), validated in `build_table` before `prev`. `ambiguous_route_host` uses the same group. Metric `route` label = `host`+prefix for host routes (`Route::label`), plain prefix for hostless.
 - `lookup` ignores health: dead upstream = 503, never fall back to a shorter prefix.
 - Client-side body errors (`hyper::Error::is_user`) and stalled or over-long uploads (`request_body_idle_timeout_secs` / `request_body_timeout_secs`, 408) never trip the breaker. `upstream_timeout` starts at request-body EOS (immediately if bodyless); a 504 after that is recorded as a breaker failure, as is an upstream that stops reading the upload for a whole `upstream_timeout` window (hyper not polling the body while not waiting on the client).
 - A client that stalled its upload for >= theta = min(1s, `request_body_idle_timeout`/2) is never blamed for an upstream 502/503/504/transport error (ticket is `release`d, status unchanged); the 504 timer branch still counts. (handle_streaming only; the deprecated `handle` is unchanged.)
 - Untrusted peers: `Forwarded`, `X-Forwarded-Host`/`-Ssl`/`-Scheme`/`-Prefix`/`-Port` are removed (all instances, incl. `_` spellings, which are removed for every peer) before ferryman writes its own; `X-Forwarded-Proto` comes from the connection (unless trusted); `X-Real-IP` is always derived. `X-Forwarded-Port` is never synthesised (not from the listener port, not from `Host`): untrusted peers get none, a trusted peer's rightmost valid value is kept, else none.
 - Forwarding headers are applied after `strip_hop_by_hop`; any later code that sets a trust-governed header (`strip_prefix` -> `X-Forwarded-Prefix`, already done that way) must run after `apply_forwarded_headers`. `strip_prefix` runs after `bad_path`/`ambiguous_route`/`lookup`, strips the normalised path, and re-checks the remainder at runtime (`Route::stripped_path` None = 400). `xff = "replace"` writes the `X-Real-IP` address; `Forwarded` `for=` is the connecting peer, `host=` is captured before `rewrite_host` overwrites Host, `proto=` is this hop's scheme.
+- Ticket exactly-once: every admission resolves exactly once (record, `release`, or Drop -> release). No hook that can return a response may run between `try_acquire` and the verdict; `abandon` exists only for the legacy bodied-504 path (`handle_legacy`).
+- `HeaderPolicy::asserted` denylist: `Proxy::with_client` panics on framing/hop-by-hop names (`host`, `content-length`, `transfer-encoding`, `te`, `trailer`, `upgrade`, `connection`, `keep-alive`, `proxy-*`, `x-request-id`); asserted names are folded like the trust-governed set before comparing.
+- `Hooks::pre_dispatch` gets a read-only request head (plus mutable extensions), never the body; `stamp` runs after the strips and a panic in it is a 500.
+- Pre-admission order (matches edge): bad_path/ambiguous -> bad_host -> pure `lookup` -> upgrade/CONNECT 501 (also unrouted; h1 gets `Connection: close`) -> declared-size 413 -> 404 -> `strip_prefix` check -> admission -> `strip_hop_by_hop` (so a `Content-Length` named in `Connection` is still seen by the 413 check; `Host` and `x-request-id` are exempt from Connection-named stripping).
+- Host parity (shared with ferryman-edge): port is 1-5 digits <= 65535; only `:port` may follow an IPv6 literal (`[::1]x`, `x:000080` -> 400).
 - Metric labels are config-bounded (`route` = prefix, `upstream` = host:port); never label with raw paths.
 - Gauges: recorder is installed before any gauge write; health loop republishes every tick (removed upstreams expire via `idle_timeout`).
 - `examples/*` crates are workspace members with `publish = false`.
@@ -47,15 +53,17 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Don't add `rustls-pemfile` (unmaintained advisory); use `rustls::pki_types::pem::PemObject`.
 - `rust-toolchain.toml` is in `.dockerignore` on purpose: it made rustup switch to a toolchain without the musl target.
 - CI test job sets `RUSTUP_TOOLCHAIN=${{ matrix.rust }}`; otherwise the toolchain file forces stable on the beta leg.
+- Toolchains are installed in CI with `rustup toolchain install` + `rustup default` (inline `run:` step, values via `env:`), not a third-party action (`dtolnay/rust-toolchain` only has a floating `v1` tag, which trips zizmor ref-version-mismatch).
 
 ## Publishing
 
-- Version lives in `[workspace.package]` AND the `ferryman-core` entry of `[workspace.dependencies]`; bump both together. On a minor/major bump also update the `version = "0.x"` reqs on both crates in `examples/embedded/Cargo.toml`, and commit the refreshed `Cargo.lock` (`release.yml` builds `--locked`).
+- Version lives in `[workspace.package]` AND the `ferryman-core` and `ferryman-proxy` entries of `[workspace.dependencies]`; bump all three together (release.yml checks both entries). On a minor/major bump also update the `version = "0.x"` reqs on both crates in `examples/embedded/Cargo.toml`, and commit the refreshed `Cargo.lock` (`release.yml` builds `--locked`).
 - `crates/*/LICENSE-*` are symlinks to the root files; keep them (they ship the license texts in each `.crate`).
 - `ConfigToml`/`RouteToml` are `#[non_exhaustive]`: construct via TOML parsing outside the core crate.
 - Release binaries: `binaries` job in `release.yml` (`binaries` tier 1 gates attest and publish; `binaries-extra` tier 2 best effort, not attested); naming `ferryman-v<ver>-<target>.tar.gz|zip` is mirrored in `[package.metadata.binstall]`. Tier 1 builds with `cargo auditable` (tier 2 is built without it). `attest` and `image-attest` jobs (the only ones with `id-token`/`attestations: write`; no checkout, no cargo; tier-1 archives only; skipped on dry runs) runs before `publish`. Dry run: run the workflow via `workflow_dispatch` (builds only, no publish). Actions are SHA-pinned; zizmor runs in CI.
 - `image` job (release.yml, after `publish`, `release` does not need it): multi-arch GHCR image from the tier-1 musl archives via `Dockerfile.release` (COPY only, no rebuild); `image` has `packages: write` but no `id-token`, `image-attest` (no checkout) attests its digest, `image-dry-run` builds without pushing on dispatch; archive extraction is `scripts/extract-release-bins.sh` (stdout = version only; self-tested in CI by `scripts/test-extract-release-bins.sh`); a failed image job is recovered by dispatching `.github/workflows/image-publish.yml` with the tag, never by re-running the tag run; BuildKit is pinned by digest in setup-buildx; never re-run `binaries` after `release` succeeded; keep its runtime stanza in sync with the `Dockerfile` final stage; image runs as 65532 (mounted files must be readable).
 - `.github/workflows/release.yml` publishes on a `v[0-9]+.[0-9]+.[0-9]+` or prerelease `v…-*` tag push (Trusted Publishing; jobs verify -> binaries (tier 1) -> attest -> publish -> release, plus best-effort binaries-extra; idempotent per-crate publish); see `docs/plans/2026-09-28-publishing.md` for the one remaining manual step, the release procedure, and half-published-release recovery.
+- Hooks (`unstable-hooks`) and `testkit` are outside semver: change them only in `ferryman-proxy` minor releases.
 
 ## Testing patterns
 

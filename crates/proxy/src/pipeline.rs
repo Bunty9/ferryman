@@ -3,7 +3,7 @@
 //! hyper client, records metrics, and turns transport failures into
 //! circuit-breaker trips.
 
-use ferryman_core::{RouteTable, SharedTable, TrustedProxies, XffMode};
+use ferryman_core::{Admission, RouteTable, SharedTable, TrustedProxies, XffMode};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -22,9 +22,11 @@ use tokio::sync::oneshot;
 use tokio::time::Sleep;
 use tracing::Instrument;
 
+use crate::verdict::{client_fault, ClientFault, Held, Ticket, VerdictPolicy, WatchedBody};
 #[allow(deprecated)]
 use crate::ProxyClient;
 use crate::StreamingClient;
+use crate::{ConnCtx, TlsInfo};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 
@@ -43,6 +45,9 @@ pub struct RequestBody {
     inner: Incoming,
     idle: Duration,
     deadline: tokio::time::Instant,
+    /// `Policy::max_request_body_bytes`: streamed bytes allowed, and bytes seen.
+    max: Option<u64>,
+    seen: u64,
     // Armed only while waiting on the client, so a slow upstream connect or
     // an upstream that is not reading is never blamed on the client.
     idle_sleep: Option<Pin<Box<Sleep>>>,
@@ -57,42 +62,84 @@ impl std::fmt::Debug for RequestBody {
     }
 }
 
-/// What `handle`'s timer can see of the body: whether hyper polled it, and
-/// whether the last poll was left waiting on the client (as opposed to hyper
-/// having stopped reading, e.g. an upstream whose receive buffer is full).
-struct BodyState {
+/// What the timer and the blame checks can see of the request body: whether
+/// hyper polled it, and since when the last poll has been left waiting on the
+/// client (rather than hyper having stopped reading because the upstream
+/// isn't draining it). Shared with [`crate::verdict::WatchedBody`].
+pub(crate) struct BodyState {
     polled: AtomicBool,
-    waiting_on_client: AtomicBool,
-    origin: Instant,
-    /// Start of the current client stall, ms since `origin` + 1 (0 = none).
-    stall_since: AtomicU64,
-    /// Longest finished client stall so far, ms.
-    longest_stall: AtomicU64,
+    /// Start of the current wait on the client, as nanoseconds since `base`
+    /// plus one; 0 while not waiting. Set on a `Pending` poll, cleared by
+    /// any `Ready` (frame, end of stream, error).
+    waiting_since: AtomicU64,
+    base: tokio::time::Instant,
+    /// theta: how long a client must stall (upload, or pulling the response)
+    /// before an upstream failure is put down to that stall.
+    pub(crate) stall: Duration,
+    /// The request body yielded an error (cap, deadline, client broke off).
+    pub(crate) client_failed: AtomicBool,
+    /// Sticky: a finished wait on the client lasted at least `stall`.
+    stalled_once: AtomicBool,
+}
+
+/// theta = max(100 ms, min(1 s, idle / 2)). The floor keeps a zero idle gap
+/// from turning response-body blame off entirely.
+pub(crate) fn stall_threshold(idle: Duration) -> Duration {
+    (idle / 2)
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(100))
 }
 
 impl BodyState {
-    fn now_ms(&self) -> u64 {
-        self.origin.elapsed().as_millis() as u64
-    }
-    fn stall_ended(&self) {
-        let since = self.stall_since.swap(0, Ordering::Relaxed);
-        if since != 0 {
-            let d = (self.now_ms() + 1).saturating_sub(since);
-            self.longest_stall.fetch_max(d, Ordering::Relaxed);
+    fn new(idle: Duration) -> Self {
+        Self {
+            polled: AtomicBool::new(false),
+            waiting_since: AtomicU64::new(0),
+            base: tokio::time::Instant::now(),
+            stall: stall_threshold(idle),
+            client_failed: AtomicBool::new(false),
+            stalled_once: AtomicBool::new(false),
         }
     }
-    /// Did the client leave its upload idle for >= `theta` at any point (incl. now)?
-    fn client_stalled(&self, theta: Duration) -> bool {
-        let t = theta.as_millis() as u64;
-        let since = self.stall_since.load(Ordering::Relaxed);
-        self.longest_stall.load(Ordering::Relaxed) >= t
-            || (since != 0 && (self.now_ms() + 1).saturating_sub(since) >= t)
+
+    fn now_mark(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1)
+    }
+
+    /// The last poll of the upload was left waiting on the client. True most
+    /// of the time during a normal upload (the proxy drains the client
+    /// faster than it sends), so it is no excuse for an upstream failure on
+    /// its own; see [`Self::client_stalled`].
+    fn waiting_on_client(&self) -> bool {
+        self.waiting_since.load(Ordering::Acquire) != 0
+    }
+
+    /// The proxy has been waiting on the client's next upload frame for at
+    /// least `stall`.
+    fn client_stalled(&self) -> bool {
+        self.stalled_for(self.waiting_since.load(Ordering::Acquire))
+    }
+
+    /// The client stalled its upload for at least `stall` at some point of
+    /// this request, or is stalling now. Every blame path checks this: an
+    /// upstream that hangs up, breaks its body, or (as a gateway) answers
+    /// 502-504 after such a stall may be reacting to it, so it is not blamed.
+    pub(crate) fn stalled_during_request(&self) -> bool {
+        self.stalled_once.load(Ordering::Acquire) || self.client_stalled()
+    }
+
+    /// A wait that started at `since` (a `now_mark`, 0 = none) has lasted at
+    /// least `stall`.
+    fn stalled_for(&self, since: u64) -> bool {
+        since != 0 && Duration::from_nanos(self.now_mark().saturating_sub(since)) >= self.stall
     }
 }
 
-struct Eos {
+pub(crate) struct Eos {
     rx: oneshot::Receiver<()>,
-    state: Arc<BodyState>,
+    pub(crate) state: Arc<BodyState>,
 }
 
 /// The client stalled its upload for longer than `request_body_idle_timeout_secs`.
@@ -117,20 +164,27 @@ impl std::fmt::Display for BodyTotalTimeout {
 }
 impl std::error::Error for BodyTotalTimeout {}
 
+/// The streamed request body passed `Policy::max_request_body_bytes` (413).
+#[derive(Debug)]
+pub(crate) struct BodyTooLarge;
+
+impl std::fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body too large")
+    }
+}
+impl std::error::Error for BodyTooLarge {}
+
 impl RequestBody {
-    fn new(inner: Incoming, idle: Duration, total: Duration) -> (Self, Eos) {
+    fn new(inner: Incoming, idle: Duration, total: Duration, max: Option<u64>) -> (Self, Eos) {
         let (tx, rx) = oneshot::channel();
-        let state = Arc::new(BodyState {
-            polled: AtomicBool::new(false),
-            waiting_on_client: AtomicBool::new(false),
-            origin: Instant::now(),
-            stall_since: AtomicU64::new(0),
-            longest_stall: AtomicU64::new(0),
-        });
+        let state = Arc::new(BodyState::new(idle));
         let mut b = Self {
             inner,
             idle,
             deadline: tokio::time::Instant::now() + total,
+            max,
+            seen: 0,
             idle_sleep: None,
             total_sleep: None,
             eos: Some(tx),
@@ -158,7 +212,46 @@ impl Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
-        this.state.polled.store(true, Ordering::Relaxed);
+        let polled = this.poll_inner(cx);
+        // Bookkeeping lives here, around `poll_inner`, so every exit is seen,
+        // including the total-deadline check at its top.
+        let state = &this.state;
+        match polled {
+            Poll::Pending => {
+                if state.waiting_since.load(Ordering::Acquire) == 0 {
+                    state
+                        .waiting_since
+                        .store(state.now_mark(), Ordering::Release);
+                }
+            }
+            Poll::Ready(ref r) => {
+                if state.stalled_for(state.waiting_since.swap(0, Ordering::AcqRel)) {
+                    state.stalled_once.store(true, Ordering::Release);
+                }
+                if matches!(r, Some(Err(_))) {
+                    state.client_failed.store(true, Ordering::Release);
+                }
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+type BodyPoll =
+    Poll<Option<Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>>;
+
+impl RequestBody {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> BodyPoll {
+        let this = self;
+        this.state.polled.store(true, Ordering::Release);
         if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
         }
@@ -168,36 +261,26 @@ impl Body for RequestBody {
                 // trust-governed header names. Keep polling for the next frame.
                 Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
                 Poll::Ready(Some(Ok(frame))) => {
+                    if let (Some(max), Some(d)) = (this.max, frame.data_ref()) {
+                        this.seen = this.seen.saturating_add(d.len() as u64);
+                        if this.seen > max {
+                            return Poll::Ready(Some(Err(BodyTooLarge.into())));
+                        }
+                    }
                     this.idle_sleep = None;
-                    this.state.stall_ended();
-                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
                     // The last frame of a content-length body may not be followed
                     // by another poll, so check here as well as on `None`.
                     this.signal_if_done();
                     Poll::Ready(Some(Ok(frame)))
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    this.state.stall_ended();
-                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                    Poll::Ready(Some(Err(e.into())))
-                }
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
                 Poll::Ready(None) => {
-                    this.state.stall_ended();
-                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
                     if let Some(tx) = this.eos.take() {
                         let _ = tx.send(());
                     }
                     Poll::Ready(None)
                 }
                 Poll::Pending => {
-                    this.state.waiting_on_client.store(true, Ordering::Relaxed);
-                    let now = this.state.now_ms() + 1;
-                    let _ = this.state.stall_since.compare_exchange(
-                        0,
-                        now,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
                     let idle = this.idle;
                     let idle_sleep = this
                         .idle_sleep
@@ -217,22 +300,15 @@ impl Body for RequestBody {
             };
         }
     }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
-    }
 }
 
 /// Headers that are meaningful only for one hop and must never be forwarded,
 /// per RFC 7230 §6.1 (plus `keep-alive`, which predates the RFC but is
 /// conventionally hop-by-hop too).
-const HOP_BY_HOP_HEADERS: [HeaderName; 8] = [
+const HOP_BY_HOP_HEADERS: [HeaderName; 9] = [
     header::CONNECTION,
     HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
     header::PROXY_AUTHENTICATE,
     header::PROXY_AUTHORIZATION,
     header::TE,
@@ -241,16 +317,157 @@ const HOP_BY_HOP_HEADERS: [HeaderName; 8] = [
     header::UPGRADE,
 ];
 
-/// Handle a single inbound request. Never returns `Err` — every expected
-/// failure (no route, breaker open, timeout, transport error) becomes an
-/// error response instead, per hyper service conventions.
-///
+/// Names `Policy.headers.asserted` may never list (given folded): the
+/// hop-by-hop set the strip uses plus the framing / routing headers the proxy
+/// itself owns. Trust-governed names (`x-real-ip`, `forwarded`, ...) are allowed.
+fn asserted_name_denied(folded: &str) -> bool {
+    HOP_BY_HOP_HEADERS.iter().any(|h| h.as_str() == folded)
+        || matches!(
+            folded,
+            "host" | "content-length" | "proxy-connection" | "x-request-id"
+        )
+}
+
+/// Per-process pipeline handler: routing table, upstream client and policy.
+/// Cheap to clone (`Arc` inside).
+#[derive(Clone)]
+pub struct Proxy {
+    inner: Arc<ProxyInner>,
+}
+
+struct ProxyInner {
+    table: SharedTable,
+    client: StreamingClient,
+    policy: Policy,
+}
+
+/// Behaviour knobs for [`Proxy`]. `Policy::default()` is ferryman's own
+/// behaviour: header handling from the route table, no body cap. Construct
+/// with `let mut p = Policy::default(); p.field = ...;`; fields are added
+/// additively.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct Policy {
+    /// Header handling overrides.
+    pub headers: HeaderPolicy,
+    /// 413 when a declared `Content-Length` is over the cap, or when the
+    /// streamed body passes it. Never affects the breaker. `None` = no cap.
+    pub max_request_body_bytes: Option<u64>,
+    /// When a normal admission's success reaches the breaker. Default
+    /// [`VerdictPolicy::HeadOnly`].
+    pub verdict: VerdictPolicy,
+    /// Embedder hooks (`unstable-hooks`); `None` = ferryman's own behaviour.
+    #[cfg(feature = "unstable-hooks")]
+    pub hooks: Option<Arc<dyn crate::Hooks>>,
+}
+
+impl std::fmt::Debug for Policy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Policy");
+        d.field("headers", &self.headers)
+            .field("max_request_body_bytes", &self.max_request_body_bytes)
+            .field("verdict", &self.verdict);
+        #[cfg(feature = "unstable-hooks")]
+        d.field("hooks", &self.hooks.is_some());
+        d.finish_non_exhaustive()
+    }
+}
+
+/// Overrides for the forwarding-header step. The default uses the route
+/// table's `xff`, `trusted_proxies` and `forwarded_header`.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct HeaderPolicy {
+    /// `None` = the table's `xff_mode()`.
+    pub xff: Option<XffMode>,
+    /// `None` = the table's `trusted_proxies()`. `Some(TrustedProxies::default())`
+    /// trusts no peer, whatever the table says.
+    pub trusted_proxies: Option<TrustedProxies>,
+    /// `None` = the table's `forwarded_header()`.
+    pub forwarded_header: Option<bool>,
+    /// Request header names (lowercase) the embedder asserts. For each, its
+    /// non-canonical spellings are removed for every peer (together with the
+    /// trust-governed set), and the canonical name is removed after the
+    /// forwarding step, whatever the client or that step wrote. Listing a
+    /// trust-governed name (e.g. `x-real-ip`) hands it to the embedder.
+    pub asserted: Vec<HeaderName>,
+    /// `(raw, folded)` per asserted name, filled once by `Proxy::with_client`.
+    folded: Vec<(String, String)>,
+}
+
+impl HeaderPolicy {
+    fn fold_asserted(&mut self) {
+        self.folded = fold_asserted(&self.asserted);
+    }
+}
+
+impl Proxy {
+    /// Builds its own upstream client (HTTP/1.1, TCP_NODELAY).
+    pub fn new(table: SharedTable, policy: Policy) -> Self {
+        Self::with_client(table, crate::client(), policy)
+    }
+
+    /// Like [`Proxy::new`] with a caller-supplied upstream client (tests,
+    /// embedders).
+    ///
+    /// # Panics
+    ///
+    /// If `policy.headers.asserted` lists a framing, hop-by-hop or
+    /// proxy-owned name (`host`, `content-length`, `transfer-encoding`, `te`,
+    /// `trailer`, `upgrade`, `connection`, `keep-alive`, `proxy-connection`,
+    /// `proxy-authenticate`, `proxy-authorization`, `x-request-id`): stamping
+    /// one would desync framing or the Host the proxy relies on.
+    pub fn with_client(table: SharedTable, client: StreamingClient, mut policy: Policy) -> Self {
+        policy.headers.fold_asserted();
+        for (raw, folded) in &policy.headers.folded {
+            assert!(
+                !asserted_name_denied(folded),
+                "Policy.headers.asserted may not list `{raw}`: it is a framing, hop-by-hop or \
+                 proxy-owned header"
+            );
+        }
+        Self {
+            inner: Arc::new(ProxyInner {
+                table,
+                client,
+                policy,
+            }),
+        }
+    }
+
+    /// Handle a single inbound request. Never fails: every expected failure
+    /// (no route, breaker open, timeout, transport error) becomes an error
+    /// response. `conn` describes the connection the request arrived on; its
+    /// peer address and TLS state drive the forwarding headers.
+    ///
+    /// Streaming semantics: `upstream_timeout_secs` starts once the request
+    /// body is complete, `request_body_idle_timeout_secs` applies between
+    /// body frames, and `request_body_timeout_secs` caps the whole upload.
+    /// The private-peer `trusted_proxies` warning is the caller's job, see
+    /// [`warn_if_private_peer`].
+    pub async fn handle(&self, req: Request<Incoming>, conn: &ConnCtx) -> Response<ResponseBody> {
+        let wrap = |body, idle, total, max| {
+            let (b, eos) = RequestBody::new(body, idle, total, max);
+            (b, Some(eos))
+        };
+        let Ok(resp) = handle_inner(
+            self.inner.table.clone(),
+            self.inner.client.clone(),
+            conn,
+            req,
+            &self.inner.policy,
+            wrap,
+        )
+        .await;
+        resp
+    }
+}
+
 /// `proto` is `"http"` or `"https"`, reflecting whether this connection was
 /// TLS-terminated, and is forwarded as `x-forwarded-proto`.
 ///
-/// This is the streaming handler: `upstream_timeout_secs` starts once the
-/// request body is complete, `request_body_idle_timeout_secs` applies between
-/// body frames, and `request_body_timeout_secs` caps the whole upload.
+/// Thin shim over [`Proxy::handle`]: builds a [`ConnCtx`] from its arguments
+/// (the local address is unknown and set to `0.0.0.0:0`).
 pub async fn handle_streaming(
     table: SharedTable,
     client: StreamingClient,
@@ -258,11 +475,20 @@ pub async fn handle_streaming(
     proto: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    let wrap = |body, idle, total| {
-        let (b, eos) = RequestBody::new(body, idle, total);
-        (b, Some(eos))
-    };
-    handle_inner(table, client, peer, proto, req, wrap).await
+    warn_if_private_peer(&table.load(), peer);
+    let conn = shim_ctx(peer, proto);
+    Ok(Proxy::with_client(table, client, Policy::default())
+        .handle(req, &conn)
+        .await)
+}
+
+fn shim_ctx(peer: SocketAddr, proto: &str) -> ConnCtx {
+    let ctx = ConnCtx::new(peer, SocketAddr::from(([0, 0, 0, 0], 0)));
+    if proto == "https" {
+        ctx.with_tls(TlsInfo::default())
+    } else {
+        ctx
+    }
 }
 
 /// The 0.2.2 handler, kept for compatibility: `upstream_timeout_secs` covers
@@ -285,7 +511,16 @@ pub async fn handle(
     proto: &'static str,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    handle_inner(table, client, peer, proto, req, |b, _, _| (b, None)).await
+    warn_if_private_peer(&table.load(), peer);
+    handle_inner(
+        table,
+        client,
+        &shim_ctx(peer, proto),
+        req,
+        &Policy::default(),
+        |b, _, _, _| (b, None),
+    )
+    .await
 }
 
 /// Per-request state for the access log line (`None` = `access_log = false`).
@@ -363,15 +598,16 @@ fn ensure_request_id(headers: &mut HeaderMap) -> String {
 async fn handle_inner<B>(
     table: SharedTable,
     client: Client<HttpConnector, B>,
-    peer: SocketAddr,
-    proto: &'static str,
+    conn: &ConnCtx,
     mut req: Request<Incoming>,
-    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
+    policy: &Policy,
+    wrap: impl FnOnce(Incoming, Duration, Duration, Option<u64>) -> (B, Option<Eos>),
 ) -> Result<Response<ResponseBody>, Infallible>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let (peer, proto) = (conn.peer, conn.proto());
     let started = Instant::now();
     // `load_full` (not `load`) because the returned `Arc` is held across
     // `.await` points below; `load`'s guard is meant for short critical
@@ -410,6 +646,7 @@ where
     // Skipped entirely when neither the access log nor request ids are on.
     let span = if log.is_some() || echo_id {
         tracing::info_span!(
+            target: "ferryman::proxy",
             "request",
             method = %req.method(),
             route = tracing::field::Empty,
@@ -419,7 +656,7 @@ where
         tracing::Span::none()
     };
     let cx = Cx { started, log };
-    let Ok(mut resp) = handle_core(table, client, peer, proto, req, wrap, &cx)
+    let Ok(mut resp) = handle_core(table, client, conn, req, policy, wrap, &cx)
         .instrument(span)
         .await;
     // Only with `request_id = true`; a client-supplied id is never echoed otherwise.
@@ -439,16 +676,17 @@ where
 async fn handle_core<B>(
     table: Arc<RouteTable>,
     client: Client<HttpConnector, B>,
-    peer: SocketAddr,
-    proto: &'static str,
+    conn: &ConnCtx,
     req: Request<Incoming>,
-    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
+    policy: &Policy,
+    wrap: impl FnOnce(Incoming, Duration, Duration, Option<u64>) -> (B, Option<Eos>),
     cx: &Cx,
 ) -> Result<Response<ResponseBody>, Infallible>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let (peer, proto) = (conn.peer, conn.proto());
     // Answered before bad_path/lookup: no upstream, no breaker. Exact match
     // on the raw path. Metric label is the fixed "local_health".
     if table.local_health_path() == Some(req.uri().path())
@@ -463,8 +701,54 @@ where
         return Ok(error_response(StatusCode::OK, body));
     }
 
+    // Decided on the raw request, before any hook runs.
+    // Upgrades (WebSocket etc.) are refused below (501) once the route is known.
+    // `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
+    // like curl --http2 or Java's HttpClient send it on every plain request.
+    let wants_upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
+
+    // Before every check and before admission: see `Hooks` (exactly-once).
+    // The hook gets the head read-only plus `&mut Extensions`; the body never
+    // reaches it, and the request is rebuilt unchanged.
+    #[cfg(feature = "unstable-hooks")]
+    let req = match &policy.hooks {
+        Some(hooks) => {
+            let (mut parts, body) = req.into_parts();
+            let r = hooks
+                .pre_dispatch(
+                    crate::PreDispatch {
+                        method: &parts.method,
+                        uri: &parts.uri,
+                        version: parts.version,
+                        headers: &parts.headers,
+                        extensions: &mut parts.extensions,
+                    },
+                    conn,
+                )
+                .await;
+            if let Err(resp) = r {
+                // A 1xx is not a final response.
+                let resp = if resp.status().is_informational() {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                } else {
+                    resp
+                };
+                record(cx, "none", "none", resp.status().as_u16());
+                return Ok(resp);
+            }
+            Request::from_parts(parts, body)
+        }
+        None => req,
+    };
+
+    // The host routing key. Taken before bad_host runs, but only used for
+    // routing decisions that answer 400 anyway when bad_host then fails.
+    let host = request_host(req.headers(), req.uri());
     if ferryman_core::path::bad_path_normalized(req.uri().path())
-        || ferryman_core::path::ambiguous_route(&table, req.uri().path())
+        || ferryman_core::path::ambiguous_route_host(&table, host, req.uri().path())
     {
         record(cx, "none", "none", 400);
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
@@ -475,15 +759,53 @@ where
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad host\n"));
     }
 
-    let Some(route) = table.lookup(req.uri().path()) else {
+    // Pure lookup (ignores health). Upgrade and the declared-size cap are decided
+    // before the 404 and the strip-prefix check, as in ferryman-edge.
+    let route = table.lookup_host(host, req.uri().path());
+    let route_label = route.map(|r| r.label());
+    let (label, up_name): (&str, &str) = match (&route, &route_label) {
+        (Some(r), Some(l)) => (l, r.upstreams.label()),
+        _ => ("none", "none"),
+    };
+    if wants_upgrade || req.method() == http::Method::CONNECT {
+        record(cx, label, up_name, 501);
+        let h1 = req.version() <= http::Version::HTTP_11;
+        let mut resp = error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "protocol upgrades are not supported",
+        );
+        // h1: close, so bytes pipelined behind the Upgrade/CONNECT are never
+        // parsed as a request and forwarded.
+        if h1 {
+            resp.headers_mut()
+                .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
+        }
+        return Ok(resp);
+    }
+
+    // Declared length over the cap: refused before admission (no ticket).
+    if let Some(max) = policy.max_request_body_bytes {
+        let declared = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > max) {
+            record(cx, label, up_name, 413);
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload too large",
+            ));
+        }
+    }
+
+    let (Some(route), Some(route_label)) = (route, route_label) else {
         record(cx, "none", "none", 404);
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
     };
-    let route_label = route.prefix.clone();
-    let upstream = route.upstream.clone();
+    let route_label = route_label.into_owned();
     let span = tracing::Span::current();
     span.record("route", route_label.as_str());
-    span.record("upstream", &*upstream.name);
     let rewrite_host = route.rewrite_host;
     // bad_path/ambiguous_route already accepted the raw path; strip only
     // after them, on the normalised path, and re-check the result.
@@ -499,30 +821,25 @@ where
         None
     };
 
-    // Upgrades (WebSocket etc.) need both hops spliced together, which this
-    // proxy doesn't do; say so instead of forwarding a mangled plain GET.
-    // `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
-    // like curl --http2 or Java's HttpClient send it on every plain request.
-    let wants_upgrade = req
-        .headers()
-        .get(header::UPGRADE)
-        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
-    if wants_upgrade || req.method() == http::Method::CONNECT {
-        record(cx, &route_label, &upstream.name, 501);
-        return Ok(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "protocol upgrades are not supported",
-        ));
-    }
+    pre_admission();
 
-    let Some(admission) = upstream.try_acquire() else {
-        record(cx, &route_label, &upstream.name, 503);
+    // Each endpoint is offered at most once; none admitting is a 503 for
+    // this route (never another route).
+    let Some((upstream, admission)) = route.upstreams.acquire() else {
+        record(cx, &route_label, route.upstreams.label(), 503);
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream unavailable",
         ));
     };
+    let upstream = upstream.clone();
+    span.record("upstream", &*upstream.name);
 
+    // From here every exit gives a verdict or drops the ticket (release).
+    let ticket = Ticket::new(upstream.clone(), admission);
+    // In-flight (least_conn / p2c) lasts until the response body is dropped;
+    // every early return drops it with the function.
+    let inflight = upstream.track_inflight();
     let (mut parts, body) = req.into_parts();
     // `upstream_timeout` starts at end-of-request-body (immediately when
     // bodyless), so a slow upload can't be mistaken for a slow upstream.
@@ -531,6 +848,7 @@ where
         body,
         table.request_body_idle_timeout(),
         table.request_body_timeout(),
+        policy.max_request_body_bytes,
     );
     let counts_timeout = bodyless || body_done.is_some();
     strip_hop_by_hop(&mut parts.headers);
@@ -543,8 +861,12 @@ where
     // way. With `rewrite_host`, the upstream's own authority wins over both.
     // The client's effective host, for `Forwarded host=`; captured before
     // `rewrite_host` can overwrite it.
-    let client_host: Option<String> = table
-        .forwarded_header()
+    let hp = &policy.headers;
+    let forwarded_header = hp
+        .forwarded_header
+        .unwrap_or_else(|| table.forwarded_header());
+    // Captured for `Hooks::stamp` whenever it has names it may set.
+    let client_host: Option<String> = (forwarded_header || !hp.asserted.is_empty())
         .then(|| match parts.uri.authority() {
             Some(a) => a.as_str().rsplit('@').next().unwrap_or("").to_string(),
             None => parts
@@ -581,7 +903,7 @@ where
                 Ok(pq) => Some(pq),
                 Err(_) => {
                     // Request-derived, so the client's fault.
-                    upstream.release(admission);
+                    ticket.release();
                     record(cx, &route_label, &upstream.name, 400);
                     return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
                 }
@@ -592,7 +914,7 @@ where
     parts.uri = match http::Uri::from_parts(up_parts) {
         Ok(uri) => uri,
         Err(e) => {
-            upstream.release(admission);
+            ticket.release();
             record(cx, &route_label, &upstream.name, 502);
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
@@ -604,18 +926,19 @@ where
     // what the inbound connection negotiated; an inbound HTTP/2 request
     // otherwise fails the client outright.
     parts.version = http::Version::HTTP_11;
-    if table.trusted_proxies().is_empty() && is_private_peer(peer.ip()) {
-        warn_private_peer_once();
-    }
     apply_forwarded_headers(
         &mut parts.headers,
         peer.ip(),
         proto,
         client_host.as_deref(),
         &FwdCfg {
-            trusted: table.trusted_proxies(),
-            forwarded_header: table.forwarded_header(),
-            xff: table.xff_mode(),
+            trusted: hp
+                .trusted_proxies
+                .as_ref()
+                .unwrap_or_else(|| table.trusted_proxies()),
+            forwarded_header,
+            xff: hp.xff.unwrap_or_else(|| table.xff_mode()),
+            asserted: &hp.folded,
         },
     );
 
@@ -623,15 +946,47 @@ where
     if let Some((_, prefix)) = strip.as_ref().filter(|(_, p)| !p.is_empty()) {
         set_forwarded_prefix(&mut parts.headers, prefix);
     }
+    // Asserted names are the embedder's alone: drop whatever is there now.
+    for n in &hp.asserted {
+        parts.headers.remove(n);
+    }
+    // Cannot return a response. A panic is caught: ticket released (no
+    // verdict), 500 recorded. (With `panic = "abort"` the process dies.)
+    #[cfg(feature = "unstable-hooks")]
+    if let Some(hooks) = &policy.hooks {
+        let stamped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hooks.stamp(
+                &crate::StampCtx {
+                    extensions: &parts.extensions,
+                    conn,
+                    client_host: client_host.as_deref(),
+                },
+                &mut crate::AssertedHeaders::new(&mut parts.headers, &hp.asserted),
+            );
+        }));
+        if stamped.is_err() {
+            ticket.release();
+            record(cx, &route_label, &upstream.name, 500);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            ));
+        }
+    }
 
     let fwd = Request::from_parts(parts, body);
 
     let upstream_timeout = table.upstream_timeout;
-    // A client that left its upload idle for >= theta may have tripped the
-    // upstream's own body-read timeout; its 502/5xx then isn't evidence.
-    let theta = (table.request_body_idle_timeout() / 2).min(Duration::from_secs(1));
-    let stall = body_done.as_ref().map(|e| e.state.clone());
-    let client_stalled = || stall.as_ref().is_some_and(|s| s.client_stalled(theta));
+    // A client that left its upload idle for >= theta (see `stall_threshold`)
+    // may have tripped the upstream's own body-read timeout; its 502/5xx then
+    // isn't evidence.
+    let stall_theta = stall_threshold(table.request_body_idle_timeout());
+    let request_state = body_done.as_ref().map(|e| e.state.clone());
+    let client_stalled = || {
+        request_state
+            .as_ref()
+            .is_some_and(|s| s.stalled_during_request())
+    };
     // Completes when the request must be failed as an upstream timeout (504).
     let timer = async move {
         let Some(Eos { mut rx, state }) = body_done else {
@@ -653,8 +1008,8 @@ where
                 // the upstream's doing. A client that is merely slow is left
                 // to the body's own idle/total deadlines (408).
                 () = tokio::time::sleep(upstream_timeout) => {
-                    if !state.polled.swap(false, Ordering::Relaxed)
-                        && !state.waiting_on_client.load(Ordering::Relaxed)
+                    if !state.polled.swap(false, Ordering::AcqRel)
+                        && !state.waiting_on_client()
                     {
                         return;
                     }
@@ -672,7 +1027,9 @@ where
             // With EOS tracking the body is fully sent, so this is the
             // upstream's fault; the legacy path can't tell for bodies.
             if counts_timeout {
-                upstream.record_failure(admission);
+                ticket.failure();
+            } else {
+                ticket.abandon();
             }
             record(cx, &route_label, &upstream.name, 504);
             Ok(error_response(
@@ -680,63 +1037,100 @@ where
                 "upstream timeout",
             ))
         }
-        Some(Err(e)) if is_body_idle_timeout(&e) => {
-            // The client stalled or over-ran its upload: 408, no breaker effect.
-            upstream.release(admission);
-            tracing::debug!("client request body idle timeout");
-            record(cx, &route_label, &upstream.name, 408);
-            Ok(error_response(
-                StatusCode::REQUEST_TIMEOUT,
-                "request body timeout",
-            ))
-        }
-        Some(Err(e)) if is_client_body_error(&e) => {
-            // The client's request body failed (e.g. it hung up mid-upload).
-            // Not the upstream's fault, so the breaker stays out of it.
-            upstream.release(admission);
-            tracing::debug!(error = %e, "client request body failed");
-            record(cx, &route_label, &upstream.name, 400);
-            Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "request body error",
-            ))
-        }
         Some(Err(e)) => {
-            if client_stalled() {
-                upstream.release(admission);
-            } else {
-                upstream.record_failure(admission);
+            // Client-caused failures never reach the breaker: no verdict (not
+            // `failure`, and not `success`, which would let a client close an
+            // open breaker by aborting an upload).
+            if let Some(fault) = client_fault(&e) {
+                ticket.release();
+                let (status, msg) = match fault {
+                    ClientFault::Timeout => {
+                        tracing::debug!(target: "ferryman::proxy", "client request body idle timeout");
+                        (StatusCode::REQUEST_TIMEOUT, "request body timeout")
+                    }
+                    ClientFault::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large"),
+                    ClientFault::BodyError => {
+                        tracing::debug!(target: "ferryman::proxy", error = %e, "client request body failed");
+                        (StatusCode::BAD_REQUEST, "request body error")
+                    }
+                };
+                record(cx, &route_label, &upstream.name, status.as_u16());
+                return Ok(error_response(status, msg));
             }
-            tracing::warn!(upstream = %upstream.name, error = %e, "upstream request failed");
+            if client_stalled() {
+                ticket.release();
+            } else {
+                ticket.failure();
+            }
+            tracing::warn!(target: "ferryman::proxy", upstream = %upstream.name, error = %e, "upstream request failed");
             record(cx, &route_label, &upstream.name, 502);
             Ok(error_response(StatusCode::BAD_GATEWAY, "bad gateway"))
         }
         Some(Ok(resp)) => {
             let status = resp.status();
-            // Health is judged on the response head; the body is streamed
-            // afterwards with no timeout of its own.
+            let (mut rparts, rbody) = resp.into_parts();
+            // 502-504 heads mean "this upstream is unhealthy" (a 500 is one
+            // request's bug); a gateway answering them after the client
+            // stalled its upload is passing on its backend's reaction.
+            // Any other head: a probe succeeds now. A normal admission
+            // succeeds now under `HeadOnly` (the body is streamed afterwards
+            // with no verdict), or when the body is empty (it may never be
+            // polled); otherwise `DeferNormalToBodyEnd` moves the ticket into
+            // the `WatchedBody`.
+            let mut head_failed = false;
+            let mut deferred = None;
             if matches!(status.as_u16(), 502..=504) {
                 if client_stalled() {
-                    upstream.release(admission);
+                    ticket.release();
                 } else {
-                    upstream.record_failure(admission);
+                    ticket.failure();
+                    head_failed = true;
                 }
+            } else if policy.verdict == VerdictPolicy::DeferNormalToBodyEnd
+                && ticket.admission() == Admission::Normal
+                && !rbody.is_end_stream()
+            {
+                deferred = Some(ticket);
             } else {
-                upstream.record_success(admission);
+                ticket.success();
             }
-            let len = resp
-                .headers()
+            let len = rparts
+                .headers
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
             record_len(cx, &route_label, &upstream.name, status.as_u16(), len);
 
-            let (mut rparts, rbody) = resp.into_parts();
             strip_hop_by_hop(&mut rparts.headers);
-            Ok(Response::from_parts(rparts, rbody.boxed()))
+            let rbody = match policy.verdict {
+                VerdictPolicy::HeadOnly => Held {
+                    inner: rbody,
+                    _inflight: inflight,
+                }
+                .boxed(),
+                VerdictPolicy::DeferNormalToBodyEnd => WatchedBody {
+                    inner: rbody,
+                    _inflight: Some(inflight),
+                    upstream: upstream.clone(),
+                    ticket: deferred,
+                    request: request_state.clone(),
+                    stall: stall_theta,
+                    failed: head_failed,
+                    // The gap between the head and the first body poll counts.
+                    ready_at: Some(tokio::time::Instant::now()),
+                    client_stalled_reading: false,
+                }
+                .boxed(),
+            };
+            Ok(Response::from_parts(rparts, rbody))
         }
     }
 }
+
+/// Reserved call site for the route-aware pre-admission hook (after lookup,
+/// before `try_acquire`; must stay before it). Not public yet.
+#[inline(always)]
+fn pre_admission() {}
 
 /// Remove hop-by-hop headers: the fixed RFC 7230 set, plus any header named
 /// in the `Connection` header (which may list additional per-message
@@ -778,6 +1172,21 @@ fn bad_host(headers: &HeaderMap, uri: &http::Uri, version: http::Version) -> boo
     }
 }
 
+/// The host that picks a host group: the URI authority's host (absolute-form
+/// / h2 `:authority`), else the single `Host` header; the same value
+/// `bad_host` judges. `None` when there is none, several, or it is not text
+/// (bad_host rejects those). Lookup lowercases and strips the port.
+fn request_host<'a>(headers: &'a HeaderMap, uri: &'a http::Uri) -> Option<&'a str> {
+    if let Some(a) = uri.authority() {
+        return Some(a.host());
+    }
+    let mut it = headers.get_all(header::HOST).iter();
+    match (it.next(), it.next()) {
+        (Some(v), None) => v.to_str().ok(),
+        _ => None,
+    }
+}
+
 fn plain_authority(b: &[u8]) -> bool {
     if b == b"*"
         || b.iter()
@@ -788,44 +1197,23 @@ fn plain_authority(b: &[u8]) -> bool {
     if http::uri::Authority::try_from(b).is_err() {
         return false;
     }
-    // A port part after the host (not inside `[v6]`) must be 1-5 digits <= 65535.
-    match b.iter().rposition(|c| *c == b':') {
-        Some(i) if !b[i..].contains(&b']') => {
-            let p = &b[i + 1..];
-            !p.is_empty()
-                && p.iter().all(u8::is_ascii_digit)
-                && std::str::from_utf8(p).is_ok_and(|p| p.parse::<u16>().is_ok())
-        }
-        _ => true,
+    // What follows the host (after `]` for an IPv6 literal) must be empty or
+    // `:` + 1-5 digits <= 65535; `Authority` alone accepts `x:000080`, `[::1]x`.
+    let Ok(s) = std::str::from_utf8(b) else {
+        return false;
+    };
+    let rest = if s.starts_with('[') {
+        s.find(']').map(|i| &s[i + 1..])
+    } else {
+        Some(s.find(':').map_or("", |i| &s[i..]))
+    };
+    match rest {
+        Some("") => true,
+        Some(r) => r.strip_prefix(':').is_some_and(|p| {
+            p.len() <= 5 && p.bytes().all(|c| c.is_ascii_digit()) && p.parse::<u16>().is_ok()
+        }),
+        None => false,
     }
-}
-
-/// Did `client.request` fail because the client stalled its upload?
-fn is_body_idle_timeout(e: &hyper_util::client::legacy::Error) -> bool {
-    let mut source = std::error::Error::source(e);
-    while let Some(err) = source {
-        if err.is::<BodyIdleTimeout>() || err.is::<BodyTotalTimeout>() {
-            return true;
-        }
-        source = err.source();
-    }
-    false
-}
-
-/// Did `client.request` fail because reading the *client's* body failed?
-/// hyper reports errors from the outgoing body as user errors.
-fn is_client_body_error(e: &hyper_util::client::legacy::Error) -> bool {
-    let mut source = std::error::Error::source(e);
-    while let Some(err) = source {
-        if err
-            .downcast_ref::<hyper::Error>()
-            .is_some_and(|h| h.is_user())
-        {
-            return true;
-        }
-        source = err.source();
-    }
-    false
 }
 
 /// HTTP/2 lets clients split `cookie` into several fields; HTTP/1.1
@@ -850,6 +1238,8 @@ struct FwdCfg<'a> {
     trusted: &'a TrustedProxies,
     forwarded_header: bool,
     xff: XffMode,
+    /// Embedder-asserted names: folded like the trust-governed set.
+    asserted: &'a [(String, String)],
 }
 
 /// RFC 1918, 100.64/10, fc00::/7, fe80::/10, loopback.
@@ -869,12 +1259,20 @@ fn is_private_peer(ip: IpAddr) -> bool {
     }
 }
 
-/// One warning per process: with no `trusted_proxies`, a private-range peer
-/// is probably a proxy/LB whose forwarding headers are being discarded.
+/// Call once per connection (or request): with no `trusted_proxies`, a
+/// private-range peer is probably a proxy/LB whose forwarding headers are
+/// being discarded; logs one warning per process.
+pub fn warn_if_private_peer(table: &RouteTable, peer: SocketAddr) {
+    if table.trusted_proxies().is_empty() && is_private_peer(peer.ip()) {
+        warn_private_peer_once();
+    }
+}
+
 fn warn_private_peer_once() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
+            target: "ferryman::proxy",
             "request from a private/loopback peer while trusted_proxies is empty: if ferryman \
              sits behind a proxy or load balancer, add its address range to trusted_proxies, \
              otherwise client IP and scheme headers it sends are ignored"
@@ -931,21 +1329,8 @@ const TRUST_GOVERNED: [&str; 9] = [
     "x-real-ip",
 ];
 
-/// Is `name` (already lowercase) a non-canonical spelling of a trust-governed
-/// header? Allocation-free for names made only of `[a-z0-9-]`, which are
-/// either canonical or unrelated. Runs of separators are collapsed and
-/// the ends trimmed (`x__real_ip`, `-x-real-ip` -> `x-real-ip`).
-fn is_noncanonical_spelling(name: &str) -> bool {
-    // Already normal (no leading/trailing `-`, no `--`): protected iff an exact
-    // match, and exact matches are canonical, hence kept.
-    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-        && !name.contains("--")
-    {
-        return false;
-    }
-    // Fold every non-alphanumeric byte to `-`, collapse runs, trim the ends.
+/// Fold every non-alphanumeric byte to `-`, collapse runs, trim the ends.
+fn fold_name(name: &str) -> String {
     let mut folded = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_alphanumeric() {
@@ -954,16 +1339,51 @@ fn is_noncanonical_spelling(name: &str) -> bool {
             folded.push('-');
         }
     }
-    let folded = folded.trim_end_matches('-');
-    TRUST_GOVERNED.contains(&folded)
+    folded.truncate(folded.trim_end_matches('-').len());
+    folded
+}
+
+/// Is `name` (already lowercase) a non-canonical spelling of a trust-governed
+/// or asserted header? Runs of separators are collapsed and the ends trimmed
+/// (`x__real_ip`, `-x-real-ip` -> `x-real-ip`). Asserted names are folded the
+/// same way before comparing, so an asserted `x_tenant_id` or `X-Tenant--Id`
+/// also catches the client's `x-tenant-id` and `x.tenant.id`. A name equal to
+/// an asserted name is that name's own spelling; it is removed by the
+/// canonical removal step, not here.
+fn is_noncanonical_spelling(name: &str, asserted: &[(String, String)]) -> bool {
+    let normal = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--");
+    // Normal names are canonical for the built-in set (exact matches are
+    // kept); for asserted names only a different spelling folding to it counts.
+    let hit = |folded: &str| {
+        !TRUST_GOVERNED.contains(&folded)
+            && asserted.iter().any(|(raw, f)| raw != name && f == folded)
+    };
+    if normal {
+        return hit(name);
+    }
+    let folded = fold_name(name);
+    let governed = TRUST_GOVERNED.contains(&folded.as_str());
+    // An asserted alias (`x_forwarded_for`) must not strip a trusted peer's
+    // canonical trust-governed header, which `normal` names are exempt from.
+    governed || hit(&folded)
+}
+
+fn fold_asserted(names: &[HeaderName]) -> Vec<(String, String)> {
+    names
+        .iter()
+        .map(|n| (n.as_str().to_owned(), fold_name(n.as_str())))
+        .collect()
 }
 
 /// Remove, for every peer, non-canonical spellings (`X_Real_IP`, `x.forwarded.for`)
 /// of trust-governed headers.
-fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
+fn strip_noncanonical_spellings(headers: &mut HeaderMap, asserted: &[(String, String)]) {
     let bad: Vec<HeaderName> = headers
         .keys()
-        .filter(|k| is_noncanonical_spelling(k.as_str()))
+        .filter(|k| is_noncanonical_spelling(k.as_str(), asserted))
         .cloned()
         .collect();
     for k in bad {
@@ -1017,7 +1437,7 @@ fn apply_forwarded_headers(
     client_host: Option<&str>,
     cfg: &FwdCfg<'_>,
 ) {
-    strip_noncanonical_spellings(headers);
+    strip_noncanonical_spellings(headers, cfg.asserted);
     let trusted = cfg.trusted;
     let xfp = HeaderName::from_static("x-forwarded-proto");
     let xport = HeaderName::from_static("x-forwarded-port");
@@ -1200,7 +1620,8 @@ fn error_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Respon
         .expect("error response with fixed headers is always valid")
 }
 
-fn full_body(body: impl Into<Bytes>) -> ResponseBody {
+/// A complete in-memory response body (for hooks building responses).
+pub(crate) fn full_body(body: impl Into<Bytes>) -> ResponseBody {
     Full::new(body.into())
         .map_err(|never| match never {})
         .boxed()
@@ -1234,6 +1655,11 @@ mod tests {
             b"[::1]:x",
             b"x:+80",
             b"*",
+            b"[::1]x",
+            b"x:000080",
+            b"[::1]:000080",
+            b"x:65536",
+            b"[::1]:65536",
         ] {
             assert!(bad_host(&h(&[bad]), &root, V::HTTP_11), "{bad:?}");
         }
@@ -1245,6 +1671,7 @@ mod tests {
             "[::1]",
             "[::1]:80",
             "[::1]:8443",
+            "x:00080",
             "LOCALHOST",
         ] {
             assert!(!bad_host(&h(&[ok.as_bytes()]), &root, V::HTTP_11), "{ok}");
@@ -1301,6 +1728,7 @@ mod tests {
             trusted: t,
             forwarded_header,
             xff,
+            asserted: &[],
         }
     }
 
@@ -1675,6 +2103,136 @@ mod tests {
             assert_eq!(get(&m, "x--custom"), Some("keep"));
             assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
         }
+    }
+
+    #[test]
+    fn override_xff_trusted_and_forwarded_header_feed_fwdcfg() {
+        // The overrides reach apply_forwarded_headers through FwdCfg: Replace
+        // writes the client only, an empty trust list ignores forged values,
+        // forwarded_header = true appends `Forwarded`.
+        let h = [
+            ("x-forwarded-for", "6.6.6.6"),
+            ("x-forwarded-proto", "https"),
+        ];
+        let hdrs = |h: &[(&str, &str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in h {
+                m.append(
+                    HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            m
+        };
+        let hp = HeaderPolicy {
+            xff: Some(XffMode::Replace),
+            trusted_proxies: Some(TrustedProxies::default()),
+            forwarded_header: Some(true),
+            ..HeaderPolicy::default()
+        };
+        // Table says: trust 10/8, append, no Forwarded.
+        let table_trusted = tp(&["10.0.0.0/8"]);
+        let mut m = hdrs(&h);
+        let t = hp.trusted_proxies.as_ref().unwrap_or(&table_trusted);
+        apply_forwarded_headers(
+            &mut m,
+            "10.1.2.3".parse().unwrap(),
+            "http",
+            Some("h"),
+            &FwdCfg {
+                trusted: t,
+                forwarded_header: hp.forwarded_header.unwrap_or(false),
+                xff: hp.xff.unwrap_or(XffMode::Append),
+                asserted: &[],
+            },
+        );
+        assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
+        assert_eq!(get(&m, "x-forwarded-proto"), Some("http"));
+        assert!(get(&m, "forwarded").unwrap().contains("for=10.1.2.3"));
+        // No overrides: the table's trust applies, so the forged proto is kept.
+        let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
+        assert_eq!(get(&m, "x-forwarded-proto"), Some("https"));
+        assert_eq!(get(&m, "forwarded"), None);
+    }
+
+    #[test]
+    fn asserted_names_join_the_noncanonical_fold() {
+        let t = tp(&[]);
+        let asserted = fold_asserted(&[HeaderName::from_static("x-tenant")]);
+        let mut m = HeaderMap::new();
+        for k in ["x_tenant", "X.Tenant", "-x-tenant", "x--tenant", "x_other"] {
+            m.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                "v".parse().unwrap(),
+            );
+        }
+        m.append("x-tenant", "canonical".parse().unwrap());
+        apply_forwarded_headers(
+            &mut m,
+            "1.2.3.4".parse().unwrap(),
+            "http",
+            None,
+            &FwdCfg {
+                trusted: &t,
+                forwarded_header: false,
+                xff: XffMode::Append,
+                asserted: &asserted,
+            },
+        );
+        for k in ["x_tenant", "x.tenant", "-x-tenant", "x--tenant"] {
+            assert_eq!(get(&m, k), None, "{k}");
+        }
+        assert_eq!(get(&m, "x_other"), Some("v"));
+        // The canonical name is the caller's step-21 business, not the fold's.
+        assert_eq!(get(&m, "x-tenant"), Some("canonical"));
+        // Without `asserted` the same spellings survive.
+        assert!(!is_noncanonical_spelling("x_tenant", &[]));
+        assert!(is_noncanonical_spelling("x_tenant", &asserted));
+    }
+
+    #[test]
+    fn asserted_alias_never_strips_trusted_canonical_header() {
+        let asserted = fold_asserted(&[HeaderName::from_static("x_forwarded_for")]);
+        assert!(!is_noncanonical_spelling("x-forwarded-for", &asserted));
+        let t = tp(&["10.0.0.0/8"]);
+        let mut m = HeaderMap::new();
+        m.append("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        apply_forwarded_headers(
+            &mut m,
+            "10.1.2.3".parse().unwrap(),
+            "http",
+            None,
+            &FwdCfg {
+                trusted: &t,
+                forwarded_header: false,
+                xff: XffMode::Append,
+                asserted: &asserted,
+            },
+        );
+        assert_eq!(get(&m, "x-forwarded-for"), Some("9.9.9.9, 10.1.2.3"));
+    }
+
+    #[test]
+    fn asserted_names_are_folded_before_comparing() {
+        for asserted_raw in ["x_tenant_id", "X-Tenant--Id"] {
+            let asserted =
+                fold_asserted(&[HeaderName::from_bytes(asserted_raw.as_bytes()).unwrap()]);
+            for client in ["x-tenant-id", "x.tenant.id", "x__tenant-id"] {
+                assert!(
+                    is_noncanonical_spelling(client, &asserted),
+                    "{asserted_raw} vs {client}"
+                );
+            }
+            assert!(!is_noncanonical_spelling("x-tenant", &asserted));
+            assert!(!is_noncanonical_spelling("x-tenant-ids", &asserted));
+        }
+        // End to end: the client's normal-looking spelling is dropped.
+        let asserted = fold_asserted(&[HeaderName::from_static("x_tenant_id")]);
+        let mut m = HeaderMap::new();
+        m.append("x-tenant-id", "evil".parse().unwrap());
+        m.append("x.tenant.id", "evil".parse().unwrap());
+        strip_noncanonical_spellings(&mut m, &asserted);
+        assert!(m.is_empty(), "{m:?}");
     }
 
     #[test]

@@ -1,9 +1,9 @@
 # Routing
 
-One route has one prefix and one upstream. For each request ferryman picks the
-**longest matching prefix** on a path-segment boundary: `/a` matches `/a` and
-`/a/b`, never `/ab`. No match is a 404. There is no host-based routing and
-no load balancing across several upstreams (one route, one upstream).
+For each request ferryman picks the **longest matching prefix** on a
+path-segment boundary: `/a` matches `/a` and `/a/b`, never `/ab`, among the
+routes of one *host group* (see [Host routing](#host-routing)). No match is a
+404.
 
 Request path order, before anything reaches an upstream:
 
@@ -18,7 +18,7 @@ Request path order, before anything reaches an upstream:
 4. `Host` validation (`bad host` -> 400): a single bare `host[:port]` with a
    valid port, present on HTTP/1.1, when the URI has no authority. More than
    one `Host` header is always 400.
-5. Route lookup, then the upstream's circuit breaker ([Circuit
+5. Route lookup (host group, then longest prefix), then the upstream's circuit breaker ([Circuit
    breaker](circuit-breaker.md)).
 
 ## Normalisation
@@ -36,6 +36,54 @@ further. Nothing else is decoded, so `/api%2fx` does not match `/api`, and
 written in this normalised form; the config is rejected otherwise. Routes are
 case-sensitive and `%c0%af` / `%3B` are not interpreted, so case-folding or
 overlong-UTF-8 upstreams are not detected.
+
+## Host routing
+
+A route may set `host = "app.example.com"` or `host = "*.example.com"`.
+Routes without `host` are the default (hostless) set.
+
+The host of a request is the host of the URI authority (HTTP/1 absolute
+form, HTTP/2 `:authority`) when there is one, else the single `Host` header:
+the same value the `Host` validation above judges, so the two never
+disagree. It is lowercased, its port removed and ONE trailing dot removed
+(`App.Example.com.:8443` is `app.example.com`).
+
+1. An exact `host` route group wins.
+2. Else the wildcard group with the longest suffix. `*.example.com` matches
+   any name with at least one extra leading label (`a.example.com`,
+   `a.b.example.com`) and never `example.com` itself.
+3. Else the hostless routes (unknown host, no `Host` on HTTP/1.0, IP
+   literals).
+
+Inside the chosen group the longest prefix wins. **There is no fallback**:
+if the chosen host group has no matching prefix the answer is 404, not a
+hostless or wildcard route (that would send `/admin` on a host you
+configured to a different service). A dead upstream is 503 as always.
+
+`host` must be lowercase ASCII (write an IDN as `xn--` punycode), a valid DNS
+name (labels 1-63 of `[a-z0-9-]`, no leading or trailing `-`, at most 253
+bytes), without port or trailing dot, and not an IP address. `*` is only
+allowed as the whole first label. The same `host` and `prefix` twice is
+rejected; the same prefix on different hosts is fine. The `route` metric
+label of a host route is `host` + prefix (`app.example.com/api`); hostless
+routes keep the plain prefix. Routes in different groups may share an
+upstream.
+
+```toml
+[[routes]]
+host = "app.example.com"
+prefix = "/"
+upstream = "http://127.0.0.1:3000"
+
+[[routes]]
+host = "*.example.com"
+prefix = "/"
+upstream = "http://127.0.0.1:3001"
+
+[[routes]]
+prefix = "/"          # everything else
+upstream = "http://127.0.0.1:3002"
+```
 
 ## Routing is not access control
 

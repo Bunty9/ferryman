@@ -8,9 +8,11 @@
 pub use crate::breaker::{Admission, CircuitState};
 use crate::breaker::{Breaker, BreakerConfig};
 use crate::proxies::TrustedProxies;
+pub use crate::upstream_set::{Endpoint, LbPolicy, UpstreamSet};
 use crate::Error;
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +26,9 @@ pub struct Upstream {
     /// the scheme (80 for http) when the URI doesn't specify one.
     pub name: String,
     breaker: Arc<Breaker>,
+    /// Requests currently dispatched to this endpoint (all routes), for
+    /// `least_conn` / `p2c`. Shared by clones, so it survives a reload.
+    inflight: Arc<AtomicUsize>,
     health_path: Option<String>,
     health_disabled: bool,
 }
@@ -41,6 +46,7 @@ impl Upstream {
             uri,
             name,
             breaker,
+            inflight: Arc::default(),
             health_path: None,
             health_disabled: false,
         })
@@ -69,6 +75,21 @@ impl Upstream {
     /// ticket to pass back to `record_*`; see [`Admission`].
     pub fn try_acquire(&self) -> Option<Admission> {
         self.breaker.try_acquire()
+    }
+
+    /// Requests currently counted against this endpoint (see
+    /// [`Upstream::track_inflight`]).
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed)
+    }
+
+    /// Count one in-flight request until the guard drops; the load balancer
+    /// (`least_conn`, `p2c`) reads it. The proxy holds it from admission until
+    /// the response body ends or is dropped (so a long download or SSE stream
+    /// counts), independent of the breaker verdict.
+    pub fn track_inflight(&self) -> InflightGuard {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        InflightGuard(self.inflight.clone())
     }
 
     /// See [`Breaker::release`].
@@ -105,6 +126,16 @@ impl Upstream {
     }
 }
 
+/// Decrements the endpoint's in-flight count on drop.
+#[must_use = "the request is only counted while the guard lives"]
+pub struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn upstream_name(uri: &http::Uri) -> String {
     // Hostnames are case-insensitive; one name per backend, one breaker.
     let host = uri.host().unwrap_or("").to_ascii_lowercase();
@@ -115,11 +146,18 @@ pub(crate) fn upstream_name(uri: &http::Uri) -> String {
     format!("{host}:{port}")
 }
 
-/// One routing rule: a path prefix and the upstream it forwards to.
+/// One routing rule: a path prefix and the endpoints it forwards to.
 #[non_exhaustive]
 pub struct Route {
     pub prefix: String,
-    pub upstream: Upstream,
+    /// Host this route is limited to: `a.example.com` or `*.example.com`
+    /// (normalised: lowercase ASCII, no port, no trailing dot). `None` = a
+    /// hostless route, the default set used when no host group applies. See
+    /// [`RouteTable::lookup_host`].
+    pub host: Option<String>,
+    /// The endpoints and load-balancing policy. See [`Route::upstream`] for
+    /// the single-endpoint shortcut.
+    pub upstreams: UpstreamSet,
     /// `true`: send the upstream's own authority as `Host`. `false` (default):
     /// keep the client's `Host` (or the request authority, see the proxy docs).
     pub rewrite_host: bool,
@@ -129,14 +167,27 @@ pub struct Route {
 }
 
 impl Route {
-    /// A route with `rewrite_host` off.
+    /// A one-endpoint route with `rewrite_host` off.
     pub fn new(prefix: impl Into<String>, upstream: Upstream) -> Self {
+        Self::with_upstreams(prefix, UpstreamSet::single(upstream))
+    }
+
+    /// A route over several endpoints.
+    pub fn with_upstreams(prefix: impl Into<String>, upstreams: UpstreamSet) -> Self {
         Self {
             prefix: prefix.into(),
-            upstream,
+            host: None,
+            upstreams,
             rewrite_host: false,
             strip_prefix: false,
         }
+    }
+
+    /// The first endpoint: THE upstream of a route configured with
+    /// `upstream = "..."`. For a multi-endpoint route use
+    /// [`Route::upstreams`] and [`UpstreamSet::acquire`].
+    pub fn upstream(&self) -> &Upstream {
+        self.upstreams.first()
     }
 
     /// Set [`Route::strip_prefix`].
@@ -175,6 +226,23 @@ impl Route {
         let out = if rest.is_empty() { "/" } else { rest };
         // Defence in depth: never hand upstream a path bad_path would refuse.
         (out.starts_with('/') && !crate::path::bad_path(out)).then(|| out.to_string())
+    }
+
+    /// Set [`Route::host`]. Not validated here (`build_table` does): it must
+    /// already be normalised or it can never match.
+    pub fn with_host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    /// Metric label: the prefix, or `host` + prefix (`a.example.com/api`) for
+    /// a host route. Config-bounded, and distinct when two host groups share
+    /// a prefix.
+    pub fn label(&self) -> Cow<'_, str> {
+        match &self.host {
+            Some(h) => Cow::Owned(format!("{h}{}", self.prefix)),
+            None => Cow::Borrowed(&self.prefix),
+        }
     }
 
     /// Set [`Route::rewrite_host`].
@@ -372,20 +440,48 @@ impl RouteTable {
     /// rejects those on the raw path before calling `lookup`. Normalisation
     /// runs exactly once and is not idempotent for malformed escapes
     /// (`/%2%61` becomes `/%2a`).
+    ///
+    /// Considers hostless routes only (same as `lookup_host(None, path)`).
     pub fn lookup(&self, path: &str) -> Option<&Route> {
-        let path = normalize(path);
-        self.routes
-            .iter()
-            .find(|r| prefix_matches(&r.prefix, &path))
+        self.lookup_host(None, path)
     }
 
-    /// Upstreams referenced by this table, deduplicated by name — routes
-    /// sharing an upstream URI share one `Upstream`/breaker.
+    /// [`RouteTable::lookup`] with the request's host. `host` is the
+    /// validated request authority text (URI authority, else the `Host`
+    /// header; `host[:port]` or a bracketed IPv6 literal, any case); `None`
+    /// or empty selects the hostless routes.
+    ///
+    /// The host is lowercased, its port stripped and ONE trailing dot
+    /// removed. The host group is then chosen: an exact host route beats a
+    /// wildcard one, the longest wildcard suffix beats a shorter one, and
+    /// hostless routes apply only when no host route applies. A wildcard
+    /// `*.example.com` matches one or more extra leading labels
+    /// (`a.example.com`, `a.b.example.com`) and never `example.com` itself.
+    /// Within the chosen group the longest prefix wins. There is NO fallback:
+    /// when the chosen host group has no matching prefix the result is
+    /// `None` (404), not a hostless or less specific host route. IP literals
+    /// can only match hostless routes (config hosts are never IPs).
+    pub fn lookup_host(&self, host: Option<&str>, path: &str) -> Option<&Route> {
+        let path = normalize(path);
+        let host = host.map(norm_host).unwrap_or_default();
+        let rank = |r: &Route| match r.host.as_deref() {
+            None => Some(0),
+            Some(p) => host_rank(p, &host),
+        };
+        let best = self.routes.iter().filter_map(rank).max()?;
+        self.routes
+            .iter()
+            .find(|r| rank(r) == Some(best) && prefix_matches(&r.prefix, &path))
+    }
+
+    /// Endpoints referenced by this table, deduplicated by name — routes
+    /// sharing an endpoint share one `Upstream`/breaker.
     pub fn upstreams(&self) -> impl Iterator<Item = &Upstream> {
         let mut seen = std::collections::HashSet::new();
         self.routes
             .iter()
-            .filter_map(move |r| seen.insert(r.upstream.name.clone()).then_some(&r.upstream))
+            .flat_map(|r| r.upstreams.upstreams())
+            .filter(move |u| seen.insert(u.name.clone()))
     }
 
     /// Set `ferryman_circuit_state` / `ferryman_upstream_alive` for every
@@ -394,6 +490,37 @@ impl RouteTable {
     pub fn publish_gauges(&self) {
         for u in self.upstreams() {
             u.breaker.set_gauges();
+        }
+    }
+}
+
+/// Lowercase, drop the port and ONE trailing dot.
+fn norm_host(h: &str) -> Cow<'_, str> {
+    let h = if h.starts_with('[') {
+        h.find(']').map_or(h, |i| &h[..=i])
+    } else {
+        h.split(':').next().unwrap_or("")
+    };
+    let h = h.strip_suffix('.').unwrap_or(h);
+    if h.bytes().any(|c| c.is_ascii_uppercase()) {
+        Cow::Owned(h.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(h)
+    }
+}
+
+/// Specificity of host pattern `pat` for normalised `host`: `None` = does
+/// not apply; exact = `usize::MAX`; wildcard = suffix length (longest wins);
+/// both beat hostless (0).
+fn host_rank(pat: &str, host: &str) -> Option<usize> {
+    if host.is_empty() {
+        return None;
+    }
+    match pat.strip_prefix('*') {
+        None => (pat == host).then_some(usize::MAX),
+        Some(suffix) => {
+            let extra = host.strip_suffix(suffix)?;
+            (!extra.is_empty() && extra.split('.').all(|l| !l.is_empty())).then_some(suffix.len())
         }
     }
 }

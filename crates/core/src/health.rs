@@ -162,14 +162,14 @@ mod tests {
             "disabled must not be probed"
         );
         assert_eq!(
-            off.load().lookup("/").unwrap().upstream.state(),
+            off.load().lookup("/").unwrap().upstream().state(),
             crate::CircuitState::Closed
         );
 
         let on = one_route_table(addr, Some("/ready"), false);
         let h = tokio::spawn(health_loop(on.clone(), Duration::from_millis(30)));
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while on.load().lookup("/").unwrap().upstream.state() != crate::CircuitState::Open
+        while on.load().lookup("/").unwrap().upstream().state() != crate::CircuitState::Open
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -181,7 +181,7 @@ mod tests {
             "{seen:?}"
         );
         assert_eq!(
-            on.load().lookup("/").unwrap().upstream.state(),
+            on.load().lookup("/").unwrap().upstream().state(),
             crate::CircuitState::Open
         );
     }

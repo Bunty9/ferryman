@@ -13,12 +13,41 @@ contract (config keys, status codes, metrics) is in the
 |                  | `route.rs`                              | `Upstream`, `Route`, `RouteTable`, `SharedTable`, prefix lookup  |
 |                  | `config.rs`                             | TOML schema, `load_config`, validating `build_table`             |
 |                  | `health.rs`                             | Concurrent active health checks                                  |
+| `ferryman-proxy` | `lib.rs`                                | `StreamingClient`, `ProxyClient`, `LATENCY_BUCKETS`, client builder |
+|                  | `pipeline.rs`                           | `Proxy`, `Policy`, `HeaderPolicy` and the per-request pipeline (re-exported as `ferryman::proxy`) |
+|                  | `conn.rs`                               | `ConnCtx` (peer, local address, optional `TlsInfo`)              |
+|                  | `verdict.rs`                            | `VerdictPolicy`, request/response body watchers, `Ticket`        |
+|                  | `hooks.rs`                              | `Hooks`, `StampCtx`, `AssertedHeaders` (feature `unstable-hooks`) |
+|                  | `testkit.rs`                            | Shared smuggling suite (feature `testkit`)                       |
 | `ferryman`       | `lib.rs`                                | `serve`: accept loop, deadlines, TLS, graceful shutdown          |
-|                  | `proxy.rs`                              | Per-request handler                                              |
 |                  | `admin.rs`                              | `/metrics`, `/healthz`, `/readyz` server                         |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
 |                  | `reload.rs`                             | Debounced directory watcher, hash de-dup, SIGHUP/TLS reload                                    |
 |                  | `main.rs`                               | CLI (`check`, `healthcheck` subcommands), tracing, metrics recorder, signals |
+
+Dependency order: `ferryman-core` -> `ferryman-proxy` -> `ferryman`. The
+request pipeline lives in `ferryman-proxy` so that other front ends (for
+example `ferryman-edge`) run the same code; `ferryman` is the accept loop,
+TLS, admin, reload and CLI around it and re-exports the proxy crate
+(`ferryman::ferryman_proxy`, plus the old `ferryman::proxy` paths).
+
+`Proxy::new(table, Policy::default())` builds the handler once; a `ConnCtx`
+per connection carries the peer, the local address and TLS facts, and
+`Proxy::handle(req, &ctx)` runs the pipeline below. `Policy` holds the
+embedder knobs, all defaulting to ferryman's own behaviour:
+
+- `verdict: VerdictPolicy` - `HeadOnly` (default, ferryman) gives a normal
+  admission's breaker verdict at the response head; `DeferNormalToBodyEnd`
+  gives it at the end of the body, so a mid-body upstream reset counts.
+  Probe admissions always get theirs at the head. Every admission is a
+  `Ticket` that resolves exactly once (success, failure or release),
+  including when the handler future is dropped.
+- `headers: HeaderPolicy` - overrides for `xff`, `trusted_proxies`,
+  `Forwarded`, a body-size cap, and `asserted` header names an embedder may
+  set after the strips.
+- `hooks` (feature `unstable-hooks`, outside semver) - `pre_dispatch` sees a
+  read-only request head and may short-circuit before admission; `stamp`
+  sets only `asserted` names after the forwarded-header strips.
 
 `ferryman` is a library plus a thin binary so the end-to-end tests
 can drive the real `serve` loop on an ephemeral port.
@@ -34,16 +63,16 @@ accept ── set TCP_NODELAY
   │    first request must arrive within 10s; later h1 heads within
   │    `keepalive_timeout_secs` (default 10)
   │
-  └─ proxy::handle_streaming
+  └─ Proxy::handle (ferryman-proxy; `proxy::handle_streaming` is a thin shim)
        1. table.load_full()             one Arc for the whole request
        2. local_health_path             GET/HEAD match -> 200, answered first
        2a. bad_path_normalized(path)     raw and normalised: dot segments, NUL, %u, double-encoded -> 400
        2b. ambiguous_route(table, path) %2F/%5C/\/; reading picks another route -> 400
        2c. bad_host                     single bare host[:port], present on 1.1 -> 400
-       2d. lookup(path)                 none -> 404
+       2d. lookup_host(host, path)      host group, then longest prefix; none -> 404
        2e. strip_prefix remainder check  re-checked at runtime, failing -> 400 (before admission)
        3. Upgrade (not h2c) / CONNECT   -> 501
-       4. upstream.try_acquire()        None -> 503, else Admission
+       4. route.upstreams.acquire()     LB order, try_acquire once per endpoint; none admits -> 503, else (endpoint, Admission)
        5. rewrite request:
             strip hop-by-hop, join h2 cookies, Host from authority (route `rewrite_host`: upstream authority),
             URI = upstream scheme+authority + original path+query
@@ -86,6 +115,16 @@ prefix ending in `/` is a plain `starts_with`, so `/` is a catch-all. A
 linear scan wins over a trie for the tens of routes this targets (see
 `crates/core/benches/lookup.rs`).
 
+Host routing: a route may carry `host` (exact or `*.suffix`). `lookup_host`
+normalises the request host (the URI authority's host, else the single `Host`
+header: lowercase, port and one trailing dot dropped), picks the group (exact
+host, else the wildcard with the longest suffix, else hostless), then the
+longest prefix inside it. A chosen group with no matching prefix is a 404
+with no fallback to another group. `ambiguous_route_host` compares readings
+inside the same group, so `ambiguous_route` runs with the host before
+`bad_host` has judged it (an invalid host is a 400 either way). The metric
+label of a host route is `host` + prefix.
+
 Lookup deliberately ignores health. If `/api/v1` is down, falling back to
 `/api` would send the request to a different service, so the answer is a
 503.
@@ -108,7 +147,12 @@ routes are not access control: such variants fall to a less specific route
 ## Circuit breaker
 
 One breaker per upstream `host:port` (lowercased), shared by every route
-pointing there and kept across hot reloads.
+pointing there and kept across hot reloads. A route holds an `UpstreamSet`
+(endpoints with weights, plus `lb`: smooth weighted round robin, `least_conn`,
+`p2c`); the set only orders endpoints, `acquire` offers each to its breaker at
+most once and the `Ticket` goes to the one that admits. In-flight counts
+(`Upstream::track_inflight`; the guard rides the response body, not the
+`Ticket`, so streams count until the body ends or is dropped) feed `least_conn`/`p2c`.
 
 ```
              failures >= threshold

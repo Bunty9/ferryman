@@ -27,10 +27,15 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: clippy, rustfmt
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ matrix.rust }}
+          COMPONENTS: "clippy,rustfmt"
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update -c "$COMPONENTS"
+          rustup default "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install nextest
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
@@ -42,8 +47,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy (proxy, all features)
+        run: cargo clippy -p ferryman-proxy --all-targets --all-features -- -D warnings
       - name: cargo nextest
         run: cargo nextest run --workspace --no-fail-fast --locked
+      # unstable-hooks is off by default, so the workspace run above skips it.
+      - name: cargo test ferryman-proxy (all features)
+        run: cargo test -p ferryman-proxy --all-features --locked
       # nextest does not run doctests.
       - name: cargo test --doc
         run: cargo test --doc --workspace --locked
@@ -57,7 +67,7 @@ jobs:
             | jq -e '[.packages[] | select(.manifest_path | contains("/examples/")) | .publish] | all(. == [])'
 
   # Blocking: public API must stay semver-compatible with the last release
-  # on crates.io (action default baseline = registry). Checks both crates.
+  # on crates.io (action default baseline = registry). Checks ferryman and ferryman-core.
   semver:
     name: cargo-semver-checks
     runs-on: ubuntu-latest
@@ -67,6 +77,12 @@ jobs:
           persist-credentials: false
       # The action installs its own toolchain (rust-toolchain input, default stable).
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          # ferryman-proxy has no crates.io baseline until 0.4.0 is
+          # published; drop this exclude once it is.
+          exclude: ferryman-proxy
+          # unstable-hooks is outside semver: check default features only.
+          feature-group: default-features
 
   # Blocking: the declared rust-version (1.88) must really build.
   # rust-toolchain.toml pins stable, hence RUSTUP_TOOLCHAIN.
@@ -79,12 +95,19 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-        with:
-          toolchain: "1.88"
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          TOOLCHAIN: "1.88"
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo check
         run: cargo check --workspace --locked
+      - name: cargo check (proxy, all features)
+        run: cargo check -p ferryman-proxy --all-features --locked
 
   deny:
     name: cargo-deny
@@ -93,9 +116,14 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-        with:
-          toolchain: stable
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
@@ -112,9 +140,14 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-        with:
-          toolchain: stable
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo bench --no-run
         run: cargo bench --workspace --no-run
@@ -187,9 +220,14 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-        with:
-          toolchain: stable
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo build --release
         run: cargo build --locked --release -p ferryman

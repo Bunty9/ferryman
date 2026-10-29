@@ -2,14 +2,40 @@
 
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
-crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`
-and `ferryman` are released together with the same version.
+crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
+`ferryman-proxy` and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Added
+
+- `ferryman-proxy` crate: the request pipeline (`Proxy`, `Policy`, `ConnCtx`), shared with ferryman-edge. `ferryman` re-exports it (`ferryman::ferryman_proxy`) and keeps the old `ferryman::proxy` / `ferryman::StreamingClient` paths.
+- `ferryman_proxy::VerdictPolicy` (`HeadOnly` default, `DeferNormalToBodyEnd`) on `Policy::verdict`: the latter gives a normal admission's breaker verdict at the end of the response body, so an upstream that resets mid-body opens the breaker. `ferryman` itself keeps `HeadOnly`.
+- `ferryman-proxy` feature `unstable-hooks` (off by default, outside semver; changes only in proxy minor releases): `Hooks` (`pre_dispatch` gets a read-only request head plus mutable extensions, never the body, and may short-circuit before admission; `stamp` sets only `HeaderPolicy::asserted` names after the strips, a panic in it becomes a 500), `PreDispatch`, `StampCtx`, `AssertedHeaders`, `BoxFuture`, `Policy::hooks`; `full_body` and `ResponseBody` are public with it. `Proxy::with_client` panics if `HeaderPolicy::asserted` lists a framing or hop-by-hop name.
+- `ferryman-proxy` feature `testkit` (outside semver): the shared HTTP/1 request-smuggling regression suite, also run from ferryman's own tests (`crates/server/tests/smuggling.rs`).
+
+- Load balancing: a route may list several endpoints with `upstreams = ["http://a:1", { addr = "http://b:2", weight = 3 }]` and pick with `lb = "round_robin" | "least_conn" | "p2c"` (default `round_robin`; weights `1..=1000` for `round_robin` and `p2c`). Each endpoint keeps its own breaker and health probe; endpoints whose breaker refuses are skipped and all refusing is 503. Core: `UpstreamSet`, `Endpoint`, `LbPolicy`, `MAX_WEIGHT`, `Upstream::{inflight, track_inflight}`, `InflightGuard`, `Route::{with_upstreams, upstream}`, `Error::InvalidUpstreamSet`, `UpstreamToml`.
+
+- Host routing: a route may set `host = "app.example.com"` or `"*.example.com"` (wildcard = one or more leading labels, never the apex). Exact beats wildcard (longest suffix) beats hostless; longest prefix inside the group; a matched host group without a matching prefix is a 404 (no fallback). The host is the URI authority (absolute form, h2 `:authority`) else `Host`, lowercased, port and one trailing dot dropped. `host` must be lowercase ASCII/punycode, a valid DNS name, not an IP; duplicate (host, prefix) is rejected. Metric `route` label for host routes is `host`+prefix. Core: `RouteToml::host`, `Route::{host, with_host, label}`, `RouteTable::lookup_host`, `path::ambiguous_route_host`, `Error::{InvalidHost, DuplicateHostPrefix}`; `lookup` considers hostless routes only.
+
+### Changed
+
+- BREAKING (`ferryman-core`): `Route::upstream` is no longer a field. A route now holds an `UpstreamSet` (`Route::upstreams`); use `Route::upstream()` for the first/only endpoint. `RouteToml::upstream` is now `Option<String>` (with the new `upstreams` and `lb` fields). Migration: TOML configs with `upstream = "..."` are unchanged; library users replace `route.upstream.x()` with `route.upstream().x()` (or `route.upstreams.acquire()` for the whole set). `Route::new(prefix, upstream)` still builds a one-endpoint route.
+- The request handler moved to `ferryman-proxy`; the old paths re-export it unchanged. The `metrics` dependency of `ferryman` is now dev-only.
+
 ### Fixed
 
+- Embedder-asserted header names (`HeaderPolicy::asserted`) are folded like the trust-governed set before comparing, so an asserted `x_tenant_id` also removes a client's `x-tenant-id` and `x.tenant.id`.
 - release image job: extraction script printed checksum output into the version.
+
+### Behaviour changes for ferryman users
+
+- `Host` validation is stricter: a port must be 1-5 digits and at most 65535, and nothing but `:port` may follow an IPv6 literal. Values such as `[::1]x`, `x:000080` and `[::1]:000080` now get 400.
+- A request dropped mid-flight (client hung up before the response head) releases its breaker ticket: a dropped half-open probe re-arms the probe slot (at most once per cooldown) instead of leaking it until the next cooldown.
+- The client-stall threshold has a 100 ms floor and nanosecond resolution (inert for config-file tables, whose idle timeout is at least 1 s); a stall of exactly the threshold now counts.
+- `Proxy-Connection` is stripped as a hop-by-hop header.
+- An `Upgrade` (other than `h2c`) or `CONNECT` request now gets 501 even when no route matches (it was 404), and a declared body over the size cap is refused with 413 before the 404; both are decided before the `strip_prefix` remainder check, so an upgrade on a `strip_prefix` route is never answered 400.
+- Handler log events use the explicit target `ferryman::proxy`; the default `info` filter is unaffected.
 
 ## [0.3.0] - 2026-10-11
 

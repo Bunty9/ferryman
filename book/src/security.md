@@ -29,6 +29,18 @@ dependency list (`cargo auditable`), so `cargo audit bin ./ferryman` works on
 them. Dependencies are checked in CI with `cargo-deny`, and workflows are
 SHA-pinned and linted with zizmor.
 
+## Request smuggling regression suite
+
+`crates/server/tests/smuggling.rs` sends raw-TCP attack requests through
+`ferryman::serve` to a byte-recording upstream and asserts both the client
+outcome and exactly what was forwarded. It covers Content-Length /
+Transfer-Encoding conflicts and variants, duplicate or malformed
+Content-Length, obs-fold, bare LF, NUL/CR, chunk-size abuse, request-line
+oddities, pipelining, `Upgrade` and `Expect: 100-continue`. Ambiguous framing
+is rejected with 400 (or TE wins and Content-Length is dropped, with the
+connection closed); nothing smuggled ever reaches the upstream. The suite
+gates any change to upgrade handling.
+
 ## Runtime posture
 
 - **Non-root image.** `FROM scratch`, uid/gid 65532, no writable paths

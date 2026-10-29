@@ -7,6 +7,10 @@ and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
+### Added
+
+- HTTP/1 request-smuggling / desync regression suite (`crates/server/tests/smuggling.rs`, raw-TCP e2e with a byte-recording upstream).
+
 ### Fixed
 
 - release image job: extraction script printed checksum output into the version.

@@ -66,7 +66,6 @@ http-body-util = { workspace = true }
 arc-swap = { workspace = true }
 notify = { workspace = true, optional = true }
 toml = { workspace = true }
-metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 metrics-util = { workspace = true, optional = true }
 anyhow = { workspace = true }
@@ -81,6 +80,7 @@ libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["http2"] }
+metrics = { workspace = true }
 ferryman-proxy = { workspace = true, features = ["testkit"] }
 
 # cargo-binstall: fetch the prebuilt archive from the GitHub release

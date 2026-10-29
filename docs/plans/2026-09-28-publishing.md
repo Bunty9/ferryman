@@ -172,6 +172,22 @@ Until that's done for both crates, `cargo publish` in the workflow will
 fail with an OIDC/auth error; the long-lived token from Step 3 works as a
 fallback in the meantime but isn't used by the workflow.
 
+### One-time step for 0.4.0: first publish of `ferryman-proxy`
+
+`ferryman-proxy` is a new crate, and Trusted Publishing can only be
+configured for a crate that already exists, so the release workflow cannot
+publish it the first time. Before tagging 0.4.0 (not yet done):
+
+1. From the owner's account, with the long-lived token from Step 3:
+   `cargo publish -p ferryman-proxy` (after `ferryman-core 0.4.0` is on
+   crates.io, since it depends on it; so publish `ferryman-core` first the
+   same way if the workflow has not).
+2. On the crate's crates.io page, *Settings* -> *Trusted Publishing* ->
+   *Add GitHub* with the same values as above (owner `Bunty9`, repo
+   `ferryman`, workflow `release.yml`, no environment).
+3. Then push the tag; the workflow's idempotent per-crate publish skips the
+   crates that are already up.
+
 ### Recovering from a half-published release
 
 `ferryman` depends on `ferryman-core`, so the `publish` job always does

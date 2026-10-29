@@ -9,23 +9,26 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 
 ### Added
 
-- `ferryman-proxy` crate (request pipeline, shared with ferryman-edge); `ferryman` re-exports it, no API change.
-- HTTP/1 request-smuggling / desync regression suite (`crates/server/tests/smuggling.rs`, raw-TCP e2e with a byte-recording upstream).
-
+- `ferryman-proxy` crate: the request pipeline (`Proxy`, `Policy`, `ConnCtx`), shared with ferryman-edge. `ferryman` re-exports it (`ferryman::ferryman_proxy`) and keeps the old `ferryman::proxy` / `ferryman::StreamingClient` paths.
 - `ferryman_proxy::VerdictPolicy` (`HeadOnly` default, `DeferNormalToBodyEnd`) on `Policy::verdict`: the latter gives a normal admission's breaker verdict at the end of the response body, so an upstream that resets mid-body opens the breaker. `ferryman` itself keeps `HeadOnly`.
-
-- `ferryman-proxy` feature `unstable-hooks` (off by default, outside semver; changes only in proxy minor releases): `Hooks` (`pre_dispatch` gets a read-only request head plus mutable extensions, `PreDispatch`, never the body, and may short-circuit before admission; `stamp` sets only `HeaderPolicy::asserted` names after the strips, a panic in it becomes a 500), `PreDispatch`, `StampCtx`, `AssertedHeaders`, `BoxFuture`, `Policy::hooks`; `full_body` and `ResponseBody` are public with it. `Proxy::with_client` panics if `HeaderPolicy::asserted` lists a framing or hop-by-hop name (`host`, `content-length`, `transfer-encoding`, `te`, `trailer`, `upgrade`, `connection`, `keep-alive`, `proxy-connection`, `proxy-authenticate`, `proxy-authorization`, `x-request-id`).
+- `ferryman-proxy` feature `unstable-hooks` (off by default, outside semver; changes only in proxy minor releases): `Hooks` (`pre_dispatch` gets a read-only request head plus mutable extensions, never the body, and may short-circuit before admission; `stamp` sets only `HeaderPolicy::asserted` names after the strips, a panic in it becomes a 500), `PreDispatch`, `StampCtx`, `AssertedHeaders`, `BoxFuture`, `Policy::hooks`; `full_body` and `ResponseBody` are public with it. `Proxy::with_client` panics if `HeaderPolicy::asserted` lists a framing or hop-by-hop name.
+- `ferryman-proxy` feature `testkit` (outside semver): the shared HTTP/1 request-smuggling regression suite, also run from ferryman's own tests (`crates/server/tests/smuggling.rs`).
 
 ### Changed
 
-- Host header validation is stricter: a port must be 1–5 digits and at most 65535, and nothing but `:port` may follow an IPv6 literal (400 otherwise).
-- A request dropped mid-flight (client hung up before the response head) now releases its breaker ticket: a dropped half-open probe re-arms the probe slot (at most once per cooldown) instead of leaking it until the next cooldown.
-- The client-stall threshold now has a 100 ms floor and nanosecond resolution (the floor is inert for config-file tables, whose idle timeout is at least 1 s; a sub-second idle set via `RouteTable::with_request_body_idle_timeout` gets a threshold of at least 100 ms).
+- The request handler moved to `ferryman-proxy`; the old paths re-export it unchanged. The `metrics` dependency of `ferryman` is now dev-only.
 
 ### Fixed
 
 - Embedder-asserted header names (`HeaderPolicy::asserted`) are folded like the trust-governed set before comparing, so an asserted `x_tenant_id` also removes a client's `x-tenant-id` and `x.tenant.id`.
 - release image job: extraction script printed checksum output into the version.
+
+### Behaviour changes for ferryman users
+
+- `Host` validation is stricter: a port must be 1-5 digits and at most 65535, and nothing but `:port` may follow an IPv6 literal. Values such as `[::1]x`, `x:000080` and `[::1]:000080` now get 400.
+- A request dropped mid-flight (client hung up before the response head) releases its breaker ticket: a dropped half-open probe re-arms the probe slot (at most once per cooldown) instead of leaking it until the next cooldown.
+- The client-stall threshold has a 100 ms floor and nanosecond resolution (inert for config-file tables, whose idle timeout is at least 1 s); a stall of exactly the threshold now counts.
+- Handler log events use the explicit target `ferryman::proxy`; the default `info` filter is unaffected.
 
 ## [0.3.0] - 2026-10-11
 

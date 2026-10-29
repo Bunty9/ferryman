@@ -15,6 +15,9 @@ pub mod tls;
 /// The per-request handler (re-exported from `ferryman-proxy`).
 pub use ferryman_proxy::pipeline as proxy;
 
+/// The request pipeline crate, re-exported so embedders can name it (`Proxy`, `Policy`, `ConnCtx`).
+pub use ferryman_proxy;
+
 use ferryman_core::SharedTable;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};

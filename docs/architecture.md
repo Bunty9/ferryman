@@ -14,12 +14,40 @@ contract (config keys, status codes, metrics) is in the
 |                  | `config.rs`                             | TOML schema, `load_config`, validating `build_table`             |
 |                  | `health.rs`                             | Concurrent active health checks                                  |
 | `ferryman-proxy` | `lib.rs`                                | `StreamingClient`, `ProxyClient`, `LATENCY_BUCKETS`, client builder |
-|                  | `pipeline.rs`                           | Per-request handler (re-exported as `ferryman::proxy`)           |
+|                  | `pipeline.rs`                           | `Proxy`, `Policy`, `HeaderPolicy` and the per-request pipeline (re-exported as `ferryman::proxy`) |
+|                  | `conn.rs`                               | `ConnCtx` (peer, local address, optional `TlsInfo`)              |
+|                  | `verdict.rs`                            | `VerdictPolicy`, request/response body watchers, `Ticket`        |
+|                  | `hooks.rs`                              | `Hooks`, `StampCtx`, `AssertedHeaders` (feature `unstable-hooks`) |
+|                  | `testkit.rs`                            | Shared smuggling suite (feature `testkit`)                       |
 | `ferryman`       | `lib.rs`                                | `serve`: accept loop, deadlines, TLS, graceful shutdown          |
 |                  | `admin.rs`                              | `/metrics`, `/healthz`, `/readyz` server                         |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
 |                  | `reload.rs`                             | Debounced directory watcher, hash de-dup, SIGHUP/TLS reload                                    |
 |                  | `main.rs`                               | CLI (`check`, `healthcheck` subcommands), tracing, metrics recorder, signals |
+
+Dependency order: `ferryman-core` -> `ferryman-proxy` -> `ferryman`. The
+request pipeline lives in `ferryman-proxy` so that other front ends (for
+example `ferryman-edge`) run the same code; `ferryman` is the accept loop,
+TLS, admin, reload and CLI around it and re-exports the proxy crate
+(`ferryman::ferryman_proxy`, plus the old `ferryman::proxy` paths).
+
+`Proxy::new(table, Policy::default())` builds the handler once; a `ConnCtx`
+per connection carries the peer, the local address and TLS facts, and
+`Proxy::handle(req, &ctx)` runs the pipeline below. `Policy` holds the
+embedder knobs, all defaulting to ferryman's own behaviour:
+
+- `verdict: VerdictPolicy` - `HeadOnly` (default, ferryman) gives a normal
+  admission's breaker verdict at the response head; `DeferNormalToBodyEnd`
+  gives it at the end of the body, so a mid-body upstream reset counts.
+  Probe admissions always get theirs at the head. Every admission is a
+  `Ticket` that resolves exactly once (success, failure or release),
+  including when the handler future is dropped.
+- `headers: HeaderPolicy` - overrides for `xff`, `trusted_proxies`,
+  `Forwarded`, a body-size cap, and `asserted` header names an embedder may
+  set after the strips.
+- `hooks` (feature `unstable-hooks`, outside semver) - `pre_dispatch` sees a
+  read-only request head and may short-circuit before admission; `stamp`
+  sets only `asserted` names after the forwarded-header strips.
 
 `ferryman` is a library plus a thin binary so the end-to-end tests
 can drive the real `serve` loop on an ephemeral port.
@@ -35,7 +63,7 @@ accept ── set TCP_NODELAY
   │    first request must arrive within 10s; later h1 heads within
   │    `keepalive_timeout_secs` (default 10)
   │
-  └─ proxy::handle_streaming
+  └─ Proxy::handle (ferryman-proxy; `proxy::handle_streaming` is a thin shim)
        1. table.load_full()             one Arc for the whole request
        2. local_health_path             GET/HEAD match -> 200, answered first
        2a. bad_path_normalized(path)     raw and normalised: dot segments, NUL, %u, double-encoded -> 400

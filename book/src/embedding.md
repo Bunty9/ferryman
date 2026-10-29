@@ -1,11 +1,12 @@
 # Embedding the library
 
-ferryman is two published crates:
+ferryman is three published crates:
 
 | Crate | What it is |
 | --- | --- |
 | [`ferryman-core`](https://docs.rs/ferryman-core) | `Breaker`, `BreakerConfig`, `Admission`, `RouteTable`, `SharedTable`, TOML schema (`ConfigToml`, `build_table`), `health_loop`, `TrustedProxies`. No HTTP server. |
-| [`ferryman`](https://docs.rs/ferryman) | The serve loop (`serve`), the request handler (`proxy::handle_streaming`), `tls`, and optionally `admin` and `reload`, plus the binary. |
+| [`ferryman-proxy`](https://docs.rs/ferryman-proxy) | The request pipeline: `Proxy`, `Policy`, `ConnCtx`. Bring your own accept loop. |
+| [`ferryman`](https://docs.rs/ferryman) | The serve loop (`serve`), `tls`, and optionally `admin` and `reload`, plus the binary. Re-exports `ferryman-proxy` (`ferryman::ferryman_proxy`, `ferryman::proxy`). |
 
 Both are released together with the same version. `ConfigToml` and
 `RouteToml` are `#[non_exhaustive]`: outside the core crate construct them by
@@ -55,13 +56,41 @@ Notes:
 - `ferryman::reload::watch_config` (feature `reload`; keep the returned watcher alive) gives you the same
   directory watcher, content-hash de-dup and failed-reload-keeps-old-table
   behaviour as the binary.
-- `proxy::handle_streaming` is the per-request handler, if you want your own
-  accept loop. The older `proxy::handle` is deprecated.
+- If you want your own accept loop, use `ferryman-proxy` directly (next
+  section). `proxy::handle_streaming` and the deprecated `proxy::handle` are
+  kept as shims.
 
 [`examples/embedded/`](https://github.com/Bunty9/ferryman/tree/main/examples/embedded)
 is a complete, tested version: proxy, health loop and reload watcher as tasks
 in your process, a shared metrics recorder, a hand-rolled admin server with a
 `/status` JSON endpoint, and a shutdown that stops everything it spawned.
+
+## Using ferryman-proxy directly
+
+Build one `Proxy` from a shared table, make a `ConnCtx` per accepted
+connection, and call `handle` for each request. `Policy::default()` is
+exactly ferryman's behaviour.
+
+```rust,ignore
+use ferryman_proxy::{ConnCtx, Policy, Proxy};
+use hyper::service::service_fn;
+
+let proxy = Proxy::new(table.clone(), Policy::default());
+// per accepted connection:
+let ctx = ConnCtx::new(peer, listener.local_addr()?); // .with_tls(..) after a TLS handshake
+let svc = service_fn(move |req| {
+    let (proxy, ctx) = (proxy.clone(), ctx.clone());
+    async move { Ok::<_, std::convert::Infallible>(proxy.handle(req, &ctx).await) }
+});
+// serve `svc` with hyper's auto builder on the connection
+```
+
+The snippet is `ignore`d because it needs a socket; the same flow runs as a
+test in
+[`crates/proxy/tests/proxy_api.rs`](https://github.com/Bunty9/ferryman/blob/main/crates/proxy/tests/proxy_api.rs).
+`Policy` also selects the breaker verdict timing (`VerdictPolicy`) and
+header-policy overrides. The hooks API (`unstable-hooks`) is outside semver
+and changes only in minor releases.
 
 ## The breaker on its own
 

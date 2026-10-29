@@ -77,8 +77,17 @@ struct Rig {
 
 impl Rig {
     async fn new(up: SocketAddr, threshold: u32, verdict: VerdictPolicy) -> Self {
+        Self::with_cooldown(up, threshold, verdict, 60).await
+    }
+
+    async fn with_cooldown(
+        up: SocketAddr,
+        threshold: u32,
+        verdict: VerdictPolicy,
+        cooldown_secs: u32,
+    ) -> Self {
         let cfg: ConfigToml = toml::from_str(&format!(
-            "failure_threshold = {threshold}\ndefault_cooldown_secs = 60\n\
+            "failure_threshold = {threshold}\ndefault_cooldown_secs = {cooldown_secs}\n\
              request_body_idle_timeout_secs = 1\n\
              [[routes]]\nprefix = \"/svc\"\nupstream = \"http://{up}\"\n"
         ))
@@ -234,4 +243,21 @@ async fn client_stall_exempts_a_body_reset() {
     );
     post(&r, Duration::from_millis(0)).await;
     assert_eq!(r.circuit(), CircuitState::Open, "control: blamed");
+}
+
+/// A probe's success at the head closes the breaker; the body error after it
+/// is then at most one `Normal` failure (threshold 2: closed after one, open
+/// after two), never a second verdict from the probe ticket.
+#[tokio::test]
+async fn probe_success_at_head_then_body_error_counts_one_failure() {
+    let r = Rig::with_cooldown(upstream().await, 2, VerdictPolicy::DeferNormalToBodyEnd, 1).await;
+    r.get("/svc/bad").await;
+    r.get("/svc/bad").await;
+    assert_eq!(r.circuit(), CircuitState::Open);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let out = r.get("/svc/trunc").await;
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert_eq!(r.circuit(), CircuitState::Closed, "one failure of two");
+    r.get("/svc/trunc").await;
+    assert_eq!(r.circuit(), CircuitState::Open, "the second one opens it");
 }

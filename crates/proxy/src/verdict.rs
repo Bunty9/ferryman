@@ -40,6 +40,8 @@ pub enum VerdictPolicy {
 /// reset, panic unwinding) or a response body dropped before its end all hand
 /// the admission back instead of leaking a half-open probe slot. `release`
 /// re-arms a probe slot at most once per cooldown and is a no-op for `Normal`.
+/// The single sanctioned exception is `abandon` (the deprecated `handle`'s
+/// bodied 504, kept as 0.3.0 behaved).
 /// The only `Upstream::record_*` call in the request path outside a `Ticket`
 /// is `WatchedBody`'s single `record_failure(Normal)` for a body error after
 /// the head already gave its verdict.
@@ -83,6 +85,12 @@ impl Ticket {
 
     /// No verdict on the upstream: hand the admission back (see `Drop`).
     pub(crate) fn release(self) {}
+
+    /// Legacy bodied 504: no verdict and no release (0.3.0); the stale-probe
+    /// rule frees the slot after a cooldown.
+    pub(crate) fn abandon(mut self) {
+        self.admission = None;
+    }
 }
 
 impl Drop for Ticket {
@@ -267,6 +275,19 @@ mod tests {
         let up = upstream();
         probe(&up).await.release();
         assert_eq!(up.try_acquire(), Some(Admission::Probe));
+    }
+
+    #[tokio::test]
+    async fn abandon_holds_the_probe_slot_until_the_cooldown_passes() {
+        let up = upstream();
+        probe(&up).await.abandon();
+        assert!(up.try_acquire().is_none(), "abandon does not re-arm");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            up.try_acquire(),
+            Some(Admission::Probe),
+            "stale probe freed"
+        );
     }
 
     #[tokio::test]

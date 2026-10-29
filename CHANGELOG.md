@@ -17,7 +17,7 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 ### Changed
 
 - A request dropped mid-flight (client hung up before the response head) now releases its breaker ticket: a dropped half-open probe re-arms the probe slot (at most once per cooldown) instead of leaking it until the next cooldown.
-- The client-stall threshold now has a 100 ms floor and nanosecond resolution (inert at the 1 s minimum idle timeout).
+- The client-stall threshold now has a 100 ms floor and nanosecond resolution (the floor is inert for config-file tables, whose idle timeout is at least 1 s; a sub-second idle set via `RouteTable::with_request_body_idle_timeout` gets a threshold of at least 100 ms).
 
 ### Fixed
 

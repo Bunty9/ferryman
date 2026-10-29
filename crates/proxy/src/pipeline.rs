@@ -364,6 +364,14 @@ pub struct HeaderPolicy {
     /// forwarding step, whatever the client or that step wrote. Listing a
     /// trust-governed name (e.g. `x-real-ip`) hands it to the embedder.
     pub asserted: Vec<HeaderName>,
+    /// `(raw, folded)` per asserted name, filled once by `Proxy::with_client`.
+    folded: Vec<(String, String)>,
+}
+
+impl HeaderPolicy {
+    fn fold_asserted(&mut self) {
+        self.folded = fold_asserted(&self.asserted);
+    }
 }
 
 impl Proxy {
@@ -374,7 +382,8 @@ impl Proxy {
 
     /// Like [`Proxy::new`] with a caller-supplied upstream client (tests,
     /// embedders).
-    pub fn with_client(table: SharedTable, client: StreamingClient, policy: Policy) -> Self {
+    pub fn with_client(table: SharedTable, client: StreamingClient, mut policy: Policy) -> Self {
+        policy.headers.fold_asserted();
         Self {
             inner: Arc::new(ProxyInner {
                 table,
@@ -833,7 +842,7 @@ where
                 .unwrap_or_else(|| table.trusted_proxies()),
             forwarded_header,
             xff: hp.xff.unwrap_or_else(|| table.xff_mode()),
-            asserted: &hp.asserted,
+            asserted: &hp.folded,
         },
     );
 
@@ -901,7 +910,7 @@ where
             if counts_timeout {
                 ticket.failure();
             } else {
-                ticket.release();
+                ticket.abandon();
             }
             record(cx, &route_label, &upstream.name, 504);
             Ok(error_response(
@@ -1079,7 +1088,7 @@ struct FwdCfg<'a> {
     forwarded_header: bool,
     xff: XffMode,
     /// Embedder-asserted names: folded like the trust-governed set.
-    asserted: &'a [HeaderName],
+    asserted: &'a [(String, String)],
 }
 
 /// RFC 1918, 100.64/10, fc00::/7, fe80::/10, loopback.
@@ -1190,7 +1199,7 @@ fn fold_name(name: &str) -> String {
 /// also catches the client's `x-tenant-id` and `x.tenant.id`. A name equal to
 /// an asserted name is that name's own spelling; it is removed by the
 /// canonical removal step, not here.
-fn is_noncanonical_spelling(name: &str, asserted: &[HeaderName]) -> bool {
+fn is_noncanonical_spelling(name: &str, asserted: &[(String, String)]) -> bool {
     let normal = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && !name.starts_with('-')
         && !name.ends_with('-')
@@ -1198,20 +1207,29 @@ fn is_noncanonical_spelling(name: &str, asserted: &[HeaderName]) -> bool {
     // Normal names are canonical for the built-in set (exact matches are
     // kept); for asserted names only a different spelling folding to it counts.
     let hit = |folded: &str| {
-        asserted
-            .iter()
-            .any(|a| a.as_str() != name && fold_name(a.as_str()) == folded)
+        !TRUST_GOVERNED.contains(&folded)
+            && asserted.iter().any(|(raw, f)| raw != name && f == folded)
     };
     if normal {
         return hit(name);
     }
     let folded = fold_name(name);
-    TRUST_GOVERNED.contains(&folded.as_str()) || hit(&folded)
+    let governed = TRUST_GOVERNED.contains(&folded.as_str());
+    // An asserted alias (`x_forwarded_for`) must not strip a trusted peer's
+    // canonical trust-governed header, which `normal` names are exempt from.
+    governed || hit(&folded)
+}
+
+fn fold_asserted(names: &[HeaderName]) -> Vec<(String, String)> {
+    names
+        .iter()
+        .map(|n| (n.as_str().to_owned(), fold_name(n.as_str())))
+        .collect()
 }
 
 /// Remove, for every peer, non-canonical spellings (`X_Real_IP`, `x.forwarded.for`)
 /// of trust-governed headers.
-fn strip_noncanonical_spellings(headers: &mut HeaderMap, asserted: &[HeaderName]) {
+fn strip_noncanonical_spellings(headers: &mut HeaderMap, asserted: &[(String, String)]) {
     let bad: Vec<HeaderName> = headers
         .keys()
         .filter(|k| is_noncanonical_spelling(k.as_str(), asserted))
@@ -1967,7 +1985,7 @@ mod tests {
                 trusted: t,
                 forwarded_header: hp.forwarded_header.unwrap_or(false),
                 xff: hp.xff.unwrap_or(XffMode::Append),
-                asserted: &hp.asserted,
+                asserted: &[],
             },
         );
         assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
@@ -1982,7 +2000,7 @@ mod tests {
     #[test]
     fn asserted_names_join_the_noncanonical_fold() {
         let t = tp(&[]);
-        let asserted = [HeaderName::from_static("x-tenant")];
+        let asserted = fold_asserted(&[HeaderName::from_static("x-tenant")]);
         let mut m = HeaderMap::new();
         for k in ["x_tenant", "X.Tenant", "-x-tenant", "x--tenant", "x_other"] {
             m.append(
@@ -2015,9 +2033,32 @@ mod tests {
     }
 
     #[test]
+    fn asserted_alias_never_strips_trusted_canonical_header() {
+        let asserted = fold_asserted(&[HeaderName::from_static("x_forwarded_for")]);
+        assert!(!is_noncanonical_spelling("x-forwarded-for", &asserted));
+        let t = tp(&["10.0.0.0/8"]);
+        let mut m = HeaderMap::new();
+        m.append("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        apply_forwarded_headers(
+            &mut m,
+            "10.1.2.3".parse().unwrap(),
+            "http",
+            None,
+            &FwdCfg {
+                trusted: &t,
+                forwarded_header: false,
+                xff: XffMode::Append,
+                asserted: &asserted,
+            },
+        );
+        assert_eq!(get(&m, "x-forwarded-for"), Some("9.9.9.9, 10.1.2.3"));
+    }
+
+    #[test]
     fn asserted_names_are_folded_before_comparing() {
         for asserted_raw in ["x_tenant_id", "X-Tenant--Id"] {
-            let asserted = [HeaderName::from_bytes(asserted_raw.as_bytes()).unwrap()];
+            let asserted =
+                fold_asserted(&[HeaderName::from_bytes(asserted_raw.as_bytes()).unwrap()]);
             for client in ["x-tenant-id", "x.tenant.id", "x__tenant-id"] {
                 assert!(
                     is_noncanonical_spelling(client, &asserted),
@@ -2028,7 +2069,7 @@ mod tests {
             assert!(!is_noncanonical_spelling("x-tenant-ids", &asserted));
         }
         // End to end: the client's normal-looking spelling is dropped.
-        let asserted = [HeaderName::from_static("x_tenant_id")];
+        let asserted = fold_asserted(&[HeaderName::from_static("x_tenant_id")]);
         let mut m = HeaderMap::new();
         m.append("x-tenant-id", "evil".parse().unwrap());
         m.append("x.tenant.id", "evil".parse().unwrap());

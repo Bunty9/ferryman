@@ -14,6 +14,7 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 
 ### Fixed
 
+- Embedder-asserted header names (`HeaderPolicy::asserted`) are folded like the trust-governed set before comparing, so an asserted `x_tenant_id` also removes a client's `x-tenant-id` and `x.tenant.id`.
 - release image job: extraction script printed checksum output into the version.
 
 ## [0.3.0] - 2026-10-11

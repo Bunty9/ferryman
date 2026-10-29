@@ -1129,21 +1129,8 @@ const TRUST_GOVERNED: [&str; 9] = [
     "x-real-ip",
 ];
 
-/// Is `name` (already lowercase) a non-canonical spelling of a trust-governed
-/// header? Allocation-free for names made only of `[a-z0-9-]`, which are
-/// either canonical or unrelated. Runs of separators are collapsed and
-/// the ends trimmed (`x__real_ip`, `-x-real-ip` -> `x-real-ip`).
-fn is_noncanonical_spelling(name: &str, asserted: &[HeaderName]) -> bool {
-    // Already normal (no leading/trailing `-`, no `--`): protected iff an exact
-    // match, and exact matches are canonical, hence kept.
-    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-        && !name.contains("--")
-    {
-        return false;
-    }
-    // Fold every non-alphanumeric byte to `-`, collapse runs, trim the ends.
+/// Fold every non-alphanumeric byte to `-`, collapse runs, trim the ends.
+fn fold_name(name: &str) -> String {
     let mut folded = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_alphanumeric() {
@@ -1152,8 +1139,34 @@ fn is_noncanonical_spelling(name: &str, asserted: &[HeaderName]) -> bool {
             folded.push('-');
         }
     }
-    let folded = folded.trim_end_matches('-');
-    TRUST_GOVERNED.contains(&folded) || asserted.iter().any(|a| a.as_str() == folded)
+    folded.truncate(folded.trim_end_matches('-').len());
+    folded
+}
+
+/// Is `name` (already lowercase) a non-canonical spelling of a trust-governed
+/// or asserted header? Runs of separators are collapsed and the ends trimmed
+/// (`x__real_ip`, `-x-real-ip` -> `x-real-ip`). Asserted names are folded the
+/// same way before comparing, so an asserted `x_tenant_id` or `X-Tenant--Id`
+/// also catches the client's `x-tenant-id` and `x.tenant.id`. A name equal to
+/// an asserted name is that name's own spelling; it is removed by the
+/// canonical removal step, not here.
+fn is_noncanonical_spelling(name: &str, asserted: &[HeaderName]) -> bool {
+    let normal = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--");
+    // Normal names are canonical for the built-in set (exact matches are
+    // kept); for asserted names only a different spelling folding to it counts.
+    let hit = |folded: &str| {
+        asserted
+            .iter()
+            .any(|a| a.as_str() != name && fold_name(a.as_str()) == folded)
+    };
+    if normal {
+        return hit(name);
+    }
+    let folded = fold_name(name);
+    TRUST_GOVERNED.contains(&folded.as_str()) || hit(&folded)
 }
 
 /// Remove, for every peer, non-canonical spellings (`X_Real_IP`, `x.forwarded.for`)
@@ -1959,6 +1972,28 @@ mod tests {
         // Without `asserted` the same spellings survive.
         assert!(!is_noncanonical_spelling("x_tenant", &[]));
         assert!(is_noncanonical_spelling("x_tenant", &asserted));
+    }
+
+    #[test]
+    fn asserted_names_are_folded_before_comparing() {
+        for asserted_raw in ["x_tenant_id", "X-Tenant--Id"] {
+            let asserted = [HeaderName::from_bytes(asserted_raw.as_bytes()).unwrap()];
+            for client in ["x-tenant-id", "x.tenant.id", "x__tenant-id"] {
+                assert!(
+                    is_noncanonical_spelling(client, &asserted),
+                    "{asserted_raw} vs {client}"
+                );
+            }
+            assert!(!is_noncanonical_spelling("x-tenant", &asserted));
+            assert!(!is_noncanonical_spelling("x-tenant-ids", &asserted));
+        }
+        // End to end: the client's normal-looking spelling is dropped.
+        let asserted = [HeaderName::from_static("x_tenant_id")];
+        let mut m = HeaderMap::new();
+        m.append("x-tenant-id", "evil".parse().unwrap());
+        m.append("x.tenant.id", "evil".parse().unwrap());
+        strip_noncanonical_spellings(&mut m, &asserted);
+        assert!(m.is_empty(), "{m:?}");
     }
 
     #[test]

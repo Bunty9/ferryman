@@ -3,7 +3,7 @@
 //! hyper client, records metrics, and turns transport failures into
 //! circuit-breaker trips.
 
-use ferryman_core::{RouteTable, SharedTable, TrustedProxies, XffMode};
+use ferryman_core::{Admission, RouteTable, SharedTable, TrustedProxies, XffMode};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 use tokio::time::Sleep;
 use tracing::Instrument;
 
+use crate::verdict::{client_fault, ClientFault, Ticket, VerdictPolicy, WatchedBody};
 #[allow(deprecated)]
 use crate::ProxyClient;
 use crate::StreamingClient;
@@ -61,42 +62,84 @@ impl std::fmt::Debug for RequestBody {
     }
 }
 
-/// What `handle`'s timer can see of the body: whether hyper polled it, and
-/// whether the last poll was left waiting on the client (as opposed to hyper
-/// having stopped reading, e.g. an upstream whose receive buffer is full).
-struct BodyState {
+/// What the timer and the blame checks can see of the request body: whether
+/// hyper polled it, and since when the last poll has been left waiting on the
+/// client (rather than hyper having stopped reading because the upstream
+/// isn't draining it). Shared with [`crate::verdict::WatchedBody`].
+pub(crate) struct BodyState {
     polled: AtomicBool,
-    waiting_on_client: AtomicBool,
-    origin: Instant,
-    /// Start of the current client stall, ms since `origin` + 1 (0 = none).
-    stall_since: AtomicU64,
-    /// Longest finished client stall so far, ms.
-    longest_stall: AtomicU64,
+    /// Start of the current wait on the client, as nanoseconds since `base`
+    /// plus one; 0 while not waiting. Set on a `Pending` poll, cleared by
+    /// any `Ready` (frame, end of stream, error).
+    waiting_since: AtomicU64,
+    base: tokio::time::Instant,
+    /// theta: how long a client must stall (upload, or pulling the response)
+    /// before an upstream failure is put down to that stall.
+    pub(crate) stall: Duration,
+    /// The request body yielded an error (cap, deadline, client broke off).
+    pub(crate) client_failed: AtomicBool,
+    /// Sticky: a finished wait on the client lasted at least `stall`.
+    stalled_once: AtomicBool,
+}
+
+/// theta = max(100 ms, min(1 s, idle / 2)). The floor keeps a zero idle gap
+/// from turning response-body blame off entirely.
+pub(crate) fn stall_threshold(idle: Duration) -> Duration {
+    (idle / 2)
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(100))
 }
 
 impl BodyState {
-    fn now_ms(&self) -> u64 {
-        self.origin.elapsed().as_millis() as u64
-    }
-    fn stall_ended(&self) {
-        let since = self.stall_since.swap(0, Ordering::Relaxed);
-        if since != 0 {
-            let d = (self.now_ms() + 1).saturating_sub(since);
-            self.longest_stall.fetch_max(d, Ordering::Relaxed);
+    fn new(idle: Duration) -> Self {
+        Self {
+            polled: AtomicBool::new(false),
+            waiting_since: AtomicU64::new(0),
+            base: tokio::time::Instant::now(),
+            stall: stall_threshold(idle),
+            client_failed: AtomicBool::new(false),
+            stalled_once: AtomicBool::new(false),
         }
     }
-    /// Did the client leave its upload idle for >= `theta` at any point (incl. now)?
-    fn client_stalled(&self, theta: Duration) -> bool {
-        let t = theta.as_millis() as u64;
-        let since = self.stall_since.load(Ordering::Relaxed);
-        self.longest_stall.load(Ordering::Relaxed) >= t
-            || (since != 0 && (self.now_ms() + 1).saturating_sub(since) >= t)
+
+    fn now_mark(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1)
+    }
+
+    /// The last poll of the upload was left waiting on the client. True most
+    /// of the time during a normal upload (the proxy drains the client
+    /// faster than it sends), so it is no excuse for an upstream failure on
+    /// its own; see [`Self::client_stalled`].
+    fn waiting_on_client(&self) -> bool {
+        self.waiting_since.load(Ordering::Acquire) != 0
+    }
+
+    /// The proxy has been waiting on the client's next upload frame for at
+    /// least `stall`.
+    fn client_stalled(&self) -> bool {
+        self.stalled_for(self.waiting_since.load(Ordering::Acquire))
+    }
+
+    /// The client stalled its upload for at least `stall` at some point of
+    /// this request, or is stalling now. Every blame path checks this: an
+    /// upstream that hangs up, breaks its body, or (as a gateway) answers
+    /// 502-504 after such a stall may be reacting to it, so it is not blamed.
+    pub(crate) fn stalled_during_request(&self) -> bool {
+        self.stalled_once.load(Ordering::Acquire) || self.client_stalled()
+    }
+
+    /// A wait that started at `since` (a `now_mark`, 0 = none) has lasted at
+    /// least `stall`.
+    fn stalled_for(&self, since: u64) -> bool {
+        since != 0 && Duration::from_nanos(self.now_mark().saturating_sub(since)) >= self.stall
     }
 }
 
-struct Eos {
+pub(crate) struct Eos {
     rx: oneshot::Receiver<()>,
-    state: Arc<BodyState>,
+    pub(crate) state: Arc<BodyState>,
 }
 
 /// The client stalled its upload for longer than `request_body_idle_timeout_secs`.
@@ -135,13 +178,7 @@ impl std::error::Error for BodyTooLarge {}
 impl RequestBody {
     fn new(inner: Incoming, idle: Duration, total: Duration, max: Option<u64>) -> (Self, Eos) {
         let (tx, rx) = oneshot::channel();
-        let state = Arc::new(BodyState {
-            polled: AtomicBool::new(false),
-            waiting_on_client: AtomicBool::new(false),
-            origin: Instant::now(),
-            stall_since: AtomicU64::new(0),
-            longest_stall: AtomicU64::new(0),
-        });
+        let state = Arc::new(BodyState::new(idle));
         let mut b = Self {
             inner,
             idle,
@@ -175,7 +212,46 @@ impl Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
-        this.state.polled.store(true, Ordering::Relaxed);
+        let polled = this.poll_inner(cx);
+        // Bookkeeping lives here, around `poll_inner`, so every exit is seen,
+        // including the total-deadline check at its top.
+        let state = &this.state;
+        match polled {
+            Poll::Pending => {
+                if state.waiting_since.load(Ordering::Acquire) == 0 {
+                    state
+                        .waiting_since
+                        .store(state.now_mark(), Ordering::Release);
+                }
+            }
+            Poll::Ready(ref r) => {
+                if state.stalled_for(state.waiting_since.swap(0, Ordering::AcqRel)) {
+                    state.stalled_once.store(true, Ordering::Release);
+                }
+                if matches!(r, Some(Err(_))) {
+                    state.client_failed.store(true, Ordering::Release);
+                }
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+type BodyPoll =
+    Poll<Option<Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>>;
+
+impl RequestBody {
+    fn poll_inner(&mut self, cx: &mut Context<'_>) -> BodyPoll {
+        let this = self;
+        this.state.polled.store(true, Ordering::Release);
         if tokio::time::Instant::now() >= this.deadline {
             return Poll::Ready(Some(Err(BodyTotalTimeout.into())));
         }
@@ -188,41 +264,23 @@ impl Body for RequestBody {
                     if let (Some(max), Some(d)) = (this.max, frame.data_ref()) {
                         this.seen = this.seen.saturating_add(d.len() as u64);
                         if this.seen > max {
-                            this.state.stall_ended();
-                            this.state.waiting_on_client.store(false, Ordering::Relaxed);
                             return Poll::Ready(Some(Err(BodyTooLarge.into())));
                         }
                     }
                     this.idle_sleep = None;
-                    this.state.stall_ended();
-                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
                     // The last frame of a content-length body may not be followed
                     // by another poll, so check here as well as on `None`.
                     this.signal_if_done();
                     Poll::Ready(Some(Ok(frame)))
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    this.state.stall_ended();
-                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
-                    Poll::Ready(Some(Err(e.into())))
-                }
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
                 Poll::Ready(None) => {
-                    this.state.stall_ended();
-                    this.state.waiting_on_client.store(false, Ordering::Relaxed);
                     if let Some(tx) = this.eos.take() {
                         let _ = tx.send(());
                     }
                     Poll::Ready(None)
                 }
                 Poll::Pending => {
-                    this.state.waiting_on_client.store(true, Ordering::Relaxed);
-                    let now = this.state.now_ms() + 1;
-                    let _ = this.state.stall_since.compare_exchange(
-                        0,
-                        now,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
                     let idle = this.idle;
                     let idle_sleep = this
                         .idle_sleep
@@ -241,14 +299,6 @@ impl Body for RequestBody {
                 }
             };
         }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
     }
 }
 
@@ -291,6 +341,9 @@ pub struct Policy {
     /// 413 when a declared `Content-Length` is over the cap, or when the
     /// streamed body passes it. Never affects the breaker. `None` = no cap.
     pub max_request_body_bytes: Option<u64>,
+    /// When a normal admission's success reaches the breaker. Default
+    /// [`VerdictPolicy::HeadOnly`].
+    pub verdict: VerdictPolicy,
 }
 
 /// Overrides for the forwarding-header step. The default uses the route
@@ -681,6 +734,8 @@ where
         ));
     };
 
+    // From here every exit gives a verdict or drops the ticket (release).
+    let ticket = Ticket::new(upstream.clone(), admission);
     let (mut parts, body) = req.into_parts();
     // `upstream_timeout` starts at end-of-request-body (immediately when
     // bodyless), so a slow upload can't be mistaken for a slow upstream.
@@ -743,7 +798,7 @@ where
                 Ok(pq) => Some(pq),
                 Err(_) => {
                     // Request-derived, so the client's fault.
-                    upstream.release(admission);
+                    ticket.release();
                     record(cx, &route_label, &upstream.name, 400);
                     return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
                 }
@@ -754,7 +809,7 @@ where
     parts.uri = match http::Uri::from_parts(up_parts) {
         Ok(uri) => uri,
         Err(e) => {
-            upstream.release(admission);
+            ticket.release();
             record(cx, &route_label, &upstream.name, 502);
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
@@ -794,11 +849,16 @@ where
     let fwd = Request::from_parts(parts, body);
 
     let upstream_timeout = table.upstream_timeout;
-    // A client that left its upload idle for >= theta may have tripped the
-    // upstream's own body-read timeout; its 502/5xx then isn't evidence.
-    let theta = (table.request_body_idle_timeout() / 2).min(Duration::from_secs(1));
-    let stall = body_done.as_ref().map(|e| e.state.clone());
-    let client_stalled = || stall.as_ref().is_some_and(|s| s.client_stalled(theta));
+    // A client that left its upload idle for >= theta (see `stall_threshold`)
+    // may have tripped the upstream's own body-read timeout; its 502/5xx then
+    // isn't evidence.
+    let stall_theta = stall_threshold(table.request_body_idle_timeout());
+    let request_state = body_done.as_ref().map(|e| e.state.clone());
+    let client_stalled = || {
+        request_state
+            .as_ref()
+            .is_some_and(|s| s.stalled_during_request())
+    };
     // Completes when the request must be failed as an upstream timeout (504).
     let timer = async move {
         let Some(Eos { mut rx, state }) = body_done else {
@@ -820,8 +880,8 @@ where
                 // the upstream's doing. A client that is merely slow is left
                 // to the body's own idle/total deadlines (408).
                 () = tokio::time::sleep(upstream_timeout) => {
-                    if !state.polled.swap(false, Ordering::Relaxed)
-                        && !state.waiting_on_client.load(Ordering::Relaxed)
+                    if !state.polled.swap(false, Ordering::AcqRel)
+                        && !state.waiting_on_client()
                     {
                         return;
                     }
@@ -839,7 +899,9 @@ where
             // With EOS tracking the body is fully sent, so this is the
             // upstream's fault; the legacy path can't tell for bodies.
             if counts_timeout {
-                upstream.record_failure(admission);
+                ticket.failure();
+            } else {
+                ticket.release();
             }
             record(cx, &route_label, &upstream.name, 504);
             Ok(error_response(
@@ -847,41 +909,30 @@ where
                 "upstream timeout",
             ))
         }
-        Some(Err(e)) if is_body_idle_timeout(&e) => {
-            // The client stalled or over-ran its upload: 408, no breaker effect.
-            upstream.release(admission);
-            tracing::debug!(target: "ferryman::proxy", "client request body idle timeout");
-            record(cx, &route_label, &upstream.name, 408);
-            Ok(error_response(
-                StatusCode::REQUEST_TIMEOUT,
-                "request body timeout",
-            ))
-        }
-        Some(Err(e)) if is_body_too_large(&e) => {
-            // The client's upload passed the cap: its fault, never the breaker's.
-            upstream.release(admission);
-            record(cx, &route_label, &upstream.name, 413);
-            Ok(error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "payload too large",
-            ))
-        }
-        Some(Err(e)) if is_client_body_error(&e) => {
-            // The client's request body failed (e.g. it hung up mid-upload).
-            // Not the upstream's fault, so the breaker stays out of it.
-            upstream.release(admission);
-            tracing::debug!(target: "ferryman::proxy", error = %e, "client request body failed");
-            record(cx, &route_label, &upstream.name, 400);
-            Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "request body error",
-            ))
-        }
         Some(Err(e)) => {
+            // Client-caused failures never reach the breaker: no verdict (not
+            // `failure`, and not `success`, which would let a client close an
+            // open breaker by aborting an upload).
+            if let Some(fault) = client_fault(&e) {
+                ticket.release();
+                let (status, msg) = match fault {
+                    ClientFault::Timeout => {
+                        tracing::debug!(target: "ferryman::proxy", "client request body idle timeout");
+                        (StatusCode::REQUEST_TIMEOUT, "request body timeout")
+                    }
+                    ClientFault::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload too large"),
+                    ClientFault::BodyError => {
+                        tracing::debug!(target: "ferryman::proxy", error = %e, "client request body failed");
+                        (StatusCode::BAD_REQUEST, "request body error")
+                    }
+                };
+                record(cx, &route_label, &upstream.name, status.as_u16());
+                return Ok(error_response(status, msg));
+            }
             if client_stalled() {
-                upstream.release(admission);
+                ticket.release();
             } else {
-                upstream.record_failure(admission);
+                ticket.failure();
             }
             tracing::warn!(target: "ferryman::proxy", upstream = %upstream.name, error = %e, "upstream request failed");
             record(cx, &route_label, &upstream.name, 502);
@@ -889,27 +940,56 @@ where
         }
         Some(Ok(resp)) => {
             let status = resp.status();
-            // Health is judged on the response head; the body is streamed
-            // afterwards with no timeout of its own.
+            let (mut rparts, rbody) = resp.into_parts();
+            // 502-504 heads mean "this upstream is unhealthy" (a 500 is one
+            // request's bug); a gateway answering them after the client
+            // stalled its upload is passing on its backend's reaction.
+            // Any other head: a probe succeeds now. A normal admission
+            // succeeds now under `HeadOnly` (the body is streamed afterwards
+            // with no verdict), or when the body is empty (it may never be
+            // polled); otherwise `DeferNormalToBodyEnd` moves the ticket into
+            // the `WatchedBody`.
+            let mut head_failed = false;
+            let mut deferred = None;
             if matches!(status.as_u16(), 502..=504) {
                 if client_stalled() {
-                    upstream.release(admission);
+                    ticket.release();
                 } else {
-                    upstream.record_failure(admission);
+                    ticket.failure();
+                    head_failed = true;
                 }
+            } else if policy.verdict == VerdictPolicy::DeferNormalToBodyEnd
+                && ticket.admission() == Admission::Normal
+                && !rbody.is_end_stream()
+            {
+                deferred = Some(ticket);
             } else {
-                upstream.record_success(admission);
+                ticket.success();
             }
-            let len = resp
-                .headers()
+            let len = rparts
+                .headers
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
             record_len(cx, &route_label, &upstream.name, status.as_u16(), len);
 
-            let (mut rparts, rbody) = resp.into_parts();
             strip_hop_by_hop(&mut rparts.headers);
-            Ok(Response::from_parts(rparts, rbody.boxed()))
+            let rbody = match policy.verdict {
+                VerdictPolicy::HeadOnly => rbody.boxed(),
+                VerdictPolicy::DeferNormalToBodyEnd => WatchedBody {
+                    inner: rbody,
+                    upstream: upstream.clone(),
+                    ticket: deferred,
+                    request: request_state.clone(),
+                    stall: stall_theta,
+                    failed: head_failed,
+                    // The gap between the head and the first body poll counts.
+                    ready_at: Some(tokio::time::Instant::now()),
+                    client_stalled_reading: false,
+                }
+                .boxed(),
+            };
+            Ok(Response::from_parts(rparts, rbody))
         }
     }
 }
@@ -974,46 +1054,6 @@ fn plain_authority(b: &[u8]) -> bool {
         }
         _ => true,
     }
-}
-
-/// Did `client.request` fail because the client stalled its upload?
-fn is_body_idle_timeout(e: &hyper_util::client::legacy::Error) -> bool {
-    let mut source = std::error::Error::source(e);
-    while let Some(err) = source {
-        if err.is::<BodyIdleTimeout>() || err.is::<BodyTotalTimeout>() {
-            return true;
-        }
-        source = err.source();
-    }
-    false
-}
-
-/// Did `client.request` fail because the streamed body passed the size cap?
-fn is_body_too_large(e: &hyper_util::client::legacy::Error) -> bool {
-    let mut source = std::error::Error::source(e);
-    while let Some(err) = source {
-        if err.is::<BodyTooLarge>() {
-            return true;
-        }
-        source = err.source();
-    }
-    false
-}
-
-/// Did `client.request` fail because reading the *client's* body failed?
-/// hyper reports errors from the outgoing body as user errors.
-fn is_client_body_error(e: &hyper_util::client::legacy::Error) -> bool {
-    let mut source = std::error::Error::source(e);
-    while let Some(err) = source {
-        if err
-            .downcast_ref::<hyper::Error>()
-            .is_some_and(|h| h.is_user())
-        {
-            return true;
-        }
-        source = err.source();
-    }
-    false
 }
 
 /// HTTP/2 lets clients split `cookie` into several fields; HTTP/1.1

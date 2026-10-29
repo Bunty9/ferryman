@@ -5,9 +5,11 @@
 
 pub mod conn;
 pub mod pipeline;
+mod verdict;
 
 pub use conn::{ConnCtx, TlsInfo};
 pub use pipeline::{warn_if_private_peer, HeaderPolicy, Policy, Proxy};
+pub use verdict::VerdictPolicy;
 
 use hyper::body::Incoming;
 use hyper_util::client::legacy::connect::HttpConnector;

@@ -12,6 +12,13 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 - `ferryman-proxy` crate (request pipeline, shared with ferryman-edge); `ferryman` re-exports it, no API change.
 - HTTP/1 request-smuggling / desync regression suite (`crates/server/tests/smuggling.rs`, raw-TCP e2e with a byte-recording upstream).
 
+- `ferryman_proxy::VerdictPolicy` (`HeadOnly` default, `DeferNormalToBodyEnd`) on `Policy::verdict`: the latter gives a normal admission's breaker verdict at the end of the response body, so an upstream that resets mid-body opens the breaker. `ferryman` itself keeps `HeadOnly`.
+
+### Changed
+
+- A request dropped mid-flight (client hung up before the response head) now releases its breaker ticket: a dropped half-open probe re-arms the probe slot (at most once per cooldown) instead of leaking it until the next cooldown.
+- The client-stall threshold now has a 100 ms floor and nanosecond resolution (inert at the 1 s minimum idle timeout).
+
 ### Fixed
 
 - Embedder-asserted header names (`HeaderPolicy::asserted`) are folded like the trust-governed set before comparing, so an asserted `x_tenant_id` also removes a client's `x-tenant-id` and `x.tenant.id`.

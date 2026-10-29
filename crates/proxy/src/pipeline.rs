@@ -1053,15 +1053,22 @@ fn plain_authority(b: &[u8]) -> bool {
     if http::uri::Authority::try_from(b).is_err() {
         return false;
     }
-    // A port part after the host (not inside `[v6]`) must be 1-5 digits <= 65535.
-    match b.iter().rposition(|c| *c == b':') {
-        Some(i) if !b[i..].contains(&b']') => {
-            let p = &b[i + 1..];
-            !p.is_empty()
-                && p.iter().all(u8::is_ascii_digit)
-                && std::str::from_utf8(p).is_ok_and(|p| p.parse::<u16>().is_ok())
-        }
-        _ => true,
+    // What follows the host (after `]` for an IPv6 literal) must be empty or
+    // `:` + 1-5 digits <= 65535; `Authority` alone accepts `x:000080`, `[::1]x`.
+    let Ok(s) = std::str::from_utf8(b) else {
+        return false;
+    };
+    let rest = if s.starts_with('[') {
+        s.find(']').map(|i| &s[i + 1..])
+    } else {
+        Some(s.find(':').map_or("", |i| &s[i..]))
+    };
+    match rest {
+        Some("") => true,
+        Some(r) => r.strip_prefix(':').is_some_and(|p| {
+            p.len() <= 5 && p.bytes().all(|c| c.is_ascii_digit()) && p.parse::<u16>().is_ok()
+        }),
+        None => false,
     }
 }
 
@@ -1503,6 +1510,11 @@ mod tests {
             b"[::1]:x",
             b"x:+80",
             b"*",
+            b"[::1]x",
+            b"x:000080",
+            b"[::1]:000080",
+            b"x:65536",
+            b"[::1]:65536",
         ] {
             assert!(bad_host(&h(&[bad]), &root, V::HTTP_11), "{bad:?}");
         }
@@ -1514,6 +1526,7 @@ mod tests {
             "[::1]",
             "[::1]:80",
             "[::1]:8443",
+            "x:00080",
             "LOCALHOST",
         ] {
             assert!(!bad_host(&h(&[ok.as_bytes()]), &root, V::HTTP_11), "{ok}");

@@ -1341,9 +1341,10 @@ async fn bad_host_headers_get_400_and_never_reach_upstream() {
         s.read_to_end(&mut out).await.unwrap();
         String::from_utf8_lossy(&out).into_owned()
     };
-    let bad: [Vec<&[u8]>; 8] = [
+    let bad: [Vec<&[u8]>; 9] = [
         vec![b"a:b"],
         vec![b"x:99999"],
+        vec![b"x:000080"],
         vec![b"*"],
         vec![b"a.example, b.example"],
         vec![b"u@x"],

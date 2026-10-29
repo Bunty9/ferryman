@@ -16,6 +16,12 @@ categories = ["network-programming", "web-programming::http-server"]
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Hooks API (Hooks, StampCtx, AssertedHeaders, Policy::hooks). Not covered by
+# semver: changes only in minor releases.
+unstable-hooks = []
+
 [dependencies]
 ferryman-core = { workspace = true }
 tokio = { workspace = true }
@@ -30,3 +36,11 @@ rustls = { workspace = true }
 [dev-dependencies]
 arc-swap = { workspace = true }
 toml = { workspace = true }
+
+[[test]]
+name = "hooks_api"
+required-features = ["unstable-hooks"]
+
+[[test]]
+name = "hooks_e2e"
+required-features = ["unstable-hooks"]

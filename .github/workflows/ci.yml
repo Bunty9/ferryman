@@ -47,8 +47,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy (proxy, all features)
+        run: cargo clippy -p ferryman-proxy --all-targets --all-features -- -D warnings
       - name: cargo nextest
         run: cargo nextest run --workspace --no-fail-fast --locked
+      # unstable-hooks is off by default, so the workspace run above skips it.
+      - name: cargo test ferryman-proxy (all features)
+        run: cargo test -p ferryman-proxy --all-features --locked
       # nextest does not run doctests.
       - name: cargo test --doc
         run: cargo test --doc --workspace --locked
@@ -76,6 +81,8 @@ jobs:
           # ferryman-proxy has no crates.io baseline until 0.4.0 is
           # published; drop this exclude once it is.
           exclude: ferryman-proxy
+          # unstable-hooks is outside semver: check default features only.
+          feature-group: default-features
 
   # Blocking: the declared rust-version (1.88) must really build.
   # rust-toolchain.toml pins stable, hence RUSTUP_TOOLCHAIN.

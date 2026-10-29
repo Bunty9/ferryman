@@ -14,6 +14,8 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 
 - `ferryman_proxy::VerdictPolicy` (`HeadOnly` default, `DeferNormalToBodyEnd`) on `Policy::verdict`: the latter gives a normal admission's breaker verdict at the end of the response body, so an upstream that resets mid-body opens the breaker. `ferryman` itself keeps `HeadOnly`.
 
+- `ferryman-proxy` feature `unstable-hooks` (off by default, outside semver; changes only in proxy minor releases): `Hooks` (`pre_dispatch` may short-circuit before admission, `stamp` sets only `HeaderPolicy::asserted` names after the strips), `StampCtx`, `AssertedHeaders`, `BoxFuture`, `Policy::hooks`; `full_body` and `ResponseBody` are public with it.
+
 ### Changed
 
 - Host header validation is stricter: a port must be 1–5 digits and at most 65535, and nothing but `:port` may follow an IPv6 literal (400 otherwise).

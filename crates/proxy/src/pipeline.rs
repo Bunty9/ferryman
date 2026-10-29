@@ -333,7 +333,7 @@ struct ProxyInner {
 /// behaviour: header handling from the route table, no body cap. Construct
 /// with `let mut p = Policy::default(); p.field = ...;`; fields are added
 /// additively.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct Policy {
     /// Header handling overrides.
@@ -344,6 +344,21 @@ pub struct Policy {
     /// When a normal admission's success reaches the breaker. Default
     /// [`VerdictPolicy::HeadOnly`].
     pub verdict: VerdictPolicy,
+    /// Embedder hooks (`unstable-hooks`); `None` = ferryman's own behaviour.
+    #[cfg(feature = "unstable-hooks")]
+    pub hooks: Option<Arc<dyn crate::Hooks>>,
+}
+
+impl std::fmt::Debug for Policy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Policy");
+        d.field("headers", &self.headers)
+            .field("max_request_body_bytes", &self.max_request_body_bytes)
+            .field("verdict", &self.verdict);
+        #[cfg(feature = "unstable-hooks")]
+        d.field("hooks", &self.hooks.is_some());
+        d.finish_non_exhaustive()
+    }
 }
 
 /// Overrides for the forwarding-header step. The default uses the route
@@ -635,7 +650,7 @@ async fn handle_core<B>(
     table: Arc<RouteTable>,
     client: Client<HttpConnector, B>,
     conn: &ConnCtx,
-    req: Request<Incoming>,
+    #[cfg_attr(not(feature = "unstable-hooks"), allow(unused_mut))] mut req: Request<Incoming>,
     policy: &Policy,
     wrap: impl FnOnce(Incoming, Duration, Duration, Option<u64>) -> (B, Option<Eos>),
     cx: &Cx,
@@ -657,6 +672,15 @@ where
             "ok"
         };
         return Ok(error_response(StatusCode::OK, body));
+    }
+
+    // Before every check and before admission: see `Hooks` (exactly-once).
+    #[cfg(feature = "unstable-hooks")]
+    if let Some(hooks) = &policy.hooks {
+        if let Err(resp) = hooks.pre_dispatch(&mut req, conn).await {
+            record(cx, "none", "none", resp.status().as_u16());
+            return Ok(resp);
+        }
     }
 
     if ferryman_core::path::bad_path_normalized(req.uri().path())
@@ -735,6 +759,8 @@ where
         }
     }
 
+    pre_admission();
+
     let Some(admission) = upstream.try_acquire() else {
         record(cx, &route_label, &upstream.name, 503);
         return Ok(error_response(
@@ -770,6 +796,7 @@ where
     let forwarded_header = hp
         .forwarded_header
         .unwrap_or_else(|| table.forwarded_header());
+    // Captured for `Hooks::stamp` whenever it has names it may set.
     let client_host: Option<String> = (forwarded_header || !hp.asserted.is_empty())
         .then(|| match parts.uri.authority() {
             Some(a) => a.as_str().rsplit('@').next().unwrap_or("").to_string(),
@@ -853,6 +880,18 @@ where
     // Asserted names are the embedder's alone: drop whatever is there now.
     for n in &hp.asserted {
         parts.headers.remove(n);
+    }
+    // Cannot return a response; a panic unwinds through `ticket` (release).
+    #[cfg(feature = "unstable-hooks")]
+    if let Some(hooks) = &policy.hooks {
+        hooks.stamp(
+            &crate::StampCtx {
+                extensions: &parts.extensions,
+                conn,
+                client_host: client_host.as_deref(),
+            },
+            &mut crate::AssertedHeaders::new(&mut parts.headers, &hp.asserted),
+        );
     }
 
     let fwd = Request::from_parts(parts, body);
@@ -1002,6 +1041,11 @@ where
         }
     }
 }
+
+/// Reserved call site for the route-aware pre-admission hook (after lookup,
+/// before `try_acquire`; must stay before it). Not public yet.
+#[inline(always)]
+fn pre_admission() {}
 
 /// Remove hop-by-hop headers: the fixed RFC 7230 set, plus any header named
 /// in the `Connection` header (which may list additional per-message
@@ -1476,7 +1520,8 @@ fn error_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Respon
         .expect("error response with fixed headers is always valid")
 }
 
-fn full_body(body: impl Into<Bytes>) -> ResponseBody {
+/// A complete in-memory response body (for hooks building responses).
+pub fn full_body(body: impl Into<Bytes>) -> ResponseBody {
     Full::new(body.into())
         .map_err(|never| match never {})
         .boxed()

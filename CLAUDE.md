@@ -15,7 +15,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - `bash scripts/wrk2-smoke.sh` - compose fixture + wrk2; runs in CI (wrk2 isn't buildable locally: no OpenSSL headers)
 - `bash examples/full-stack/demo.sh --ci` - full-stack reference example; runs in CI (`examples` job)
 - `cargo test -p ferryman-embedded-example` - embedded-library reference example's tests
-- `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`
+- `cargo publish --workspace --dry-run` - packaging check; real publish is irreversible, follow `docs/plans/2026-09-28-publishing.md`. Re-running it at an unchanged version can verify against a stale extracted copy (unresolved imports from a sibling crate): delete `~/.cargo/registry/src/*/ferryman-{proxy,}-<ver>` and retry
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` - no intra-doc links to private items
 - CI jobs beyond test/deny: `semver` (cargo-semver-checks vs the latest crates.io release, blocking; additive-only public API), `msrv` (`cargo check` on 1.88 via `RUSTUP_TOOLCHAIN`), doctests run in the `test` job (`cargo test --doc`, nextest skips them)
 - `gh run list -L 3` / `gh run view <id> --log` - CI status and smoke-bench numbers

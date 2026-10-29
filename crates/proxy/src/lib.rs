@@ -7,6 +7,8 @@ pub mod conn;
 #[cfg(feature = "unstable-hooks")]
 mod hooks;
 pub mod pipeline;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 mod verdict;
 
 pub use conn::{ConnCtx, TlsInfo};

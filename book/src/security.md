@@ -31,7 +31,7 @@ SHA-pinned and linted with zizmor.
 
 ## Request smuggling regression suite
 
-`crates/server/tests/smuggling.rs` sends raw-TCP attack requests through
+The vectors live in `ferryman_proxy::testkit` (feature `testkit`, for test use, not covered by semver) and run from `crates/server/tests/smuggling.rs` and `crates/proxy/tests/smuggling.rs`. They send raw-TCP attack requests through
 `ferryman::serve` to a byte-recording upstream and asserts both the client
 outcome and exactly what was forwarded. It covers Content-Length /
 Transfer-Encoding conflicts and variants, duplicate or malformed

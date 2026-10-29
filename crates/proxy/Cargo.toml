@@ -21,6 +21,9 @@ default = []
 # Hooks API (Hooks, StampCtx, AssertedHeaders, Policy::hooks). Not covered by
 # semver: changes only in minor releases.
 unstable-hooks = []
+# `ferryman_proxy::testkit`: shared smuggling suite. For test use; not covered
+# by semver: changes only in minor releases.
+testkit = []
 
 [dependencies]
 ferryman-core = { workspace = true }
@@ -44,3 +47,7 @@ required-features = ["unstable-hooks"]
 [[test]]
 name = "hooks_e2e"
 required-features = ["unstable-hooks"]
+
+[[test]]
+name = "smuggling"
+required-features = ["testkit"]

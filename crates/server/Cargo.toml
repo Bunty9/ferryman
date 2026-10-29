@@ -81,6 +81,7 @@ libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["http2"] }
+ferryman-proxy = { workspace = true, features = ["testkit"] }
 
 # cargo-binstall: fetch the prebuilt archive from the GitHub release
 # (built by .github/workflows/release.yml).

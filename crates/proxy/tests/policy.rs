@@ -261,3 +261,83 @@ fn every_denied_name_panics_and_trust_governed_names_do_not() {
     }
     proxy_asserting(&["x-real-ip", "x-forwarded-for", "forwarded", "x-tenant"]);
 }
+
+fn strip_table(up: SocketAddr) -> SharedTable {
+    let cfg: ConfigToml = toml::from_str(&format!(
+        "[[routes]]\nprefix = \"/strip\"\nupstream = \"http://{up}\"\nstrip_prefix = true\n"
+    ))
+    .unwrap();
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        build_table(cfg, None).unwrap(),
+    ))
+}
+
+#[tokio::test]
+async fn proxy_connection_is_stripped() {
+    let up = upstream(Arc::new(AtomicUsize::new(0))).await;
+    let p = proxy_addr(table(up, ""), Policy::default()).await;
+    let out = raw(
+        p,
+        "GET /svc/ HTTP/1.1\r\nhost: x\r\nconnection: close\r\nproxy-connection: keep-alive\r\n\r\n",
+    )
+    .await;
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(!out.contains("proxy-connection"), "{out}");
+}
+
+#[tokio::test]
+async fn upgrade_and_connect_are_501_even_when_unrouted() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let up = upstream(hits.clone()).await;
+    let p = proxy_addr(table(up, ""), Policy::default()).await;
+    for req in [
+        "GET /nowhere HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        "CONNECT x:443 HTTP/1.1\r\nhost: x:443\r\n\r\n",
+        "GET /svc/ HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+    ] {
+        let out = raw(p, req).await;
+        assert!(out.starts_with("HTTP/1.1 501"), "{req}: {out}");
+        assert!(
+            out.to_ascii_lowercase().contains("connection: close"),
+            "{out}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+// D4: the upgrade refusal precedes the strip-prefix remainder check. A remainder
+// that passes `bad_path_normalized` but fails the runtime check is not
+// constructible on the wire (the check is defence in depth), so this pins the
+// observable part: an upgrade on a strip route is 501 with the route label.
+#[tokio::test]
+async fn upgrade_on_a_strip_prefix_route_is_501() {
+    let up = upstream(Arc::new(AtomicUsize::new(0))).await;
+    let p = proxy_addr(strip_table(up), Policy::default()).await;
+    let out = raw(
+        p,
+        "GET /strip/a HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+    )
+    .await;
+    assert!(out.starts_with("HTTP/1.1 501"), "{out}");
+}
+
+#[tokio::test]
+async fn content_length_named_in_connection_is_413_before_admission() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let up = upstream(hits.clone()).await;
+    let p = proxy_addr(table(up, ""), capped(10)).await;
+    let out = raw(
+        p,
+        "POST /svc/ HTTP/1.1\r\nhost: x\r\nconnection: close, content-length\r\ncontent-length: 11\r\n\r\n12345678901",
+    )
+    .await;
+    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    // Unrouted + oversized: the cap answers before the 404 (edge order).
+    let out = raw(
+        p,
+        "POST /nowhere HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-length: 11\r\n\r\n12345678901",
+    )
+    .await;
+    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+}

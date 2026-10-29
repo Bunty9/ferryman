@@ -36,6 +36,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Ticket exactly-once: every admission resolves exactly once (record, `release`, or Drop -> release). No hook that can return a response may run between `try_acquire` and the verdict; `abandon` exists only for the legacy bodied-504 path (`handle_legacy`).
 - `HeaderPolicy::asserted` denylist: `Proxy::with_client` panics on framing/hop-by-hop names (`host`, `content-length`, `transfer-encoding`, `te`, `trailer`, `upgrade`, `connection`, `keep-alive`, `proxy-*`, `x-request-id`); asserted names are folded like the trust-governed set before comparing.
 - `Hooks::pre_dispatch` gets a read-only request head (plus mutable extensions), never the body; `stamp` runs after the strips and a panic in it is a 500.
+- Pre-admission order (matches edge): bad_path/ambiguous -> bad_host -> pure `lookup` -> upgrade/CONNECT 501 (also unrouted; h1 gets `Connection: close`) -> declared-size 413 -> 404 -> `strip_prefix` check -> admission -> `strip_hop_by_hop` (so a `Content-Length` named in `Connection` is still seen by the 413 check; `Host` and `x-request-id` are exempt from Connection-named stripping).
 - Host parity (shared with ferryman-edge): port is 1-5 digits <= 65535; only `:port` may follow an IPv6 literal (`[::1]x`, `x:000080` -> 400).
 - Metric labels are config-bounded (`route` = prefix, `upstream` = host:port); never label with raw paths.
 - Gauges: recorder is installed before any gauge write; health loop republishes every tick (removed upstreams expire via `idle_timeout`).

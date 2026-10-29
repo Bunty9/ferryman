@@ -305,9 +305,10 @@ impl RequestBody {
 /// Headers that are meaningful only for one hop and must never be forwarded,
 /// per RFC 7230 §6.1 (plus `keep-alive`, which predates the RFC but is
 /// conventionally hop-by-hop too).
-const HOP_BY_HOP_HEADERS: [HeaderName; 8] = [
+const HOP_BY_HOP_HEADERS: [HeaderName; 9] = [
     header::CONNECTION,
     HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
     header::PROXY_AUTHENTICATE,
     header::PROXY_AUTHORIZATION,
     header::TE,
@@ -755,6 +756,45 @@ where
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad host\n"));
     }
 
+    // Pure lookup (ignores health). Upgrade and the declared-size cap are decided
+    // before the 404 and the strip-prefix check, as in ferryman-edge.
+    let route = table.lookup(req.uri().path());
+    let (label, up_name): (&str, &str) = match &route {
+        Some(r) => (&r.prefix, &r.upstream.name),
+        None => ("none", "none"),
+    };
+    if wants_upgrade || req.method() == http::Method::CONNECT {
+        record(cx, label, up_name, 501);
+        let h1 = req.version() <= http::Version::HTTP_11;
+        let mut resp = error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "protocol upgrades are not supported",
+        );
+        // h1: close, so bytes pipelined behind the Upgrade/CONNECT are never
+        // parsed as a request and forwarded.
+        if h1 {
+            resp.headers_mut()
+                .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
+        }
+        return Ok(resp);
+    }
+
+    // Declared length over the cap: refused before admission (no ticket).
+    if let Some(max) = policy.max_request_body_bytes {
+        let declared = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > max) {
+            record(cx, label, up_name, 413);
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload too large",
+            ));
+        }
+    }
+
     let Some(route) = table.lookup(req.uri().path()) else {
         record(cx, "none", "none", 404);
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
@@ -778,38 +818,6 @@ where
     } else {
         None
     };
-
-    if wants_upgrade || req.method() == http::Method::CONNECT {
-        record(cx, &route_label, &upstream.name, 501);
-        let h1 = req.version() <= http::Version::HTTP_11;
-        let mut resp = error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "protocol upgrades are not supported",
-        );
-        // h1: close, so bytes pipelined behind the Upgrade/CONNECT are never
-        // parsed as a request and forwarded.
-        if h1 {
-            resp.headers_mut()
-                .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
-        }
-        return Ok(resp);
-    }
-
-    // Declared length over the cap: refused before admission (no ticket).
-    if let Some(max) = policy.max_request_body_bytes {
-        let declared = req
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        if declared.is_some_and(|n| n > max) {
-            record(cx, &route_label, &upstream.name, 413);
-            return Ok(error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "payload too large",
-            ));
-        }
-    }
 
     pre_admission();
 

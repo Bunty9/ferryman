@@ -28,6 +28,8 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 - `Host` validation is stricter: a port must be 1-5 digits and at most 65535, and nothing but `:port` may follow an IPv6 literal. Values such as `[::1]x`, `x:000080` and `[::1]:000080` now get 400.
 - A request dropped mid-flight (client hung up before the response head) releases its breaker ticket: a dropped half-open probe re-arms the probe slot (at most once per cooldown) instead of leaking it until the next cooldown.
 - The client-stall threshold has a 100 ms floor and nanosecond resolution (inert for config-file tables, whose idle timeout is at least 1 s); a stall of exactly the threshold now counts.
+- `Proxy-Connection` is stripped as a hop-by-hop header.
+- An `Upgrade` (other than `h2c`) or `CONNECT` request now gets 501 even when no route matches (it was 404), and a declared body over the size cap is refused with 413 before the 404; both are decided before the `strip_prefix` remainder check, so an upgrade on a `strip_prefix` route is never answered 400.
 - Handler log events use the explicit target `ferryman::proxy`; the default `info` filter is unaffected.
 
 ## [0.3.0] - 2026-10-11

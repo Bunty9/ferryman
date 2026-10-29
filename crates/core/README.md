@@ -28,9 +28,9 @@ let cfg: ConfigToml = toml::from_str(r#"
 let table = build_table(cfg, None)?;
 
 let route = table.lookup("/svc-a/users").expect("route");
-if let Some(ticket) = route.upstream.try_acquire() {
+if let Some(ticket) = route.upstream().try_acquire() {
     // ... forward the request, then report the outcome:
-    route.upstream.record_success(ticket);
+    route.upstream().record_success(ticket);
 } else {
     // circuit open: answer 503
 }

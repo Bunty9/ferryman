@@ -18,9 +18,9 @@
 //!
 //! let route = table.lookup("/svc-a/users").expect("route");
 //! assert!(table.lookup("/svc-ab").is_none());
-//! if let Some(ticket) = route.upstream.try_acquire() {
+//! if let Some(ticket) = route.upstream().try_acquire() {
 //!     // ... forward the request, then report the outcome:
-//!     route.upstream.record_success(ticket);
+//!     route.upstream().record_success(ticket);
 //! } else {
 //!     // circuit open: answer 503
 //! }
@@ -34,10 +34,15 @@ pub mod health;
 pub mod path;
 mod proxies;
 pub mod route;
+mod upstream_set;
 
 pub use breaker::{Breaker, BreakerConfig, CircuitState};
 pub use config::{build_table, load_config, ConfigToml, RouteToml, XffMode};
 pub use error::Error;
 pub use health::health_loop;
 pub use proxies::TrustedProxies;
-pub use route::{Admission, Route, RouteTable, SharedTable, Upstream};
+pub use route::{
+    Admission, Endpoint, InflightGuard, LbPolicy, Route, RouteTable, SharedTable, Upstream,
+    UpstreamSet,
+};
+pub use upstream_set::MAX_WEIGHT;

@@ -81,3 +81,10 @@ upstream = "http://localhost:8001"
 [[routes]]
 prefix = "/svc-b"
 upstream = "http://localhost:8002"
+
+# Several endpoints (each with its own breaker); `lb` is round_robin
+# (default), least_conn or p2c. weight is 1..=1000 (round_robin, p2c).
+# [[routes]]
+# prefix = "/svc-c"
+# lb = "round_robin"
+# upstreams = ["http://localhost:8003", { addr = "http://localhost:8004", weight = 2 }]

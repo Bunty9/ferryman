@@ -50,6 +50,10 @@ pub enum Error {
         #[source]
         source: Option<http::uri::InvalidUri>,
     },
+    /// A route's `upstream` / `upstreams` / `weight` combination is invalid
+    /// (both or neither set, empty list, duplicate endpoint, weight out of range).
+    #[error("route {route:?}: {reason}")]
+    InvalidUpstreamSet { route: String, reason: String },
     /// A route's `cooldown_secs` is out of range.
     #[error("route {route:?}: cooldown_secs {reason}")]
     InvalidCooldown { route: String, reason: String },

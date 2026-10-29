@@ -72,7 +72,7 @@ accept ── set TCP_NODELAY
        2d. lookup(path)                 none -> 404
        2e. strip_prefix remainder check  re-checked at runtime, failing -> 400 (before admission)
        3. Upgrade (not h2c) / CONNECT   -> 501
-       4. upstream.try_acquire()        None -> 503, else Admission
+       4. route.upstreams.acquire()     LB order, try_acquire once per endpoint; none admits -> 503, else (endpoint, Admission)
        5. rewrite request:
             strip hop-by-hop, join h2 cookies, Host from authority (route `rewrite_host`: upstream authority),
             URI = upstream scheme+authority + original path+query
@@ -137,7 +137,11 @@ routes are not access control: such variants fall to a less specific route
 ## Circuit breaker
 
 One breaker per upstream `host:port` (lowercased), shared by every route
-pointing there and kept across hot reloads.
+pointing there and kept across hot reloads. A route holds an `UpstreamSet`
+(endpoints with weights, plus `lb`: smooth weighted round robin, `least_conn`,
+`p2c`); the set only orders endpoints, `acquire` offers each to its breaker at
+most once and the `Ticket` goes to the one that admits. In-flight counts
+(`Upstream::track_inflight`, held by the `Ticket`) feed `least_conn`/`p2c`.
 
 ```
              failures >= threshold

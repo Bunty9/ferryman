@@ -119,7 +119,12 @@ impl Rig {
     }
 
     fn circuit(&self) -> CircuitState {
-        self.table.load().lookup("/svc/").unwrap().upstream.state()
+        self.table
+            .load()
+            .lookup("/svc/")
+            .unwrap()
+            .upstream()
+            .state()
     }
 
     /// GET `path`, read until the connection closes; returns the raw reply.

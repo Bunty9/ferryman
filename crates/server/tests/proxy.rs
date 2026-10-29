@@ -1548,3 +1548,91 @@ async fn chunked_upload_with_trailer_to_slow_upstream_is_504() {
     assert!(st.starts_with("HTTP/1.1 504"), "{st}");
     assert!(start.elapsed() < Duration::from_millis(2500));
 }
+
+// --- upstreams / load balancing ---
+
+async fn body_of(client: &reqwest::Client, url: &str) -> (u16, String) {
+    let r = client.get(url).send().await.unwrap();
+    (r.status().as_u16(), r.text().await.unwrap())
+}
+
+#[tokio::test]
+async fn round_robin_alternates_across_upstreams() {
+    let a = spawn_stub(|_req| async { ok("A") }).await;
+    let b = spawn_stub(|_req| async { ok("B") }).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let mut got = String::new();
+    for _ in 0..6 {
+        got += &body_of(&client, &format!("http://{proxy}/s")).await.1;
+    }
+    assert_eq!(got, "ABABAB");
+}
+
+#[tokio::test]
+async fn weighted_round_robin_follows_weights() {
+    let a = spawn_stub(|_req| async { ok("A") }).await;
+    let b = spawn_stub(|_req| async { ok("B") }).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\n\
+         [[routes.upstreams]]\naddr = \"http://{a}\"\nweight = 3\n\
+         [[routes.upstreams]]\naddr = \"http://{b}\"\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let mut got = String::new();
+    for _ in 0..8 {
+        got += &body_of(&client, &format!("http://{proxy}/s")).await.1;
+    }
+    assert_eq!(got.matches('A').count(), 6);
+    assert_eq!(got.matches('B').count(), 2);
+}
+
+#[tokio::test]
+async fn dead_endpoint_is_skipped_after_breaker_opens() {
+    let a = spawn_toggle_stub(Arc::new(AtomicBool::new(true))).await;
+    let b = spawn_toggle_stub(Arc::new(AtomicBool::new(false))).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\n[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy}/s");
+    // Round robin offers `a` first: one 502 opens its breaker.
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    for _ in 0..6 {
+        assert_eq!(body_of(&client, &url).await, (200, "up".into()));
+    }
+}
+
+#[tokio::test]
+async fn all_endpoints_dead_is_503_and_health_loop_recovers() {
+    let down = Arc::new(AtomicBool::new(true));
+    let a = spawn_toggle_stub(down.clone()).await;
+    let b = spawn_toggle_stub(down.clone()).await;
+    let table = shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\n[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    )));
+    let proxy = start_proxy(table.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy}/s");
+    // One 502 per endpoint opens both breakers; then everything refuses.
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    for _ in 0..3 {
+        assert_eq!(body_of(&client, &url).await.0, 503);
+    }
+    // Probe results are authoritative: the health loop re-closes both
+    // (cooldown is the 30 s default, so nothing else could).
+    down.store(false, Ordering::SeqCst);
+    let h = tokio::spawn(ferryman_core::health_loop(table, Duration::from_millis(50)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while body_of(&client, &url).await.0 != 200 {
+        assert!(std::time::Instant::now() < deadline, "never recovered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h.abort();
+}

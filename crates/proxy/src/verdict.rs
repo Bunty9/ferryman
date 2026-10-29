@@ -3,7 +3,7 @@
 //! client-fault classifier.
 
 use crate::pipeline::{BodyIdleTimeout, BodyState, BodyTooLarge, BodyTotalTimeout};
-use ferryman_core::{Admission, Upstream};
+use ferryman_core::{Admission, InflightGuard, Upstream};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -52,11 +52,15 @@ pub enum VerdictPolicy {
 pub(crate) struct Ticket {
     upstream: Upstream,
     admission: Option<Admission>,
+    /// Counts the request against the endpoint for least_conn / p2c until
+    /// the ticket is dropped (any verdict, release or abandon).
+    _inflight: InflightGuard,
 }
 
 impl Ticket {
     pub(crate) fn new(upstream: Upstream, admission: Admission) -> Self {
         Self {
+            _inflight: upstream.track_inflight(),
             upstream,
             admission: Some(admission),
         }

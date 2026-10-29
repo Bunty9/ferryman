@@ -14,8 +14,11 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 - `ferryman-proxy` feature `unstable-hooks` (off by default, outside semver; changes only in proxy minor releases): `Hooks` (`pre_dispatch` gets a read-only request head plus mutable extensions, never the body, and may short-circuit before admission; `stamp` sets only `HeaderPolicy::asserted` names after the strips, a panic in it becomes a 500), `PreDispatch`, `StampCtx`, `AssertedHeaders`, `BoxFuture`, `Policy::hooks`; `full_body` and `ResponseBody` are public with it. `Proxy::with_client` panics if `HeaderPolicy::asserted` lists a framing or hop-by-hop name.
 - `ferryman-proxy` feature `testkit` (outside semver): the shared HTTP/1 request-smuggling regression suite, also run from ferryman's own tests (`crates/server/tests/smuggling.rs`).
 
+- Load balancing: a route may list several endpoints with `upstreams = ["http://a:1", { addr = "http://b:2", weight = 3 }]` and pick with `lb = "round_robin" | "least_conn" | "p2c"` (default `round_robin`; weights `1..=1000` for `round_robin` and `p2c`). Each endpoint keeps its own breaker and health probe; endpoints whose breaker refuses are skipped and all refusing is 503. Core: `UpstreamSet`, `Endpoint`, `LbPolicy`, `MAX_WEIGHT`, `Upstream::{inflight, track_inflight}`, `InflightGuard`, `Route::{with_upstreams, upstream}`, `Error::InvalidUpstreamSet`, `UpstreamToml`.
+
 ### Changed
 
+- BREAKING (`ferryman-core`): `Route::upstream` is no longer a field. A route now holds an `UpstreamSet` (`Route::upstreams`); use `Route::upstream()` for the first/only endpoint. `RouteToml::upstream` is now `Option<String>` (with the new `upstreams` and `lb` fields). Migration: TOML configs with `upstream = "..."` are unchanged; library users replace `route.upstream.x()` with `route.upstream().x()` (or `route.upstreams.acquire()` for the whole set). `Route::new(prefix, upstream)` still builds a one-endpoint route.
 - The request handler moved to `ferryman-proxy`; the old paths re-export it unchanged. The `metrics` dependency of `ferryman` is now dev-only.
 
 ### Fixed

@@ -8,9 +8,11 @@
 pub use crate::breaker::{Admission, CircuitState};
 use crate::breaker::{Breaker, BreakerConfig};
 use crate::proxies::TrustedProxies;
+pub use crate::upstream_set::{Endpoint, LbPolicy, UpstreamSet};
 use crate::Error;
 use arc_swap::ArcSwap;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +26,9 @@ pub struct Upstream {
     /// the scheme (80 for http) when the URI doesn't specify one.
     pub name: String,
     breaker: Arc<Breaker>,
+    /// Requests currently dispatched to this endpoint (all routes), for
+    /// `least_conn` / `p2c`. Shared by clones, so it survives a reload.
+    inflight: Arc<AtomicUsize>,
     health_path: Option<String>,
     health_disabled: bool,
 }
@@ -41,6 +46,7 @@ impl Upstream {
             uri,
             name,
             breaker,
+            inflight: Arc::default(),
             health_path: None,
             health_disabled: false,
         })
@@ -69,6 +75,20 @@ impl Upstream {
     /// ticket to pass back to `record_*`; see [`Admission`].
     pub fn try_acquire(&self) -> Option<Admission> {
         self.breaker.try_acquire()
+    }
+
+    /// Requests currently counted against this endpoint (see
+    /// [`Upstream::track_inflight`]).
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed)
+    }
+
+    /// Count one in-flight request until the guard drops; the load balancer
+    /// (`least_conn`, `p2c`) reads it. Hold it as long as the request is
+    /// dispatched (the proxy ties it to the breaker ticket).
+    pub fn track_inflight(&self) -> InflightGuard {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        InflightGuard(self.inflight.clone())
     }
 
     /// See [`Breaker::release`].
@@ -105,6 +125,16 @@ impl Upstream {
     }
 }
 
+/// Decrements the endpoint's in-flight count on drop.
+#[must_use = "the request is only counted while the guard lives"]
+pub struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn upstream_name(uri: &http::Uri) -> String {
     // Hostnames are case-insensitive; one name per backend, one breaker.
     let host = uri.host().unwrap_or("").to_ascii_lowercase();
@@ -115,11 +145,13 @@ pub(crate) fn upstream_name(uri: &http::Uri) -> String {
     format!("{host}:{port}")
 }
 
-/// One routing rule: a path prefix and the upstream it forwards to.
+/// One routing rule: a path prefix and the endpoints it forwards to.
 #[non_exhaustive]
 pub struct Route {
     pub prefix: String,
-    pub upstream: Upstream,
+    /// The endpoints and load-balancing policy. See [`Route::upstream`] for
+    /// the single-endpoint shortcut.
+    pub upstreams: UpstreamSet,
     /// `true`: send the upstream's own authority as `Host`. `false` (default):
     /// keep the client's `Host` (or the request authority, see the proxy docs).
     pub rewrite_host: bool,
@@ -129,14 +161,26 @@ pub struct Route {
 }
 
 impl Route {
-    /// A route with `rewrite_host` off.
+    /// A one-endpoint route with `rewrite_host` off.
     pub fn new(prefix: impl Into<String>, upstream: Upstream) -> Self {
+        Self::with_upstreams(prefix, UpstreamSet::single(upstream))
+    }
+
+    /// A route over several endpoints.
+    pub fn with_upstreams(prefix: impl Into<String>, upstreams: UpstreamSet) -> Self {
         Self {
             prefix: prefix.into(),
-            upstream,
+            upstreams,
             rewrite_host: false,
             strip_prefix: false,
         }
+    }
+
+    /// The first endpoint: THE upstream of a route configured with
+    /// `upstream = "..."`. For a multi-endpoint route use
+    /// [`Route::upstreams`] and [`UpstreamSet::acquire`].
+    pub fn upstream(&self) -> &Upstream {
+        self.upstreams.first()
     }
 
     /// Set [`Route::strip_prefix`].
@@ -379,13 +423,14 @@ impl RouteTable {
             .find(|r| prefix_matches(&r.prefix, &path))
     }
 
-    /// Upstreams referenced by this table, deduplicated by name — routes
-    /// sharing an upstream URI share one `Upstream`/breaker.
+    /// Endpoints referenced by this table, deduplicated by name — routes
+    /// sharing an endpoint share one `Upstream`/breaker.
     pub fn upstreams(&self) -> impl Iterator<Item = &Upstream> {
         let mut seen = std::collections::HashSet::new();
         self.routes
             .iter()
-            .filter_map(move |r| seen.insert(r.upstream.name.clone()).then_some(&r.upstream))
+            .flat_map(|r| r.upstreams.upstreams())
+            .filter(move |u| seen.insert(u.name.clone()))
     }
 
     /// Set `ferryman_circuit_state` / `ferryman_upstream_alive` for every

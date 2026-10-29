@@ -760,7 +760,7 @@ where
     // before the 404 and the strip-prefix check, as in ferryman-edge.
     let route = table.lookup(req.uri().path());
     let (label, up_name): (&str, &str) = match &route {
-        Some(r) => (&r.prefix, &r.upstream.name),
+        Some(r) => (&r.prefix, r.upstreams.label()),
         None => ("none", "none"),
     };
     if wants_upgrade || req.method() == http::Method::CONNECT {
@@ -800,10 +800,8 @@ where
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
     };
     let route_label = route.prefix.clone();
-    let upstream = route.upstream.clone();
     let span = tracing::Span::current();
     span.record("route", route_label.as_str());
-    span.record("upstream", &*upstream.name);
     let rewrite_host = route.rewrite_host;
     // bad_path/ambiguous_route already accepted the raw path; strip only
     // after them, on the normalised path, and re-check the result.
@@ -821,13 +819,17 @@ where
 
     pre_admission();
 
-    let Some(admission) = upstream.try_acquire() else {
-        record(cx, &route_label, &upstream.name, 503);
+    // Each endpoint is offered at most once; none admitting is a 503 for
+    // this route (never another route).
+    let Some((upstream, admission)) = route.upstreams.acquire() else {
+        record(cx, &route_label, route.upstreams.label(), 503);
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream unavailable",
         ));
     };
+    let upstream = upstream.clone();
+    span.record("upstream", &*upstream.name);
 
     // From here every exit gives a verdict or drops the ticket (release).
     let ticket = Ticket::new(upstream.clone(), admission);

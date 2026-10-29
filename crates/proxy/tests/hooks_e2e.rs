@@ -139,7 +139,12 @@ impl Rig {
     }
 
     fn state(&self) -> CircuitState {
-        self.table.load().lookup("/svc/").unwrap().upstream.state()
+        self.table
+            .load()
+            .lookup("/svc/")
+            .unwrap()
+            .upstream()
+            .state()
     }
 }
 
@@ -193,7 +198,7 @@ async fn panicking_stamp_is_a_500_and_spares_the_breaker() {
 
 /// Open the breaker through the table's own upstream.
 fn open(r: &Rig) {
-    let up = r.table.load().lookup("/svc/").unwrap().upstream.clone();
+    let up = r.table.load().lookup("/svc/").unwrap().upstream().clone();
     let a = up.try_acquire().unwrap();
     up.record_failure(a);
     assert_eq!(up.state(), CircuitState::Open);
@@ -220,7 +225,7 @@ async fn short_circuit_while_half_open_leaves_state_and_probe_slot_alone() {
     let r = rig().await;
     open(&r);
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-    let up = r.table.load().lookup("/svc/").unwrap().upstream.clone();
+    let up = r.table.load().lookup("/svc/").unwrap().upstream().clone();
     let probe = up.try_acquire().unwrap();
     assert_eq!(up.state(), CircuitState::HalfOpen);
     assert!(r.send("").await.starts_with("HTTP/1.1 401"));

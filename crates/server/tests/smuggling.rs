@@ -92,11 +92,19 @@ async fn setup(extra: &str) -> (std::net::SocketAddr, Rec) {
     (proxy, rec)
 }
 
-/// Read until EOF or until `idle` passes with no data (hang-proof).
+/// Read until EOF or until `idle` passes with no data after the first
+/// bytes. The first read waits up to 5s so a loaded box cannot make a slow
+/// response look like silence (hang-proof either way).
 async fn read_all(s: &mut TcpStream, idle: Duration) -> Vec<u8> {
+    read_all_wait(s, Duration::from_secs(5), idle).await
+}
+
+async fn read_all_wait(s: &mut TcpStream, first: Duration, idle: Duration) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
-    while let Ok(Ok(n)) = tokio::time::timeout(idle, s.read(&mut buf)).await {
+    let mut wait = first;
+    while let Ok(Ok(n)) = tokio::time::timeout(wait, s.read(&mut buf)).await {
+        wait = idle;
         if n == 0 {
             break;
         }
@@ -366,7 +374,12 @@ async fn expect_continue_with_rejected_body_does_not_desync() {
             b"GET /svc/evil HTTP/1.1\r\nhost: x\r\n\r\nGET /svc/next HTTP/1.1\r\nhost: x\r\n\r\n",
         )
         .await;
-    let _ = read_all(&mut s, Duration::from_millis(250)).await;
+    let _ = read_all_wait(
+        &mut s,
+        Duration::from_millis(250),
+        Duration::from_millis(250),
+    )
+    .await;
     let up: String = rec
         .lock()
         .unwrap()

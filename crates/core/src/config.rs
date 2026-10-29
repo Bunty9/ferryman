@@ -134,6 +134,13 @@ const MAX_SECS: u64 = 86_400;
 pub struct RouteToml {
     /// Path prefix to match (e.g. `/svc-a`).
     pub prefix: String,
+    /// Limit the route to a request host: `a.example.com` or `*.example.com`
+    /// (one or more leading labels, never `example.com` itself). Lowercase
+    /// ASCII (IDN as `xn--` punycode), no port, no trailing dot, not an IP.
+    /// Without it the route is in the default (hostless) set. Matching:
+    /// [`RouteTable::lookup_host`].
+    #[serde(default)]
+    pub host: Option<String>,
     /// Upstream URI, e.g. `http://localhost:8001`: one endpoint. Exactly
     /// one of `upstream` / `upstreams` must be set.
     #[serde(default)]
@@ -238,6 +245,59 @@ impl ConfigToml {
 }
 
 /// Parse and check one upstream URI of route `route`.
+/// A route `host`: lowercase ASCII DNS name, or `*.` + one. Not an IP, so a
+/// request with an IP `Host` can only reach hostless routes.
+fn validate_host(route: &str, host: &str) -> Result<(), Error> {
+    let bad = |reason: &str| Error::InvalidHost {
+        route: route.to_string(),
+        host: host.to_string(),
+        reason: reason.to_string(),
+    };
+    if !host.is_ascii() {
+        return Err(bad("must be ASCII (write an IDN as xn-- punycode)"));
+    }
+    if host.bytes().any(|c| c.is_ascii_uppercase()) {
+        return Err(bad("must be lowercase"));
+    }
+    if host.ends_with('.') {
+        return Err(bad("must not end with '.'"));
+    }
+    let name = host.strip_prefix("*.").unwrap_or(host);
+    if name.len() > 253 {
+        return Err(bad("longer than 253 bytes"));
+    }
+    if name.is_empty() {
+        return Err(bad("empty"));
+    }
+    if name.contains('*') {
+        return Err(bad(
+            "'*' is only allowed as the whole first label (\"*.example.com\")",
+        ));
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    for l in &labels {
+        let ok = (1..=63).contains(&l.len())
+            && l.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-');
+        if !ok {
+            return Err(bad(
+                "labels must be 1-63 characters of [a-z0-9-], not starting or ending with '-' (no port, no IPv6)",
+            ));
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|l| l.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return Err(bad(
+            "IP addresses are not allowed; host routes are for DNS names",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_endpoint(route: &str, addr: &str) -> Result<http::Uri, Error> {
     let bad = |reason: String, source| Error::InvalidUpstream {
         route: route.to_string(),
@@ -413,8 +473,17 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                 normal: "prefixes may not contain ';', '\\', %2F or %5C (such requests are rejected as ambiguous)".to_string(),
             });
         }
-        if !seen_prefixes.insert(r.prefix.clone()) {
-            return Err(Error::DuplicatePrefix { prefix: r.prefix });
+        if let Some(h) = &r.host {
+            validate_host(&r.prefix, h)?;
+        }
+        if !seen_prefixes.insert((r.host.clone(), r.prefix.clone())) {
+            return Err(match r.host {
+                Some(host) => Error::DuplicateHostPrefix {
+                    host,
+                    prefix: r.prefix,
+                },
+                None => Error::DuplicatePrefix { prefix: r.prefix },
+            });
         }
 
         let bad_set = |reason: String| Error::InvalidUpstreamSet {
@@ -535,6 +604,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
         }
         validated.push((
             r.prefix,
+            r.host,
             endpoints,
             r.lb,
             cooldown,
@@ -548,6 +618,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
     let mut routes = Vec::with_capacity(validated.len());
     for (
         prefix,
+        host,
         endpoints,
         lb,
         cooldown,
@@ -581,11 +652,12 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
             };
             eps.push(Endpoint::new(upstream, weight));
         }
-        routes.push(
+        let mut route =
             Route::with_upstreams(prefix, UpstreamSet::new(eps, lb).expect("validated above"))
                 .with_rewrite_host(rewrite_host)
-                .with_strip_prefix(strip_prefix),
-        );
+                .with_strip_prefix(strip_prefix);
+        route.host = host;
+        routes.push(route);
     }
 
     Ok(RouteTable::new(routes, upstream_timeout)
@@ -654,6 +726,7 @@ mod tests {
     fn route(prefix: &str, upstream: &str) -> RouteToml {
         RouteToml {
             prefix: prefix.to_string(),
+            host: None,
             upstream: Some(upstream.to_string()),
             upstreams: None,
             lb: LbPolicy::default(),
@@ -1167,5 +1240,155 @@ health_disabled = true
         assert_eq!((up.health_path(), up.health_disabled()), ("/health", false));
         up.record_success(Admission::Probe);
         assert_eq!(new_up.state(), CircuitState::Closed);
+    }
+
+    fn hroute(host: &str, prefix: &str, upstream: &str) -> RouteToml {
+        RouteToml {
+            host: Some(host.to_string()),
+            ..route(prefix, upstream)
+        }
+    }
+
+    #[test]
+    fn host_validation() {
+        for bad in [
+            "Example.com",
+            "bücher.example",
+            "exa mple.com",
+            "example.com.",
+            "example.com:8080",
+            "*.example.com.",
+            "*",
+            "*.",
+            "a.*.example.com",
+            "*a.example.com",
+            "**.example.com",
+            "*.*.example.com",
+            "-a.example.com",
+            "a-.example.com",
+            "a..example.com",
+            ".example.com",
+            "",
+            "1.2.3.4",
+            "[::1]",
+            "*.4",
+            &format!("{}.com", "a".repeat(64)),
+            &format!("{}.com", vec!["a".repeat(60); 5].join(".")),
+        ] {
+            let r = build_table(cfg(vec![hroute(bad, "/", "http://h:1")]), None);
+            assert!(matches!(r, Err(Error::InvalidHost { .. })), "{bad:?}");
+        }
+        for ok in [
+            "example.com",
+            "a.example.com",
+            "*.example.com",
+            "xn--bcher-kva.example",
+            "localhost",
+            "a-b.c1.example",
+            &format!("{}.com", "a".repeat(63)),
+        ] {
+            build_table(cfg(vec![hroute(ok, "/", "http://h:1")]), None)
+                .unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn duplicate_host_prefix_is_rejected_but_same_prefix_across_hosts_is_not() {
+        let r = build_table(
+            cfg(vec![
+                hroute("a.example.com", "/", "http://h:1"),
+                hroute("a.example.com", "/", "http://h:2"),
+            ]),
+            None,
+        );
+        assert!(matches!(r, Err(Error::DuplicateHostPrefix { .. })));
+        build_table(
+            cfg(vec![
+                route("/", "http://h:1"),
+                hroute("a.example.com", "/", "http://h:2"),
+                hroute("*.example.com", "/", "http://h:3"),
+                hroute("b.example.com", "/", "http://h:4"),
+            ]),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn host_matching_precedence() {
+        let t = build_table(
+            cfg(vec![
+                route("/", "http://h:1"),
+                route("/only-default", "http://h:9"),
+                hroute("a.example.com", "/", "http://h:2"),
+                hroute("a.example.com", "/api", "http://h:3"),
+                hroute("*.example.com", "/", "http://h:4"),
+                hroute("*.b.example.com", "/", "http://h:5"),
+                hroute("only.example.com", "/x", "http://h:6"),
+            ]),
+            None,
+        )
+        .unwrap();
+        let up = |h: Option<&str>, p: &str| {
+            t.lookup_host(h, p)
+                .map(|r| r.upstream().uri.port_u16().unwrap())
+        };
+        // exact > wildcard > hostless; longest prefix inside the group
+        assert_eq!(up(Some("a.example.com"), "/api/x"), Some(3));
+        assert_eq!(up(Some("a.example.com"), "/other"), Some(2));
+        // case, port, ONE trailing dot
+        assert_eq!(up(Some("A.Example.COM:8443"), "/"), Some(2));
+        assert_eq!(up(Some("a.example.com."), "/"), Some(2));
+        assert_eq!(up(Some("a.example.com.."), "/"), Some(1));
+        // wildcard: longest suffix, multi-label, never the apex
+        assert_eq!(up(Some("z.example.com"), "/"), Some(4));
+        assert_eq!(up(Some("x.y.example.com"), "/"), Some(4));
+        assert_eq!(up(Some("x.b.example.com"), "/"), Some(5));
+        assert_eq!(up(Some("b.example.com"), "/"), Some(4));
+        assert_eq!(up(Some("example.com"), "/"), Some(1));
+        assert_eq!(up(Some("..example.com"), "/"), Some(1));
+        assert_eq!(up(Some("evilexample.com"), "/"), Some(1));
+        // unknown host, none, IPs, empty: hostless only
+        for h in [
+            Some("other.org"),
+            None,
+            Some(""),
+            Some("1.2.3.4:80"),
+            Some("[::1]:80"),
+        ] {
+            assert_eq!(up(h, "/only-default"), Some(9), "{h:?}");
+        }
+        // chosen group without a matching prefix: no fallback (404)
+        assert_eq!(up(Some("only.example.com"), "/other"), None);
+        assert_eq!(up(Some("only.example.com"), "/only-default"), None);
+        assert_eq!(up(Some("only.example.com"), "/x/y"), Some(6));
+        // exact group present but unmatched does not fall to the wildcard
+        assert_eq!(up(Some("a.example.com"), "/only-default"), Some(2));
+        // lookup(path) is hostless-only
+        assert_eq!(t.lookup("/").unwrap().host, None);
+        assert_eq!(
+            t.lookup_host(Some("a.example.com"), "/api")
+                .unwrap()
+                .label(),
+            "a.example.com/api"
+        );
+        assert_eq!(t.lookup("/only-default").unwrap().label(), "/only-default");
+    }
+
+    #[test]
+    fn ambiguity_check_uses_the_requests_host_group() {
+        // `/a%2Fb` flattens to `/a/b`: only host x has a route that tells them apart.
+        let t = build_table(
+            cfg(vec![
+                route("/", "http://h:1"),
+                hroute("x.example.com", "/a/b", "http://h:2"),
+            ]),
+            None,
+        )
+        .unwrap();
+        use crate::path::ambiguous_route_host as amb;
+        assert!(!amb(&t, None, "/a%2Fb"));
+        assert!(amb(&t, Some("x.example.com"), "/a%2Fb"));
+        assert!(!amb(&t, Some("y.example.com"), "/a%2Fb"));
     }
 }

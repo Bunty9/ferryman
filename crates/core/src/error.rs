@@ -41,6 +41,16 @@ pub enum Error {
     /// Two routes share a prefix.
     #[error("duplicate route prefix {prefix:?}")]
     DuplicatePrefix { prefix: String },
+    /// A route's `host` is not a valid, normalised DNS name or `*.` wildcard.
+    #[error("route {route:?}: invalid host {host:?}: {reason}")]
+    InvalidHost {
+        route: String,
+        host: String,
+        reason: String,
+    },
+    /// Two routes share a host and a prefix.
+    #[error("duplicate route {prefix:?} for host {host:?}")]
+    DuplicateHostPrefix { host: String, prefix: String },
     /// A route's upstream URI is unusable (bad URI, scheme, host, path...).
     #[error("route {route:?}: {reason}")]
     InvalidUpstream {

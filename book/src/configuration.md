@@ -42,6 +42,7 @@ At least one route is needed. Routes are matched by longest prefix
 
 | Key | Type | Default | Reload | Meaning |
 | --- | --- | --- | --- | --- |
+| `host` | string | none | hot | Limit the route to a request host: `app.example.com` or `*.example.com` (one or more leading labels, never the apex). Lowercase ASCII (IDN as `xn--`), valid DNS name, no port, trailing dot or IP. Exact host beats wildcard beats hostless; no fallback out of a matched host group (404). `host` + `prefix` must be unique. Metric `route` label is `host`+prefix. See [Routing](routing.md#host-routing). |
 | `prefix` | string | required | hot | Path prefix, matched on segment boundaries (`/a` does not match `/ab`) against the normalised, case-sensitive request path. Must start with `/` and be written in normalised form (rejected at load otherwise); may not contain `;`, `\`, `%2F` or `%5C`. Duplicates are rejected. |
 | `upstream` | string | one of `upstream`/`upstreams` | hot | `http://host:port`: no path, no query, no `https`. A host is required (`http://:80` is rejected). One endpoint. |
 | `upstreams` | array | one of `upstream`/`upstreams` | hot | Several endpoints: each a URI string (as `upstream`) or a table `{ addr = "http://host:port", weight = 3 }`. Non-empty; the same `host:port` twice in one route is rejected, as is setting both `upstream` and `upstreams`. |

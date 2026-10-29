@@ -150,6 +150,11 @@ pub(crate) fn upstream_name(uri: &http::Uri) -> String {
 #[non_exhaustive]
 pub struct Route {
     pub prefix: String,
+    /// Host this route is limited to: `a.example.com` or `*.example.com`
+    /// (normalised: lowercase ASCII, no port, no trailing dot). `None` = a
+    /// hostless route, the default set used when no host group applies. See
+    /// [`RouteTable::lookup_host`].
+    pub host: Option<String>,
     /// The endpoints and load-balancing policy. See [`Route::upstream`] for
     /// the single-endpoint shortcut.
     pub upstreams: UpstreamSet,
@@ -171,6 +176,7 @@ impl Route {
     pub fn with_upstreams(prefix: impl Into<String>, upstreams: UpstreamSet) -> Self {
         Self {
             prefix: prefix.into(),
+            host: None,
             upstreams,
             rewrite_host: false,
             strip_prefix: false,
@@ -220,6 +226,23 @@ impl Route {
         let out = if rest.is_empty() { "/" } else { rest };
         // Defence in depth: never hand upstream a path bad_path would refuse.
         (out.starts_with('/') && !crate::path::bad_path(out)).then(|| out.to_string())
+    }
+
+    /// Set [`Route::host`]. Not validated here (`build_table` does): it must
+    /// already be normalised or it can never match.
+    pub fn with_host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    /// Metric label: the prefix, or `host` + prefix (`a.example.com/api`) for
+    /// a host route. Config-bounded, and distinct when two host groups share
+    /// a prefix.
+    pub fn label(&self) -> Cow<'_, str> {
+        match &self.host {
+            Some(h) => Cow::Owned(format!("{h}{}", self.prefix)),
+            None => Cow::Borrowed(&self.prefix),
+        }
     }
 
     /// Set [`Route::rewrite_host`].
@@ -417,11 +440,38 @@ impl RouteTable {
     /// rejects those on the raw path before calling `lookup`. Normalisation
     /// runs exactly once and is not idempotent for malformed escapes
     /// (`/%2%61` becomes `/%2a`).
+    ///
+    /// Considers hostless routes only (same as `lookup_host(None, path)`).
     pub fn lookup(&self, path: &str) -> Option<&Route> {
+        self.lookup_host(None, path)
+    }
+
+    /// [`RouteTable::lookup`] with the request's host. `host` is the
+    /// validated request authority text (URI authority, else the `Host`
+    /// header; `host[:port]` or a bracketed IPv6 literal, any case); `None`
+    /// or empty selects the hostless routes.
+    ///
+    /// The host is lowercased, its port stripped and ONE trailing dot
+    /// removed. The host group is then chosen: an exact host route beats a
+    /// wildcard one, the longest wildcard suffix beats a shorter one, and
+    /// hostless routes apply only when no host route applies. A wildcard
+    /// `*.example.com` matches one or more extra leading labels
+    /// (`a.example.com`, `a.b.example.com`) and never `example.com` itself.
+    /// Within the chosen group the longest prefix wins. There is NO fallback:
+    /// when the chosen host group has no matching prefix the result is
+    /// `None` (404), not a hostless or less specific host route. IP literals
+    /// can only match hostless routes (config hosts are never IPs).
+    pub fn lookup_host(&self, host: Option<&str>, path: &str) -> Option<&Route> {
         let path = normalize(path);
+        let host = host.map(norm_host).unwrap_or_default();
+        let rank = |r: &Route| match r.host.as_deref() {
+            None => Some(0),
+            Some(p) => host_rank(p, &host),
+        };
+        let best = self.routes.iter().filter_map(rank).max()?;
         self.routes
             .iter()
-            .find(|r| prefix_matches(&r.prefix, &path))
+            .find(|r| rank(r) == Some(best) && prefix_matches(&r.prefix, &path))
     }
 
     /// Endpoints referenced by this table, deduplicated by name — routes
@@ -440,6 +490,37 @@ impl RouteTable {
     pub fn publish_gauges(&self) {
         for u in self.upstreams() {
             u.breaker.set_gauges();
+        }
+    }
+}
+
+/// Lowercase, drop the port and ONE trailing dot.
+fn norm_host(h: &str) -> Cow<'_, str> {
+    let h = if h.starts_with('[') {
+        h.find(']').map_or(h, |i| &h[..=i])
+    } else {
+        h.split(':').next().unwrap_or("")
+    };
+    let h = h.strip_suffix('.').unwrap_or(h);
+    if h.bytes().any(|c| c.is_ascii_uppercase()) {
+        Cow::Owned(h.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(h)
+    }
+}
+
+/// Specificity of host pattern `pat` for normalised `host`: `None` = does
+/// not apply; exact = `usize::MAX`; wildcard = suffix length (longest wins);
+/// both beat hostless (0).
+fn host_rank(pat: &str, host: &str) -> Option<usize> {
+    if host.is_empty() {
+        return None;
+    }
+    match pat.strip_prefix('*') {
+        None => (pat == host).then_some(usize::MAX),
+        Some(suffix) => {
+            let extra = host.strip_suffix(suffix)?;
+            (!extra.is_empty() && extra.split('.').all(|l| !l.is_empty())).then_some(suffix.len())
         }
     }
 }

@@ -744,8 +744,11 @@ where
         None => req,
     };
 
+    // The host routing key. Taken before bad_host runs, but only used for
+    // routing decisions that answer 400 anyway when bad_host then fails.
+    let host = request_host(req.headers(), req.uri());
     if ferryman_core::path::bad_path_normalized(req.uri().path())
-        || ferryman_core::path::ambiguous_route(&table, req.uri().path())
+        || ferryman_core::path::ambiguous_route_host(&table, host, req.uri().path())
     {
         record(cx, "none", "none", 400);
         return Ok(error_response(StatusCode::BAD_REQUEST, "bad path\n"));
@@ -758,10 +761,11 @@ where
 
     // Pure lookup (ignores health). Upgrade and the declared-size cap are decided
     // before the 404 and the strip-prefix check, as in ferryman-edge.
-    let route = table.lookup(req.uri().path());
-    let (label, up_name): (&str, &str) = match &route {
-        Some(r) => (&r.prefix, r.upstreams.label()),
-        None => ("none", "none"),
+    let route = table.lookup_host(host, req.uri().path());
+    let route_label = route.map(|r| r.label());
+    let (label, up_name): (&str, &str) = match (&route, &route_label) {
+        (Some(r), Some(l)) => (l, r.upstreams.label()),
+        _ => ("none", "none"),
     };
     if wants_upgrade || req.method() == http::Method::CONNECT {
         record(cx, label, up_name, 501);
@@ -795,11 +799,11 @@ where
         }
     }
 
-    let Some(route) = table.lookup(req.uri().path()) else {
+    let (Some(route), Some(route_label)) = (route, route_label) else {
         record(cx, "none", "none", 404);
         return Ok(error_response(StatusCode::NOT_FOUND, "no route"));
     };
-    let route_label = route.prefix.clone();
+    let route_label = route_label.into_owned();
     let span = tracing::Span::current();
     span.record("route", route_label.as_str());
     let rewrite_host = route.rewrite_host;
@@ -1165,6 +1169,21 @@ fn bad_host(headers: &HeaderMap, uri: &http::Uri, version: http::Version) -> boo
         (None, _) => uri.authority().is_none() && version == http::Version::HTTP_11,
         (Some(v), None) => uri.authority().is_none() && !plain_authority(v.as_bytes()),
         _ => true,
+    }
+}
+
+/// The host that picks a host group: the URI authority's host (absolute-form
+/// / h2 `:authority`), else the single `Host` header; the same value
+/// `bad_host` judges. `None` when there is none, several, or it is not text
+/// (bad_host rejects those). Lookup lowercases and strips the port.
+fn request_host<'a>(headers: &'a HeaderMap, uri: &'a http::Uri) -> Option<&'a str> {
+    if let Some(a) = uri.authority() {
+        return Some(a.host());
+    }
+    let mut it = headers.get_all(header::HOST).iter();
+    match (it.next(), it.next()) {
+        (Some(v), None) => v.to_str().ok(),
+        _ => None,
     }
 }
 

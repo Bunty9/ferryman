@@ -26,6 +26,31 @@ fn build_table() -> RouteTable {
         )
         .unwrap(),
     ));
+    // Host-routed: 20 hosts sharing one prefix, plus a wildcard.
+    for i in 0..20 {
+        routes.push(
+            Route::new(
+                "/api",
+                Upstream::new(
+                    format!("http://localhost:{}", 9100 + i).parse().unwrap(),
+                    BreakerConfig::default(),
+                )
+                .unwrap(),
+            )
+            .with_host(format!("h{i}.example.com")),
+        );
+    }
+    routes.push(
+        Route::new(
+            "/",
+            Upstream::new(
+                "http://localhost:9998".parse().unwrap(),
+                BreakerConfig::default(),
+            )
+            .unwrap(),
+        )
+        .with_host("*.wild.example.com"),
+    );
     RouteTable::new(routes, Duration::from_secs(30))
 }
 
@@ -42,6 +67,17 @@ fn bench_lookup(c: &mut Criterion) {
         b.iter(|| table.lookup(black_box("/svc-3/anything")))
     });
     // No match at all: full scan of every route.
+    c.bench_function("lookup_host_exact", |b| {
+        b.iter(|| {
+            table.lookup_host(
+                black_box(Some("H15.example.com:443")),
+                black_box("/api/v1/x"),
+            )
+        })
+    });
+    c.bench_function("lookup_host_wildcard", |b| {
+        b.iter(|| table.lookup_host(black_box(Some("a.b.wild.example.com")), black_box("/x")))
+    });
     c.bench_function("lookup_miss", |b| {
         b.iter(|| table.lookup(black_box("/does-not-exist")))
     });

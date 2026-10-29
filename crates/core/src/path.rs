@@ -29,15 +29,27 @@ use crate::route::RouteTable;
 /// (not treated as `;`), and decoding beyond the forms above (triple
 /// encoding and the like).
 pub fn ambiguous_route(table: &RouteTable, raw_path: &str) -> bool {
+    ambiguous_route_host(table, None, raw_path)
+}
+
+/// [`ambiguous_route`] for a request with host `host` (see
+/// [`RouteTable::lookup_host`]): every reading is looked up in the same host
+/// group the request itself would use.
+pub fn ambiguous_route_host(table: &RouteTable, host: Option<&str>, raw_path: &str) -> bool {
     let norm = crate::route::normalize(raw_path);
     if !(suspicious(raw_path) || suspicious(&norm)) {
         return false;
     }
-    fn pick<'t>(t: &'t RouteTable, p: &str) -> Option<&'t str> {
-        t.lookup(p).map(|r| r.prefix.as_str())
+    fn pick<'t>(
+        t: &'t RouteTable,
+        host: Option<&str>,
+        p: &str,
+    ) -> Option<(Option<&'t str>, &'t str)> {
+        t.lookup_host(host, p)
+            .map(|r| (r.host.as_deref(), r.prefix.as_str()))
     }
 
-    let canon = pick(table, raw_path);
+    let canon = pick(table, host, raw_path);
     let ambiguous = [raw_path, &*norm].into_iter().any(|s| {
         let stripped = strip_params(s);
         [
@@ -47,7 +59,7 @@ pub fn ambiguous_route(table: &RouteTable, raw_path: &str) -> bool {
             flatten(&stripped),
         ]
         .iter()
-        .any(|r| pick(table, r) != canon)
+        .any(|r| pick(table, host, r) != canon)
     });
     ambiguous
 }

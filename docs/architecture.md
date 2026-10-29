@@ -69,7 +69,7 @@ accept ── set TCP_NODELAY
        2a. bad_path_normalized(path)     raw and normalised: dot segments, NUL, %u, double-encoded -> 400
        2b. ambiguous_route(table, path) %2F/%5C/\/; reading picks another route -> 400
        2c. bad_host                     single bare host[:port], present on 1.1 -> 400
-       2d. lookup(path)                 none -> 404
+       2d. lookup_host(host, path)      host group, then longest prefix; none -> 404
        2e. strip_prefix remainder check  re-checked at runtime, failing -> 400 (before admission)
        3. Upgrade (not h2c) / CONNECT   -> 501
        4. route.upstreams.acquire()     LB order, try_acquire once per endpoint; none admits -> 503, else (endpoint, Admission)
@@ -114,6 +114,16 @@ and a breaker failure.
 prefix ending in `/` is a plain `starts_with`, so `/` is a catch-all. A
 linear scan wins over a trie for the tens of routes this targets (see
 `crates/core/benches/lookup.rs`).
+
+Host routing: a route may carry `host` (exact or `*.suffix`). `lookup_host`
+normalises the request host (the URI authority's host, else the single `Host`
+header: lowercase, port and one trailing dot dropped), picks the group (exact
+host, else the wildcard with the longest suffix, else hostless), then the
+longest prefix inside it. A chosen group with no matching prefix is a 404
+with no fallback to another group. `ambiguous_route_host` compares readings
+inside the same group, so `ambiguous_route` runs with the host before
+`bad_host` has judged it (an invalid host is a 400 either way). The metric
+label of a host route is `host` + prefix.
 
 Lookup deliberately ignores health. If `/api/v1` is down, falling back to
 `/api` would send the request to a different service, so the answer is a

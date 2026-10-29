@@ -1817,3 +1817,118 @@ async fn request_path_half_open_recovers_on_a_multi_endpoint_health_disabled_rou
         }
     }
 }
+
+async fn tagged(tag: &'static str) -> SocketAddr {
+    spawn_stub(move |_| async move { ok(tag) }).await
+}
+
+/// Send one raw request (`target`, optional `Host`) and return the whole reply.
+async fn raw_get(proxy: SocketAddr, target: &str, host: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host = host.map(|h| format!("host: {h}\r\n")).unwrap_or_default();
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(format!("GET {target} HTTP/1.1\r\n{host}connection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    out
+}
+
+async fn host_proxy() -> SocketAddr {
+    let (a, b, w, d, only) = (
+        tagged("A").await,
+        tagged("B").await,
+        tagged("W").await,
+        tagged("D").await,
+        tagged("ONLY").await,
+    );
+    let table = shared_table(parse_cfg(&format!(
+        r#"
+[[routes]]
+prefix = "/"
+upstream = "http://{d}"
+[[routes]]
+host = "a.example.com"
+prefix = "/api"
+upstream = "http://{a}"
+[[routes]]
+host = "b.example.com"
+prefix = "/api"
+upstream = "http://{b}"
+[[routes]]
+host = "*.example.com"
+prefix = "/"
+upstream = "http://{w}"
+[[routes]]
+host = "only.example.com"
+prefix = "/x"
+upstream = "http://{only}"
+"#
+    )));
+    start_proxy(table).await
+}
+
+#[tokio::test]
+async fn host_routes_pick_upstream_by_host() {
+    let p = host_proxy().await;
+    let body = |r: String| r.rsplit("\r\n\r\n").next().unwrap().to_string();
+    // same prefix, different hosts; case and port ignored
+    assert_eq!(body(raw_get(p, "/api/x", Some("a.example.com")).await), "A");
+    assert_eq!(
+        body(raw_get(p, "/api/x", Some("B.Example.COM:8080")).await),
+        "B"
+    );
+    // exact group without matching prefix: 404, not the wildcard or default
+    let r = raw_get(p, "/other", Some("a.example.com")).await;
+    assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    // wildcard, then unknown host / IP host -> hostless default
+    assert_eq!(body(raw_get(p, "/z", Some("q.example.com")).await), "W");
+    assert_eq!(body(raw_get(p, "/z", Some("example.com")).await), "D");
+    assert_eq!(body(raw_get(p, "/z", Some("other.org")).await), "D");
+    assert_eq!(body(raw_get(p, "/z", Some("127.0.0.1")).await), "D");
+    // trailing dot
+    assert_eq!(
+        body(raw_get(p, "/api/x", Some("a.example.com.")).await),
+        "A"
+    );
+    // host group present, prefix missing: no hostless fallback
+    let r = raw_get(p, "/y", Some("only.example.com")).await;
+    assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    assert_eq!(
+        body(raw_get(p, "/x", Some("only.example.com")).await),
+        "ONLY"
+    );
+}
+
+#[tokio::test]
+async fn absolute_form_authority_beats_host_header_for_routing() {
+    let p = host_proxy().await;
+    let r = raw_get(p, "http://a.example.com/api/x", Some("b.example.com")).await;
+    assert!(r.ends_with("\r\n\r\nA"), "{r}");
+    let r = raw_get(p, "http://b.example.com/api/x", Some("a.example.com")).await;
+    assert!(r.ends_with("\r\n\r\nB"), "{r}");
+    // userinfo and port in the authority do not leak into the match
+    let r = raw_get(p, "http://u@a.example.com:81/api/x", Some("b.example.com")).await;
+    assert!(r.ends_with("\r\n\r\nA"), "{r}");
+    // bad Host headers are still 400 before routing
+    let r = raw_get(p, "/api/x", Some("a.example.com/evil")).await;
+    assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+}
+
+#[tokio::test]
+async fn http2_authority_routes_by_host() {
+    let p = host_proxy().await;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .resolve("b.example.com", p)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("http://b.example.com:{}/api/x", p.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(resp.text().await.unwrap(), "B");
+}

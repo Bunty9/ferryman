@@ -47,6 +47,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 - Don't add `rustls-pemfile` (unmaintained advisory); use `rustls::pki_types::pem::PemObject`.
 - `rust-toolchain.toml` is in `.dockerignore` on purpose: it made rustup switch to a toolchain without the musl target.
 - CI test job sets `RUSTUP_TOOLCHAIN=${{ matrix.rust }}`; otherwise the toolchain file forces stable on the beta leg.
+- Toolchains are installed in CI with `rustup toolchain install` + `rustup default` (inline `run:` step, values via `env:`), not a third-party action (`dtolnay/rust-toolchain` only has a floating `v1` tag, which trips zizmor ref-version-mismatch).
 
 ## Publishing
 

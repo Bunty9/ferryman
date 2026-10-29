@@ -509,10 +509,18 @@ where
         .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
     if wants_upgrade || req.method() == http::Method::CONNECT {
         record(cx, &route_label, &upstream.name, 501);
-        return Ok(error_response(
+        let h1 = req.version() <= http::Version::HTTP_11;
+        let mut resp = error_response(
             StatusCode::NOT_IMPLEMENTED,
             "protocol upgrades are not supported",
-        ));
+        );
+        // h1: close, so bytes pipelined behind the Upgrade/CONNECT are never
+        // parsed as a request and forwarded.
+        if h1 {
+            resp.headers_mut()
+                .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
+        }
+        return Ok(resp);
     }
 
     let Some(admission) = upstream.try_acquire() else {

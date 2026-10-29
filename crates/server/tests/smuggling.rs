@@ -19,7 +19,7 @@
 //! line endings, chunk extensions, `chunked ` / `CHUNKED`, absolute-form
 //! (authority wins over Host), equal duplicate Content-Length.
 //! Pipelining: requests are forwarded separately, responses in order.
-//! `Upgrade` / `Expect`: 501, the request never goes upstream.
+//! `Upgrade` / `Expect`: 501 with `connection: close`; nothing, including pipelined bytes, goes upstream.
 
 use ferryman_core::{build_table, ConfigToml};
 use std::sync::{Arc, Mutex};
@@ -327,40 +327,25 @@ async fn upgrade_is_501_and_never_forwarded() {
     assert_eq!(u, "");
 }
 
-/// FINDING (low): after the 501 for an Upgrade request the connection stays
-/// open, so bytes the client pipelined behind it are parsed as a normal HTTP
-/// request and forwarded. It is well-formed and singly framed (no desync),
-/// but once B1 splices after a real 101, anything pipelined behind an
-/// Upgrade must be dropped. Current behaviour is pinned by the next test.
 #[tokio::test]
-#[ignore = "FINDING: pipelined request after a 501'd Upgrade is still forwarded (connection not closed)"]
 async fn upgrade_pipelined_bytes_never_reach_upstream() {
-    let (_, u) = probe(b"GET /svc/ws HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nGET /svc/evil HTTP/1.1\r\nhost: x\r\n\r\n").await;
-    assert_eq!(u, "", "{u:?}");
-}
-
-#[tokio::test]
-async fn upgrade_then_pipelined_request_is_a_single_clean_request() {
     let (c, u) = probe(b"GET /svc/ws HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nGET /svc/evil HTTP/1.1\r\nhost: x\r\n\r\n").await;
-    assert!(c.starts_with("HTTP/1.1 501"), "{c:?}");
-    assert_eq!(reqs(&u), 1, "{u:?}");
     assert!(
-        u.starts_with("GET /svc/evil HTTP/1.1\r\n") && !u.to_lowercase().contains("upgrade"),
-        "{u:?}"
+        c.starts_with("HTTP/1.1 501") && c.contains("connection: close"),
+        "{c:?}"
     );
+    assert_eq!(c.matches("HTTP/1.1 ").count(), 1, "{c:?}");
+    assert_eq!(u, "");
 }
 
 #[tokio::test]
 async fn expect_continue_with_rejected_body_does_not_desync() {
-    // Body sent eagerly: 501, then the next request is parsed correctly.
+    // Body sent eagerly: 501 + close, the pipelined request is dropped.
     let (c, u) = probe(b"POST /svc/ws HTTP/1.1\r\nhost: x\r\nexpect: 100-continue\r\nconnection: upgrade\r\nupgrade: websocket\r\ncontent-length: 5\r\n\r\nabcdeGET /svc/next HTTP/1.1\r\nhost: x\r\n\r\n").await;
     assert!(c.starts_with("HTTP/1.1 501"), "{c:?}");
     assert!(!c.contains("100 Continue"), "{c:?}");
-    assert_eq!(reqs(&u), 1, "{u:?}");
-    assert!(
-        u.starts_with("GET /svc/next HTTP/1.1\r\n") && !u.contains("abcde"),
-        "{u:?}"
-    );
+    assert!(c.contains("connection: close"), "{c:?}");
+    assert_eq!(u, "", "closed after 501: nothing pipelined is forwarded");
 
     // Body withheld: after the 501 the connection is either closed or still
     // framed; the body bytes sent later must never be read as a request.

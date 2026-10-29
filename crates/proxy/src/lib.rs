@@ -13,9 +13,9 @@ mod verdict;
 
 pub use conn::{ConnCtx, TlsInfo};
 #[cfg(feature = "unstable-hooks")]
-pub use hooks::{AssertedHeaders, BoxFuture, Hooks, StampCtx};
+pub use hooks::{full_body, AssertedHeaders, BoxFuture, Hooks, PreDispatch, StampCtx};
 #[cfg(feature = "unstable-hooks")]
-pub use pipeline::{full_body, ResponseBody};
+pub use pipeline::ResponseBody;
 pub use pipeline::{warn_if_private_peer, HeaderPolicy, Policy, Proxy};
 pub use verdict::VerdictPolicy;
 

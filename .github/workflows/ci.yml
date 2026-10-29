@@ -106,6 +106,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo check
         run: cargo check --workspace --locked
+      - name: cargo check (proxy, all features)
+        run: cargo check -p ferryman-proxy --all-features --locked
 
   deny:
     name: cargo-deny

@@ -2,12 +2,12 @@
 
 use ferryman_core::{build_table, CircuitState, ConfigToml, SharedTable};
 use ferryman_proxy::{
-    full_body, AssertedHeaders, BoxFuture, ConnCtx, Hooks, Policy, Proxy, ResponseBody, StampCtx,
+    full_body, AssertedHeaders, BoxFuture, ConnCtx, Hooks, Policy, PreDispatch, Proxy,
+    ResponseBody, StampCtx,
 };
 use http::{HeaderName, HeaderValue, StatusCode};
-use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::Response;
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -28,21 +28,21 @@ struct Auth;
 impl Hooks for Auth {
     fn pre_dispatch<'a>(
         &'a self,
-        req: &'a mut Request<Incoming>,
+        req: PreDispatch<'a>,
         _ctx: &'a ConnCtx,
     ) -> BoxFuture<'a, Result<(), Response<ResponseBody>>> {
         Box::pin(async move {
-            let Some(who) = req.headers().get("authorization") else {
+            let Some(who) = req.headers.get("authorization") else {
                 return Err(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .body(full_body("nope"))
                     .unwrap());
             };
             let who = who.to_str().unwrap().to_string();
-            let boom = req.headers().contains_key("x-boom");
-            req.extensions_mut().insert(Tenant(who));
+            let boom = req.headers.contains_key("x-boom");
+            req.extensions.insert(Tenant(who));
             if boom {
-                req.extensions_mut().insert(Boom);
+                req.extensions.insert(Boom);
             }
             Ok(())
         })
@@ -95,7 +95,7 @@ async fn rig() -> Rig {
         }
     });
     let cfg: ConfigToml = toml::from_str(&format!(
-        "request_id = true\nfailure_threshold = 1\n[[routes]]\nprefix = \"/svc\"\nupstream = \"http://{up_addr}\"\n"
+        "request_id = true\nfailure_threshold = 1\ndefault_cooldown_secs = 1\n[[routes]]\nprefix = \"/svc\"\nupstream = \"http://{up_addr}\"\n"
     ))
     .unwrap();
     let table: SharedTable = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -176,11 +176,11 @@ async fn extension_reaches_stamp_and_client_spellings_are_stripped() {
 }
 
 #[tokio::test]
-async fn panicking_stamp_drops_the_connection_and_spares_the_breaker() {
+async fn panicking_stamp_is_a_500_and_spares_the_breaker() {
     let r = rig().await;
     // failure_threshold = 1: a recorded failure would open the breaker.
     let out = r.send("authorization: bob\r\nx-boom: 1\r\n").await;
-    assert!(!out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.starts_with("HTTP/1.1 500"), "{out}");
     assert_eq!(
         r.hits.load(Ordering::SeqCst),
         0,
@@ -189,4 +189,43 @@ async fn panicking_stamp_drops_the_connection_and_spares_the_breaker() {
     assert_eq!(r.state(), CircuitState::Closed);
     let ok = r.send("authorization: bob\r\n").await;
     assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+}
+
+/// Open the breaker through the table's own upstream.
+fn open(r: &Rig) {
+    let up = r.table.load().lookup("/svc/").unwrap().upstream.clone();
+    let a = up.try_acquire().unwrap();
+    up.record_failure(a);
+    assert_eq!(up.state(), CircuitState::Open);
+}
+
+#[tokio::test]
+async fn short_circuit_while_open_leaves_state_and_probe_slot_alone() {
+    let r = rig().await;
+    open(&r);
+    assert!(r.send("").await.starts_with("HTTP/1.1 401"));
+    assert_eq!(r.state(), CircuitState::Open);
+    // Past the cooldown a short-circuit must not have taken the probe slot
+    // or moved the state: the next real request is the probe and closes it.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(r.send("").await.starts_with("HTTP/1.1 401"));
+    assert_eq!(r.state(), CircuitState::Open);
+    let ok = r.send("authorization: bob\r\n").await;
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    assert_eq!(r.state(), CircuitState::Closed);
+}
+
+#[tokio::test]
+async fn short_circuit_while_half_open_leaves_state_and_probe_slot_alone() {
+    let r = rig().await;
+    open(&r);
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let up = r.table.load().lookup("/svc/").unwrap().upstream.clone();
+    let probe = up.try_acquire().unwrap();
+    assert_eq!(up.state(), CircuitState::HalfOpen);
+    assert!(r.send("").await.starts_with("HTTP/1.1 401"));
+    assert_eq!(up.state(), CircuitState::HalfOpen);
+    // The held probe still has the slot and decides the state.
+    up.record_success(probe);
+    assert_eq!(up.state(), CircuitState::Closed);
 }

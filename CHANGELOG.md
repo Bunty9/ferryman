@@ -14,7 +14,7 @@ crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
 
 - `ferryman_proxy::VerdictPolicy` (`HeadOnly` default, `DeferNormalToBodyEnd`) on `Policy::verdict`: the latter gives a normal admission's breaker verdict at the end of the response body, so an upstream that resets mid-body opens the breaker. `ferryman` itself keeps `HeadOnly`.
 
-- `ferryman-proxy` feature `unstable-hooks` (off by default, outside semver; changes only in proxy minor releases): `Hooks` (`pre_dispatch` may short-circuit before admission, `stamp` sets only `HeaderPolicy::asserted` names after the strips), `StampCtx`, `AssertedHeaders`, `BoxFuture`, `Policy::hooks`; `full_body` and `ResponseBody` are public with it.
+- `ferryman-proxy` feature `unstable-hooks` (off by default, outside semver; changes only in proxy minor releases): `Hooks` (`pre_dispatch` gets a read-only request head plus mutable extensions, `PreDispatch`, never the body, and may short-circuit before admission; `stamp` sets only `HeaderPolicy::asserted` names after the strips, a panic in it becomes a 500), `PreDispatch`, `StampCtx`, `AssertedHeaders`, `BoxFuture`, `Policy::hooks`; `full_body` and `ResponseBody` are public with it. `Proxy::with_client` panics if `HeaderPolicy::asserted` lists a framing or hop-by-hop name (`host`, `content-length`, `transfer-encoding`, `te`, `trailer`, `upgrade`, `connection`, `keep-alive`, `proxy-connection`, `proxy-authenticate`, `proxy-authorization`, `x-request-id`).
 
 ### Changed
 

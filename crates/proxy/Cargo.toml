@@ -13,6 +13,9 @@ readme = "README.md"
 keywords = ["reverse-proxy", "proxy", "circuit-breaker", "hyper", "http"]
 categories = ["network-programming", "web-programming::http-server"]
 
+[package.metadata.docs.rs]
+features = ["unstable-hooks", "testkit"]
+
 [lib]
 path = "src/lib.rs"
 

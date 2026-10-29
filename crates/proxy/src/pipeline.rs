@@ -316,6 +316,17 @@ const HOP_BY_HOP_HEADERS: [HeaderName; 8] = [
     header::UPGRADE,
 ];
 
+/// Names `Policy.headers.asserted` may never list (given folded): the
+/// hop-by-hop set the strip uses plus the framing / routing headers the proxy
+/// itself owns. Trust-governed names (`x-real-ip`, `forwarded`, ...) are allowed.
+fn asserted_name_denied(folded: &str) -> bool {
+    HOP_BY_HOP_HEADERS.iter().any(|h| h.as_str() == folded)
+        || matches!(
+            folded,
+            "host" | "content-length" | "proxy-connection" | "x-request-id"
+        )
+}
+
 /// Per-process pipeline handler: routing table, upstream client and policy.
 /// Cheap to clone (`Arc` inside).
 #[derive(Clone)]
@@ -397,8 +408,23 @@ impl Proxy {
 
     /// Like [`Proxy::new`] with a caller-supplied upstream client (tests,
     /// embedders).
+    ///
+    /// # Panics
+    ///
+    /// If `policy.headers.asserted` lists a framing, hop-by-hop or
+    /// proxy-owned name (`host`, `content-length`, `transfer-encoding`, `te`,
+    /// `trailer`, `upgrade`, `connection`, `keep-alive`, `proxy-connection`,
+    /// `proxy-authenticate`, `proxy-authorization`, `x-request-id`): stamping
+    /// one would desync framing or the Host the proxy relies on.
     pub fn with_client(table: SharedTable, client: StreamingClient, mut policy: Policy) -> Self {
         policy.headers.fold_asserted();
+        for (raw, folded) in &policy.headers.folded {
+            assert!(
+                !asserted_name_denied(folded),
+                "Policy.headers.asserted may not list `{raw}`: it is a framing, hop-by-hop or \
+                 proxy-owned header"
+            );
+        }
         Self {
             inner: Arc::new(ProxyInner {
                 table,
@@ -650,7 +676,7 @@ async fn handle_core<B>(
     table: Arc<RouteTable>,
     client: Client<HttpConnector, B>,
     conn: &ConnCtx,
-    #[cfg_attr(not(feature = "unstable-hooks"), allow(unused_mut))] mut req: Request<Incoming>,
+    req: Request<Incoming>,
     policy: &Policy,
     wrap: impl FnOnce(Incoming, Duration, Duration, Option<u64>) -> (B, Option<Eos>),
     cx: &Cx,
@@ -674,14 +700,48 @@ where
         return Ok(error_response(StatusCode::OK, body));
     }
 
+    // Decided on the raw request, before any hook runs.
+    // Upgrades (WebSocket etc.) are refused below (501) once the route is known.
+    // `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
+    // like curl --http2 or Java's HttpClient send it on every plain request.
+    let wants_upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
+
     // Before every check and before admission: see `Hooks` (exactly-once).
+    // The hook gets the head read-only plus `&mut Extensions`; the body never
+    // reaches it, and the request is rebuilt unchanged.
     #[cfg(feature = "unstable-hooks")]
-    if let Some(hooks) = &policy.hooks {
-        if let Err(resp) = hooks.pre_dispatch(&mut req, conn).await {
-            record(cx, "none", "none", resp.status().as_u16());
-            return Ok(resp);
+    let req = match &policy.hooks {
+        Some(hooks) => {
+            let (mut parts, body) = req.into_parts();
+            let r = hooks
+                .pre_dispatch(
+                    crate::PreDispatch {
+                        method: &parts.method,
+                        uri: &parts.uri,
+                        version: parts.version,
+                        headers: &parts.headers,
+                        extensions: &mut parts.extensions,
+                    },
+                    conn,
+                )
+                .await;
+            if let Err(resp) = r {
+                // A 1xx is not a final response.
+                let resp = if resp.status().is_informational() {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                } else {
+                    resp
+                };
+                record(cx, "none", "none", resp.status().as_u16());
+                return Ok(resp);
+            }
+            Request::from_parts(parts, body)
         }
-    }
+        None => req,
+    };
 
     if ferryman_core::path::bad_path_normalized(req.uri().path())
         || ferryman_core::path::ambiguous_route(&table, req.uri().path())
@@ -719,14 +779,6 @@ where
         None
     };
 
-    // Upgrades (WebSocket etc.) need both hops spliced together, which this
-    // proxy doesn't do; say so instead of forwarding a mangled plain GET.
-    // `h2c` is exempt: servers may ignore it (RFC 9110 §7.8), and clients
-    // like curl --http2 or Java's HttpClient send it on every plain request.
-    let wants_upgrade = req
-        .headers()
-        .get(header::UPGRADE)
-        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"h2c"));
     if wants_upgrade || req.method() == http::Method::CONNECT {
         record(cx, &route_label, &upstream.name, 501);
         let h1 = req.version() <= http::Version::HTTP_11;
@@ -881,17 +933,28 @@ where
     for n in &hp.asserted {
         parts.headers.remove(n);
     }
-    // Cannot return a response; a panic unwinds through `ticket` (release).
+    // Cannot return a response. A panic is caught: ticket released (no
+    // verdict), 500 recorded. (With `panic = "abort"` the process dies.)
     #[cfg(feature = "unstable-hooks")]
     if let Some(hooks) = &policy.hooks {
-        hooks.stamp(
-            &crate::StampCtx {
-                extensions: &parts.extensions,
-                conn,
-                client_host: client_host.as_deref(),
-            },
-            &mut crate::AssertedHeaders::new(&mut parts.headers, &hp.asserted),
-        );
+        let stamped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hooks.stamp(
+                &crate::StampCtx {
+                    extensions: &parts.extensions,
+                    conn,
+                    client_host: client_host.as_deref(),
+                },
+                &mut crate::AssertedHeaders::new(&mut parts.headers, &hp.asserted),
+            );
+        }));
+        if stamped.is_err() {
+            ticket.release();
+            record(cx, &route_label, &upstream.name, 500);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            ));
+        }
     }
 
     let fwd = Request::from_parts(parts, body);
@@ -1521,7 +1584,7 @@ fn error_response(status: StatusCode, body: impl Into<Bytes>) -> Response<Respon
 }
 
 /// A complete in-memory response body (for hooks building responses).
-pub fn full_body(body: impl Into<Bytes>) -> ResponseBody {
+pub(crate) fn full_body(body: impl Into<Bytes>) -> ResponseBody {
     Full::new(body.into())
         .map_err(|never| match never {})
         .boxed()

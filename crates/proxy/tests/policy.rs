@@ -196,3 +196,68 @@ async fn asserted_names_are_removed_in_every_spelling() {
     assert!(!out.contains("x-real-ip"), "{out}");
     assert!(out.contains("\"x-other\": \"keep\""), "{out}");
 }
+
+fn proxy_asserting(names: &[&str]) -> Proxy {
+    let cfg: ConfigToml =
+        toml::from_str("[[routes]]\nprefix = \"/\"\nupstream = \"http://127.0.0.1:1\"\n").unwrap();
+    let table: SharedTable = Arc::new(arc_swap::ArcSwap::from_pointee(
+        build_table(cfg, None).unwrap(),
+    ));
+    let mut p = Policy::default();
+    p.headers.asserted = names.iter().map(|n| n.parse().unwrap()).collect();
+    Proxy::new(table, p)
+}
+
+#[test]
+#[should_panic(expected = "may not list `content-length`")]
+fn asserting_a_framing_header_panics() {
+    proxy_asserting(&["content-length"]);
+}
+
+#[test]
+#[should_panic(expected = "may not list `host`")]
+fn asserting_host_panics() {
+    proxy_asserting(&["x-ok", "host"]);
+}
+
+#[test]
+#[should_panic(expected = "may not list `proxy-authorization`")]
+fn asserting_a_hop_by_hop_header_panics() {
+    proxy_asserting(&["proxy-authorization"]);
+}
+
+#[test]
+#[should_panic(expected = "may not list `x-request-id`")]
+fn asserting_the_request_id_panics() {
+    proxy_asserting(&["x-request-id"]);
+}
+
+#[test]
+#[should_panic(expected = "may not list `x_request_id`")]
+fn asserting_a_denied_name_in_another_spelling_panics() {
+    proxy_asserting(&["x_request_id"]);
+}
+
+#[test]
+fn every_denied_name_panics_and_trust_governed_names_do_not() {
+    for n in [
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "upgrade",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "x-request-id",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| proxy_asserting(&[n])).is_err(),
+            "{n}"
+        );
+    }
+    proxy_asserting(&["x-real-ip", "x-forwarded-for", "forwarded", "x-tenant"]);
+}

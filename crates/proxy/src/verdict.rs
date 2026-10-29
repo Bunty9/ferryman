@@ -52,15 +52,11 @@ pub enum VerdictPolicy {
 pub(crate) struct Ticket {
     upstream: Upstream,
     admission: Option<Admission>,
-    /// Counts the request against the endpoint for least_conn / p2c until
-    /// the ticket is dropped (any verdict, release or abandon).
-    _inflight: InflightGuard,
 }
 
 impl Ticket {
     pub(crate) fn new(upstream: Upstream, admission: Admission) -> Self {
         Self {
-            _inflight: upstream.track_inflight(),
             upstream,
             admission: Some(admission),
         }
@@ -156,6 +152,8 @@ pub(crate) fn client_fault(e: &(dyn std::error::Error + 'static)) -> Option<Clie
 /// then hangs up reacting to it.
 pub(crate) struct WatchedBody {
     pub(crate) inner: Incoming,
+    /// In-flight count for least_conn / p2c; held until the body is dropped.
+    pub(crate) _inflight: Option<InflightGuard>,
     pub(crate) upstream: Upstream,
     pub(crate) ticket: Option<Ticket>,
     /// `None` on the legacy path (no request-side tracking).
@@ -231,6 +229,33 @@ impl Body for WatchedBody {
             Poll::Pending => {}
         }
         polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// `HeadOnly` response body: forwards `inner` and keeps the in-flight guard
+/// until the body ends or is dropped (no verdict logic).
+pub(crate) struct Held<B> {
+    pub(crate) inner: B,
+    pub(crate) _inflight: InflightGuard,
+}
+
+impl<B: Body + Unpin> Body for Held<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<B::Data>, B::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {

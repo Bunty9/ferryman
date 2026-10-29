@@ -1636,3 +1636,184 @@ async fn all_endpoints_dead_is_503_and_health_loop_recovers() {
     }
     h.abort();
 }
+
+// --- in-flight accounting / least_conn / recovery ---
+
+/// Raw upstream: answers every request with `content-length: 4`, sends "A"
+/// at once and the remaining "AAA" after `delay`.
+async fn spawn_slow_body_stub(delay: Duration) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nA",
+                    )
+                    .await;
+                tokio::time::sleep(delay).await;
+                let _ = s.write_all(b"AAA").await;
+            });
+        }
+    });
+    addr
+}
+
+async fn read_head_and_first_byte(s: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let mut b = [0u8; 256];
+    let mut got = Vec::new();
+    while !(got.ends_with(b"A") && got.windows(4).any(|w| w == b"\r\n\r\n")) {
+        let n = s.read(&mut b).await.unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&b[..n]);
+    }
+}
+
+fn inflight(table: &SharedTable, idx: usize) -> usize {
+    table.load().lookup("/s").unwrap().upstreams.endpoints()[idx]
+        .upstream
+        .inflight()
+}
+
+async fn wait_inflight_zero(table: &SharedTable, idx: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while inflight(table, idx) != 0 {
+        assert!(std::time::Instant::now() < deadline, "inflight stuck");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn inflight_covers_the_response_body_until_end_or_hangup() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let a = spawn_slow_body_stub(Duration::from_millis(600)).await;
+    let table = shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\"]\n"
+    )));
+    let proxy = start_proxy(table.clone()).await;
+    let req = b"GET /s HTTP/1.1\r\nhost: x\r\n\r\n";
+    // Body runs to its end.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(req).await.unwrap();
+    read_head_and_first_byte(&mut s).await;
+    assert_eq!(inflight(&table, 0), 1, "mid-body");
+    let mut rest = [0u8; 3];
+    s.read_exact(&mut rest).await.unwrap();
+    drop(s);
+    wait_inflight_zero(&table, 0).await;
+
+    // Client hangs up mid-body.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(req).await.unwrap();
+    read_head_and_first_byte(&mut s).await;
+    assert_eq!(inflight(&table, 0), 1);
+    drop(s);
+    wait_inflight_zero(&table, 0).await;
+}
+
+#[tokio::test]
+async fn inflight_returns_to_zero_after_mixed_outcomes() {
+    use tokio::io::AsyncWriteExt;
+    let a = spawn_stub(|req| async move {
+        let bad = req.uri().path().ends_with("/bad");
+        let _ = req.into_body().collect().await;
+        if bad {
+            let mut r = ok("x");
+            *r.status_mut() = hyper::StatusCode::BAD_GATEWAY;
+            r
+        } else {
+            ok("fine")
+        }
+    })
+    .await;
+    let table = shared_table(parse_cfg(&format!(
+        "failure_threshold = 100\nrequest_body_idle_timeout_secs = 1\n\
+         [[routes]]\nprefix = \"/s\"\nupstreams = [\"http://{a}\"]\n"
+    )));
+    let proxy = start_proxy(table.clone()).await;
+    let client = reqwest::Client::new();
+    assert_eq!(body_of(&client, &format!("http://{proxy}/s")).await.0, 200);
+    assert_eq!(
+        body_of(&client, &format!("http://{proxy}/s/bad")).await.0,
+        502
+    );
+    // Stalled upload: 408.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"POST /s HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nabc")
+        .await
+        .unwrap();
+    assert!(read_status_line(&mut s).await.contains("408"));
+    drop(s);
+    // Hang-up mid-upload.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"POST /s HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\nabc")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(s);
+    wait_inflight_zero(&table, 0).await;
+}
+
+#[tokio::test]
+async fn least_conn_steers_away_from_an_endpoint_streaming_a_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let a = spawn_slow_body_stub(Duration::from_secs(3)).await;
+    let b = spawn_stub(|_req| async { ok("B") }).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "[[routes]]\nprefix = \"/s\"\nlb = \"least_conn\"\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    // Tie: first request goes to A and keeps streaming.
+    let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    s.write_all(b"GET /s HTTP/1.1\r\nhost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    assert!(s.read(&mut buf).await.unwrap() > 0);
+    let client = reqwest::Client::new();
+    for _ in 0..4 {
+        assert_eq!(
+            body_of(&client, &format!("http://{proxy}/s")).await,
+            (200, "B".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_path_half_open_recovers_on_a_multi_endpoint_health_disabled_route() {
+    let down = Arc::new(AtomicBool::new(true));
+    let a = spawn_toggle_stub(down.clone()).await;
+    let b = spawn_toggle_stub(down.clone()).await;
+    let proxy = start_proxy(shared_table(parse_cfg(&format!(
+        "failure_threshold = 1\ndefault_cooldown_secs = 1\n\
+         [[routes]]\nprefix = \"/s\"\nhealth_disabled = true\nupstreams = [\"http://{a}\", \"http://{b}\"]\n"
+    ))))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy}/s");
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    assert_eq!(body_of(&client, &url).await.0, 502);
+    assert_eq!(body_of(&client, &url).await.0, 503);
+    down.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Each half-open probe waits for its round-robin turn; both close soon.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut ok_seen = 0;
+    while ok_seen < 6 {
+        assert!(std::time::Instant::now() < deadline, "never recovered");
+        if body_of(&client, &url).await.0 == 200 {
+            ok_seen += 1;
+        } else {
+            ok_seen = 0;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}

@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use tokio::time::Sleep;
 use tracing::Instrument;
 
-use crate::verdict::{client_fault, ClientFault, Ticket, VerdictPolicy, WatchedBody};
+use crate::verdict::{client_fault, ClientFault, Held, Ticket, VerdictPolicy, WatchedBody};
 #[allow(deprecated)]
 use crate::ProxyClient;
 use crate::StreamingClient;
@@ -833,6 +833,9 @@ where
 
     // From here every exit gives a verdict or drops the ticket (release).
     let ticket = Ticket::new(upstream.clone(), admission);
+    // In-flight (least_conn / p2c) lasts until the response body is dropped;
+    // every early return drops it with the function.
+    let inflight = upstream.track_inflight();
     let (mut parts, body) = req.into_parts();
     // `upstream_timeout` starts at end-of-request-body (immediately when
     // bodyless), so a slow upload can't be mistaken for a slow upstream.
@@ -1096,9 +1099,14 @@ where
 
             strip_hop_by_hop(&mut rparts.headers);
             let rbody = match policy.verdict {
-                VerdictPolicy::HeadOnly => rbody.boxed(),
+                VerdictPolicy::HeadOnly => Held {
+                    inner: rbody,
+                    _inflight: inflight,
+                }
+                .boxed(),
                 VerdictPolicy::DeferNormalToBodyEnd => WatchedBody {
                     inner: rbody,
+                    _inflight: Some(inflight),
                     upstream: upstream.clone(),
                     ticket: deferred,
                     request: request_state.clone(),

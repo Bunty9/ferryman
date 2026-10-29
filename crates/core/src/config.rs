@@ -446,6 +446,11 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                     "weight of {addr:?} must be 1..={MAX_WEIGHT}, got {weight}"
                 )));
             }
+            if r.lb == LbPolicy::LeastConn && weight != 1 {
+                return Err(bad_set(format!(
+                    "weight of {addr:?} must be 1 under lb = \"least_conn\" (weights are ignored there), got {weight}"
+                )));
+            }
             let uri = parse_endpoint(&r.prefix, &addr)?;
             let name = crate::route::upstream_name(&uri);
             if !names_in_route.insert(name.clone()) {
@@ -566,7 +571,8 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
                             health_path,
                             health_disabled,
                         ),
-                        None => Upstream::new(uri, breaker.clone())?
+                        None => Upstream::new(uri, breaker.clone())
+                            .expect("validated above")
                             .with_health(health_path, health_disabled),
                     };
                     upstreams_by_name.insert(name, u.clone());
@@ -576,7 +582,7 @@ pub fn build_table(cfg: ConfigToml, prev: Option<&RouteTable>) -> Result<RouteTa
             eps.push(Endpoint::new(upstream, weight));
         }
         routes.push(
-            Route::with_upstreams(prefix, UpstreamSet::new(eps, lb)?)
+            Route::with_upstreams(prefix, UpstreamSet::new(eps, lb).expect("validated above"))
                 .with_rewrite_host(rewrite_host)
                 .with_strip_prefix(strip_prefix),
         );
@@ -910,6 +916,7 @@ upstream = "http://h:1"
             "upstreams = [\"http://h:1\", \"http://H:1\"]",
             "upstreams = [{ addr = \"http://h:1\", weight = 0 }]",
             "upstreams = [{ addr = \"http://h:1\", weight = 1001 }]",
+            "lb = \"least_conn\"\nupstreams = [\"http://h:1\", { addr = \"http://h:2\", weight = 2 }]",
         ] {
             assert!(
                 matches!(bad(body), Err(Error::InvalidUpstreamSet { .. })),

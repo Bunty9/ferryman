@@ -173,6 +173,12 @@ impl UpstreamSet {
                     (a, b)
                 };
                 ord.retain(|&i| i != first && i != second);
+                // Shuffle the fallback tail so a refusing pair doesn't always
+                // spill onto the lowest-numbered endpoint.
+                for k in (1..ord.len()).rev() {
+                    let j = (self.next_rand() % (k as u64 + 1)) as usize;
+                    ord.swap(k, j);
+                }
                 ord.insert(0, second);
                 ord.insert(0, first);
             }
@@ -180,13 +186,17 @@ impl UpstreamSet {
         ord
     }
 
-    /// Weighted random index, never `skip`.
-    fn weighted_pick(&self, skip: Option<usize>) -> usize {
+    fn next_rand(&self) -> u64 {
         let x = self.rng.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
         // splitmix64 finaliser
         let x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         let x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let x = x ^ (x >> 31);
+        x ^ (x >> 31)
+    }
+
+    /// Weighted random index, never `skip`.
+    fn weighted_pick(&self, skip: Option<usize>) -> usize {
+        let x = self.next_rand();
         let skipped = skip.map_or(0, |s| i64::from(self.endpoints[s].weight));
         let mut r = (x % (self.total_weight - skipped) as u64) as i64;
         for (i, e) in self.endpoints.iter().enumerate() {

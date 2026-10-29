@@ -141,7 +141,8 @@ pointing there and kept across hot reloads. A route holds an `UpstreamSet`
 (endpoints with weights, plus `lb`: smooth weighted round robin, `least_conn`,
 `p2c`); the set only orders endpoints, `acquire` offers each to its breaker at
 most once and the `Ticket` goes to the one that admits. In-flight counts
-(`Upstream::track_inflight`, held by the `Ticket`) feed `least_conn`/`p2c`.
+(`Upstream::track_inflight`; the guard rides the response body, not the
+`Ticket`, so streams count until the body ends or is dropped) feed `least_conn`/`p2c`.
 
 ```
              failures >= threshold

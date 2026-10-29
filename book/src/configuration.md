@@ -45,7 +45,7 @@ At least one route is needed. Routes are matched by longest prefix
 | `prefix` | string | required | hot | Path prefix, matched on segment boundaries (`/a` does not match `/ab`) against the normalised, case-sensitive request path. Must start with `/` and be written in normalised form (rejected at load otherwise); may not contain `;`, `\`, `%2F` or `%5C`. Duplicates are rejected. |
 | `upstream` | string | one of `upstream`/`upstreams` | hot | `http://host:port`: no path, no query, no `https`. A host is required (`http://:80` is rejected). One endpoint. |
 | `upstreams` | array | one of `upstream`/`upstreams` | hot | Several endpoints: each a URI string (as `upstream`) or a table `{ addr = "http://host:port", weight = 3 }`. Non-empty; the same `host:port` twice in one route is rejected, as is setting both `upstream` and `upstreams`. |
-| `lb` | string | `"round_robin"` | hot | How `upstreams` are picked: `round_robin` (smooth weighted), `least_conn` (fewest in-flight requests, ties rotate; weights ignored) or `p2c` (two endpoints drawn by weight, the less loaded wins). |
+| `lb` | string | `"round_robin"` | hot | How `upstreams` are picked: `round_robin` (smooth weighted), `least_conn` (fewest in-flight requests, counted until the response body finishes; ties rotate; weights must stay 1) or `p2c` (two endpoints drawn by weight, the less loaded wins). |
 | `cooldown_secs` | integer | `default_cooldown_secs` | hot | Per-route cooldown override. |
 | `health_path` | string | `"/health"` | hot | Health probe path: absolute, no `?` or `#`. |
 | `health_disabled` | bool | `false` | hot | Skip active probing of this route's upstream ([Circuit breaker](circuit-breaker.md#health-driven-recovery)). |
@@ -61,12 +61,16 @@ lb = "least_conn"
 upstreams = ["http://api-1:8000", { addr = "http://api-2:8000", weight = 2 }]
 ```
 
-`weight` is `1..=1000` (default 1) and applies to `round_robin` and `p2c`.
+`weight` is `1..=1000` (default 1) and applies to `round_robin` and `p2c`;
+any weight other than 1 under `least_conn` is rejected at load.
 Each endpoint (`host:port`) has its own circuit breaker and health probe. A
 request is offered to endpoints in policy order and goes to the first whose
 breaker admits; endpoints that refuse (open circuit) are skipped. If every
 endpoint refuses, the answer is 503: the request never falls back to another
-route. The `upstream` metric label is the chosen endpoint's `host:port`; for
+route. With `round_robin`, a recovering endpoint's request-path half-open
+probe is only sent when its turn comes up, so recovery can lag; active health
+probes cover this, so enable health checks on multi-endpoint routes (do not
+set `health_disabled` there unless traffic is steady). The `upstream` metric label is the chosen endpoint's `host:port`; for
 events with no chosen endpoint (503 with all endpoints refusing, a 501 or
 413 before selection) it is the endpoint of a one-endpoint route and
 `multiple` otherwise. A reload resets round-robin position but keeps every

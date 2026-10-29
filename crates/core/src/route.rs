@@ -84,8 +84,9 @@ impl Upstream {
     }
 
     /// Count one in-flight request until the guard drops; the load balancer
-    /// (`least_conn`, `p2c`) reads it. Hold it as long as the request is
-    /// dispatched (the proxy ties it to the breaker ticket).
+    /// (`least_conn`, `p2c`) reads it. The proxy holds it from admission until
+    /// the response body ends or is dropped (so a long download or SSE stream
+    /// counts), independent of the breaker verdict.
     pub fn track_inflight(&self) -> InflightGuard {
         self.inflight.fetch_add(1, Ordering::Relaxed);
         InflightGuard(self.inflight.clone())

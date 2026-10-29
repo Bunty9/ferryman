@@ -8,16 +8,15 @@
 
 #[cfg(feature = "admin")]
 pub mod admin;
-pub mod proxy;
 #[cfg(feature = "reload")]
 pub mod reload;
 pub mod tls;
 
+/// The per-request handler (re-exported from `ferryman-proxy`).
+pub use ferryman_proxy::pipeline as proxy;
+
 use ferryman_core::SharedTable;
-use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as HttpAutoBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -29,26 +28,9 @@ use tls::MaybeTlsStream;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// The 0.2.2 client type, kept for compatibility with [`proxy::handle`].
-#[deprecated(
-    since = "0.2.3",
-    note = "use `StreamingClient` with `proxy::handle_streaming`"
-)]
-pub type ProxyClient = Client<HttpConnector, Incoming>;
-
-/// Shared hyper client used by [`serve`] to forward requests to upstreams.
-/// Bodies are streamed straight through, no buffering; the request body is
-/// wrapped in [`proxy::RequestBody`] (idle timeout, end-of-body signal).
-pub type StreamingClient = Client<HttpConnector, proxy::RequestBody>;
-
-/// Latency buckets (seconds) for `ferryman_request_duration_seconds`,
-/// spanning sub-millisecond proxy hops up to `upstream_timeout_secs`'s
-/// default of 30s, so the slowest (about-to-time-out) requests still land
-/// in a real bucket instead of falling into `+Inf`. The duration is measured
-/// from request start to response headers, so it includes the request upload.
-pub const LATENCY_BUCKETS: &[f64] = &[
-    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-];
+#[allow(deprecated)]
+pub use ferryman_proxy::ProxyClient;
+pub use ferryman_proxy::{StreamingClient, LATENCY_BUCKETS};
 
 /// Deadline for a client to finish the TLS handshake and to send its first
 /// request. Stops idle sockets from pinning file descriptors (slowloris).
@@ -77,11 +59,7 @@ pub async fn serve(
     tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let mut connector = HttpConnector::new();
-    // Streamed bodies are many small writes; Nagle + delayed ACK would add
-    // ~40ms stalls.
-    connector.set_nodelay(true);
-    let client: StreamingClient = Client::builder(TokioExecutor::new()).build(connector);
+    let client: StreamingClient = ferryman_proxy::client();
     let mut builder = HttpAutoBuilder::new(TokioExecutor::new());
     builder.http1().timer(TokioTimer::new());
     builder

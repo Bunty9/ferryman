@@ -57,7 +57,7 @@ jobs:
             | jq -e '[.packages[] | select(.manifest_path | contains("/examples/")) | .publish] | all(. == [])'
 
   # Blocking: public API must stay semver-compatible with the last release
-  # on crates.io (action default baseline = registry). Checks both crates.
+  # on crates.io (action default baseline = registry). Checks ferryman and ferryman-core.
   semver:
     name: cargo-semver-checks
     runs-on: ubuntu-latest
@@ -67,6 +67,10 @@ jobs:
           persist-credentials: false
       # The action installs its own toolchain (rust-toolchain input, default stable).
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          # ferryman-proxy has no crates.io baseline until 0.4.0 is
+          # published; drop this exclude once it is.
+          exclude: ferryman-proxy
 
   # Blocking: the declared rust-version (1.88) must really build.
   # rust-toolchain.toml pins stable, hence RUSTUP_TOOLCHAIN.

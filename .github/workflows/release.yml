@@ -52,14 +52,16 @@ jobs:
             echo "::error::tag $tag does not match [workspace.package] version $pkg_version (expected v${pkg_version})"
             exit 1
           fi
-          core_version=$(sed -n \
-            's/^ferryman-core = { path = "crates\/core", version = "\([^"]*\)".*/\1/p' \
-            Cargo.toml)
-          if [ "$core_version" != "$pkg_version" ]; then
-            echo "::error::ferryman-core entry in [workspace.dependencies] ($core_version) does not match [workspace.package] version ($pkg_version)"
-            exit 1
-          fi
-          echo "tag $tag matches version $pkg_version (ferryman-core dependency: $core_version)"
+          for dep in core proxy; do
+            dep_version=$(sed -n \
+              "s/^ferryman-$dep = { path = \"crates\/$dep\", version = \"\([^\"]*\)\".*/\1/p" \
+              Cargo.toml)
+            if [ "$dep_version" != "$pkg_version" ]; then
+              echo "::error::ferryman-$dep entry in [workspace.dependencies] ($dep_version) does not match [workspace.package] version ($pkg_version)"
+              exit 1
+            fi
+          done
+          echo "tag $tag matches version $pkg_version (ferryman-core and ferryman-proxy dependencies match)"
 
       - name: Extract CHANGELOG.md section
         run: |
@@ -88,13 +90,13 @@ jobs:
         run: cargo test --workspace --locked
 
       # Packages and builds the exact crates `publish` uploads (the
-      # workspace dry run resolves ferryman-core's not-yet-published
+      # workspace dry run resolves ferryman-core/-proxy's not-yet-published
       # version through a local overlay registry). This is what makes
       # `cargo publish --no-verify` in `publish` safe.
       - name: cargo publish --workspace --dry-run --locked
         run: cargo publish --workspace --dry-run --locked
 
-  # Publishes both crates. `id-token: write` mints the crates.io Trusted
+  # Publishes all three crates. `id-token: write` mints the crates.io Trusted
   # Publishing token; `contents: read` (never `write`) because `cargo
   # publish` also runs dependency build scripts. Each crate's publish is
   # idempotent (skipped if that exact version is already on crates.io), so
@@ -132,11 +134,12 @@ jobs:
           set -euo pipefail
           pkg_version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name=="ferryman") | .version')
-          # ferryman depends on ferryman-core, so it must publish first.
+          # ferryman depends on ferryman-core and ferryman-proxy (which depends on
+          # core), so publish order is core -> proxy -> ferryman.
           # 200 = already published (skip), 404 = publish, else fail.
           # --no-verify: `verify` already ran `cargo publish --workspace
           # --dry-run --locked` on this same commit.
-          for crate in ferryman-core ferryman; do
+          for crate in ferryman-core ferryman-proxy ferryman; do
             code=$(curl -sS -o /dev/null -w '%{http_code}' \
               -A "ferryman-release (github.com/Bunty9/ferryman)" \
               "https://crates.io/api/v1/crates/${crate}/${pkg_version}")

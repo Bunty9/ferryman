@@ -57,6 +57,7 @@ reload = ["dep:notify"]
 
 [dependencies]
 ferryman-core = { workspace = true }
+ferryman-proxy = { workspace = true }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

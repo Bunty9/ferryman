@@ -371,6 +371,7 @@ dependencies = [
  "arc-swap",
  "clap",
  "ferryman-core",
+ "ferryman-proxy",
  "http",
  "http-body-util",
  "hyper",
@@ -428,6 +429,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ferryman-proxy"
+version = "0.3.0"
+dependencies = [
+ "ferryman-core",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

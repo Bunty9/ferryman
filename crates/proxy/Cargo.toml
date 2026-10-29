@@ -1,0 +1,27 @@
+[package]
+name = "ferryman-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Request pipeline of the ferryman reverse proxy: routing lookup, circuit-breaker admission, header policy, streaming forward. Shared by ferryman and ferryman-edge."
+documentation = "https://docs.rs/ferryman-proxy"
+readme = "README.md"
+keywords = ["reverse-proxy", "proxy", "circuit-breaker", "hyper", "http"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ferryman-core = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+metrics = { workspace = true }
+tracing = { workspace = true }

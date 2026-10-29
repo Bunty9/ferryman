@@ -2,13 +2,14 @@
 
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
-crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`
-and `ferryman` are released together with the same version.
+crates follow [Semantic Versioning](https://semver.org/). `ferryman-core`,
+`ferryman-proxy` and `ferryman` are released together with the same version.
 
 ## [Unreleased]
 
 ### Added
 
+- `ferryman-proxy` crate (request pipeline, shared with ferryman-edge); `ferryman` re-exports it, no API change.
 - HTTP/1 request-smuggling / desync regression suite (`crates/server/tests/smuggling.rs`, raw-TCP e2e with a byte-recording upstream).
 
 ### Fixed

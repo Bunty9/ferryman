@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/proxy",
     "crates/server",
     "examples/embedded",
     "examples/full-stack/demo-upstream",
@@ -19,6 +20,7 @@ homepage = "https://github.com/Bunty9/ferryman"
 [workspace.dependencies]
 # Internal crate: path for local builds, version for crates.io.
 ferryman-core = { path = "crates/core", version = "0.3.0" }
+ferryman-proxy = { path = "crates/proxy", version = "0.3.0" }
 
 # Runtime + HTTP
 tokio = { version = "1.47", features = ["full"] }

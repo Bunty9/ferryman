@@ -13,8 +13,9 @@ contract (config keys, status codes, metrics) is in the
 |                  | `route.rs`                              | `Upstream`, `Route`, `RouteTable`, `SharedTable`, prefix lookup  |
 |                  | `config.rs`                             | TOML schema, `load_config`, validating `build_table`             |
 |                  | `health.rs`                             | Concurrent active health checks                                  |
+| `ferryman-proxy` | `lib.rs`                                | `StreamingClient`, `ProxyClient`, `LATENCY_BUCKETS`, client builder |
+|                  | `pipeline.rs`                           | Per-request handler (re-exported as `ferryman::proxy`)           |
 | `ferryman`       | `lib.rs`                                | `serve`: accept loop, deadlines, TLS, graceful shutdown          |
-|                  | `proxy.rs`                              | Per-request handler                                              |
 |                  | `admin.rs`                              | `/metrics`, `/healthz`, `/readyz` server                         |
 |                  | `tls.rs`                                | rustls acceptor, `MaybeTlsStream`                                |
 |                  | `reload.rs`                             | Debounced directory watcher, hash de-dup, SIGHUP/TLS reload                                    |

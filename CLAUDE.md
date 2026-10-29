@@ -1,7 +1,7 @@
 # ferryman — notes for Claude
 
 Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, health loop.
-`crates/server` = lib (`serve`, proxy, tls, reload) + thin `main.rs`. Internals: `docs/architecture.md`.
+`crates/proxy` = request pipeline (`ferryman-proxy`, re-exported as `ferryman::proxy`). `crates/server` = lib (`serve`, tls, reload) + thin `main.rs`. Internals: `docs/architecture.md`.
 
 ## Commands
 
@@ -50,7 +50,7 @@ Small L7 reverse proxy (hyper 1.x). `crates/core` = breaker, routing, config, he
 
 ## Publishing
 
-- Version lives in `[workspace.package]` AND the `ferryman-core` entry of `[workspace.dependencies]`; bump both together. On a minor/major bump also update the `version = "0.x"` reqs on both crates in `examples/embedded/Cargo.toml`, and commit the refreshed `Cargo.lock` (`release.yml` builds `--locked`).
+- Version lives in `[workspace.package]` AND the `ferryman-core` and `ferryman-proxy` entries of `[workspace.dependencies]`; bump all three together (release.yml checks both entries). On a minor/major bump also update the `version = "0.x"` reqs on both crates in `examples/embedded/Cargo.toml`, and commit the refreshed `Cargo.lock` (`release.yml` builds `--locked`).
 - `crates/*/LICENSE-*` are symlinks to the root files; keep them (they ship the license texts in each `.crate`).
 - `ConfigToml`/`RouteToml` are `#[non_exhaustive]`: construct via TOML parsing outside the core crate.
 - Release binaries: `binaries` job in `release.yml` (`binaries` tier 1 gates attest and publish; `binaries-extra` tier 2 best effort, not attested); naming `ferryman-v<ver>-<target>.tar.gz|zip` is mirrored in `[package.metadata.binstall]`. Tier 1 builds with `cargo auditable` (tier 2 is built without it). `attest` and `image-attest` jobs (the only ones with `id-token`/`attestations: write`; no checkout, no cargo; tier-1 archives only; skipped on dry runs) runs before `publish`. Dry run: run the workflow via `workflow_dispatch` (builds only, no publish). Actions are SHA-pinned; zizmor runs in CI.

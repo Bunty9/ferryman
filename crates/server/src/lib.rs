@@ -30,7 +30,9 @@ use tokio_rustls::TlsAcceptor;
 
 #[allow(deprecated)]
 pub use ferryman_proxy::ProxyClient;
-pub use ferryman_proxy::{ConnCtx, Policy, Proxy, StreamingClient, TlsInfo, LATENCY_BUCKETS};
+pub use ferryman_proxy::{
+    ConnCtx, HeaderPolicy, Policy, Proxy, StreamingClient, TlsInfo, LATENCY_BUCKETS,
+};
 
 /// Deadline for a client to finish the TLS handshake and to send its first
 /// request. Stops idle sockets from pinning file descriptors (slowloris).

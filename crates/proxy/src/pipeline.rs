@@ -44,6 +44,9 @@ pub struct RequestBody {
     inner: Incoming,
     idle: Duration,
     deadline: tokio::time::Instant,
+    /// `Policy::max_request_body_bytes`: streamed bytes allowed, and bytes seen.
+    max: Option<u64>,
+    seen: u64,
     // Armed only while waiting on the client, so a slow upstream connect or
     // an upstream that is not reading is never blamed on the client.
     idle_sleep: Option<Pin<Box<Sleep>>>,
@@ -118,8 +121,19 @@ impl std::fmt::Display for BodyTotalTimeout {
 }
 impl std::error::Error for BodyTotalTimeout {}
 
+/// The streamed request body passed `Policy::max_request_body_bytes` (413).
+#[derive(Debug)]
+pub(crate) struct BodyTooLarge;
+
+impl std::fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body too large")
+    }
+}
+impl std::error::Error for BodyTooLarge {}
+
 impl RequestBody {
-    fn new(inner: Incoming, idle: Duration, total: Duration) -> (Self, Eos) {
+    fn new(inner: Incoming, idle: Duration, total: Duration, max: Option<u64>) -> (Self, Eos) {
         let (tx, rx) = oneshot::channel();
         let state = Arc::new(BodyState {
             polled: AtomicBool::new(false),
@@ -132,6 +146,8 @@ impl RequestBody {
             inner,
             idle,
             deadline: tokio::time::Instant::now() + total,
+            max,
+            seen: 0,
             idle_sleep: None,
             total_sleep: None,
             eos: Some(tx),
@@ -169,6 +185,14 @@ impl Body for RequestBody {
                 // trust-governed header names. Keep polling for the next frame.
                 Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
                 Poll::Ready(Some(Ok(frame))) => {
+                    if let (Some(max), Some(d)) = (this.max, frame.data_ref()) {
+                        this.seen = this.seen.saturating_add(d.len() as u64);
+                        if this.seen > max {
+                            this.state.stall_ended();
+                            this.state.waiting_on_client.store(false, Ordering::Relaxed);
+                            return Poll::Ready(Some(Err(BodyTooLarge.into())));
+                        }
+                    }
                     this.idle_sleep = None;
                     this.state.stall_ended();
                     this.state.waiting_on_client.store(false, Ordering::Relaxed);
@@ -252,15 +276,42 @@ pub struct Proxy {
 struct ProxyInner {
     table: SharedTable,
     client: StreamingClient,
-    // Fields arrive in step 3; held so `Proxy::new` already takes it.
-    #[allow(dead_code)]
     policy: Policy,
 }
 
-/// Behaviour knobs for [`Proxy`]. Empty for now; fields are added additively.
+/// Behaviour knobs for [`Proxy`]. `Policy::default()` is ferryman's own
+/// behaviour: header handling from the route table, no body cap. Construct
+/// with `let mut p = Policy::default(); p.field = ...;`; fields are added
+/// additively.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
-pub struct Policy {}
+pub struct Policy {
+    /// Header handling overrides.
+    pub headers: HeaderPolicy,
+    /// 413 when a declared `Content-Length` is over the cap, or when the
+    /// streamed body passes it. Never affects the breaker. `None` = no cap.
+    pub max_request_body_bytes: Option<u64>,
+}
+
+/// Overrides for the forwarding-header step. The default uses the route
+/// table's `xff`, `trusted_proxies` and `forwarded_header`.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct HeaderPolicy {
+    /// `None` = the table's `xff_mode()`.
+    pub xff: Option<XffMode>,
+    /// `None` = the table's `trusted_proxies()`. `Some(TrustedProxies::default())`
+    /// trusts no peer, whatever the table says.
+    pub trusted_proxies: Option<TrustedProxies>,
+    /// `None` = the table's `forwarded_header()`.
+    pub forwarded_header: Option<bool>,
+    /// Request header names (lowercase) the embedder asserts. For each, its
+    /// non-canonical spellings are removed for every peer (together with the
+    /// trust-governed set), and the canonical name is removed after the
+    /// forwarding step, whatever the client or that step wrote. Listing a
+    /// trust-governed name (e.g. `x-real-ip`) hands it to the embedder.
+    pub asserted: Vec<HeaderName>,
+}
 
 impl Proxy {
     /// Builds its own upstream client (HTTP/1.1, TCP_NODELAY).
@@ -291,8 +342,8 @@ impl Proxy {
     /// The private-peer `trusted_proxies` warning is the caller's job, see
     /// [`warn_if_private_peer`].
     pub async fn handle(&self, req: Request<Incoming>, conn: &ConnCtx) -> Response<ResponseBody> {
-        let wrap = |body, idle, total| {
-            let (b, eos) = RequestBody::new(body, idle, total);
+        let wrap = |body, idle, total, max| {
+            let (b, eos) = RequestBody::new(body, idle, total, max);
             (b, Some(eos))
         };
         let Ok(resp) = handle_inner(
@@ -300,6 +351,7 @@ impl Proxy {
             self.inner.client.clone(),
             conn,
             req,
+            &self.inner.policy,
             wrap,
         )
         .await;
@@ -356,9 +408,14 @@ pub async fn handle(
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     warn_if_private_peer(&table.load(), peer);
-    handle_inner(table, client, &shim_ctx(peer, proto), req, |b, _, _| {
-        (b, None)
-    })
+    handle_inner(
+        table,
+        client,
+        &shim_ctx(peer, proto),
+        req,
+        &Policy::default(),
+        |b, _, _, _| (b, None),
+    )
     .await
 }
 
@@ -439,7 +496,8 @@ async fn handle_inner<B>(
     client: Client<HttpConnector, B>,
     conn: &ConnCtx,
     mut req: Request<Incoming>,
-    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
+    policy: &Policy,
+    wrap: impl FnOnce(Incoming, Duration, Duration, Option<u64>) -> (B, Option<Eos>),
 ) -> Result<Response<ResponseBody>, Infallible>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -494,7 +552,7 @@ where
         tracing::Span::none()
     };
     let cx = Cx { started, log };
-    let Ok(mut resp) = handle_core(table, client, conn, req, wrap, &cx)
+    let Ok(mut resp) = handle_core(table, client, conn, req, policy, wrap, &cx)
         .instrument(span)
         .await;
     // Only with `request_id = true`; a client-supplied id is never echoed otherwise.
@@ -516,7 +574,8 @@ async fn handle_core<B>(
     client: Client<HttpConnector, B>,
     conn: &ConnCtx,
     req: Request<Incoming>,
-    wrap: impl FnOnce(Incoming, Duration, Duration) -> (B, Option<Eos>),
+    policy: &Policy,
+    wrap: impl FnOnce(Incoming, Duration, Duration, Option<u64>) -> (B, Option<Eos>),
     cx: &Cx,
 ) -> Result<Response<ResponseBody>, Infallible>
 where
@@ -598,6 +657,22 @@ where
         return Ok(resp);
     }
 
+    // Declared length over the cap: refused before admission (no ticket).
+    if let Some(max) = policy.max_request_body_bytes {
+        let declared = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > max) {
+            record(cx, &route_label, &upstream.name, 413);
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload too large",
+            ));
+        }
+    }
+
     let Some(admission) = upstream.try_acquire() else {
         record(cx, &route_label, &upstream.name, 503);
         return Ok(error_response(
@@ -614,6 +689,7 @@ where
         body,
         table.request_body_idle_timeout(),
         table.request_body_timeout(),
+        policy.max_request_body_bytes,
     );
     let counts_timeout = bodyless || body_done.is_some();
     strip_hop_by_hop(&mut parts.headers);
@@ -626,8 +702,11 @@ where
     // way. With `rewrite_host`, the upstream's own authority wins over both.
     // The client's effective host, for `Forwarded host=`; captured before
     // `rewrite_host` can overwrite it.
-    let client_host: Option<String> = table
-        .forwarded_header()
+    let hp = &policy.headers;
+    let forwarded_header = hp
+        .forwarded_header
+        .unwrap_or_else(|| table.forwarded_header());
+    let client_host: Option<String> = (forwarded_header || !hp.asserted.is_empty())
         .then(|| match parts.uri.authority() {
             Some(a) => a.as_str().rsplit('@').next().unwrap_or("").to_string(),
             None => parts
@@ -693,15 +772,23 @@ where
         proto,
         client_host.as_deref(),
         &FwdCfg {
-            trusted: table.trusted_proxies(),
-            forwarded_header: table.forwarded_header(),
-            xff: table.xff_mode(),
+            trusted: hp
+                .trusted_proxies
+                .as_ref()
+                .unwrap_or_else(|| table.trusted_proxies()),
+            forwarded_header,
+            xff: hp.xff.unwrap_or_else(|| table.xff_mode()),
+            asserted: &hp.asserted,
         },
     );
 
     // After apply_forwarded_headers (it strips untrusted values).
     if let Some((_, prefix)) = strip.as_ref().filter(|(_, p)| !p.is_empty()) {
         set_forwarded_prefix(&mut parts.headers, prefix);
+    }
+    // Asserted names are the embedder's alone: drop whatever is there now.
+    for n in &hp.asserted {
+        parts.headers.remove(n);
     }
 
     let fwd = Request::from_parts(parts, body);
@@ -768,6 +855,15 @@ where
             Ok(error_response(
                 StatusCode::REQUEST_TIMEOUT,
                 "request body timeout",
+            ))
+        }
+        Some(Err(e)) if is_body_too_large(&e) => {
+            // The client's upload passed the cap: its fault, never the breaker's.
+            upstream.release(admission);
+            record(cx, &route_label, &upstream.name, 413);
+            Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload too large",
             ))
         }
         Some(Err(e)) if is_client_body_error(&e) => {
@@ -892,6 +988,18 @@ fn is_body_idle_timeout(e: &hyper_util::client::legacy::Error) -> bool {
     false
 }
 
+/// Did `client.request` fail because the streamed body passed the size cap?
+fn is_body_too_large(e: &hyper_util::client::legacy::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if err.is::<BodyTooLarge>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// Did `client.request` fail because reading the *client's* body failed?
 /// hyper reports errors from the outgoing body as user errors.
 fn is_client_body_error(e: &hyper_util::client::legacy::Error) -> bool {
@@ -930,6 +1038,8 @@ struct FwdCfg<'a> {
     trusted: &'a TrustedProxies,
     forwarded_header: bool,
     xff: XffMode,
+    /// Embedder-asserted names: folded like the trust-governed set.
+    asserted: &'a [HeaderName],
 }
 
 /// RFC 1918, 100.64/10, fc00::/7, fe80::/10, loopback.
@@ -1023,7 +1133,7 @@ const TRUST_GOVERNED: [&str; 9] = [
 /// header? Allocation-free for names made only of `[a-z0-9-]`, which are
 /// either canonical or unrelated. Runs of separators are collapsed and
 /// the ends trimmed (`x__real_ip`, `-x-real-ip` -> `x-real-ip`).
-fn is_noncanonical_spelling(name: &str) -> bool {
+fn is_noncanonical_spelling(name: &str, asserted: &[HeaderName]) -> bool {
     // Already normal (no leading/trailing `-`, no `--`): protected iff an exact
     // match, and exact matches are canonical, hence kept.
     if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -1043,15 +1153,15 @@ fn is_noncanonical_spelling(name: &str) -> bool {
         }
     }
     let folded = folded.trim_end_matches('-');
-    TRUST_GOVERNED.contains(&folded)
+    TRUST_GOVERNED.contains(&folded) || asserted.iter().any(|a| a.as_str() == folded)
 }
 
 /// Remove, for every peer, non-canonical spellings (`X_Real_IP`, `x.forwarded.for`)
 /// of trust-governed headers.
-fn strip_noncanonical_spellings(headers: &mut HeaderMap) {
+fn strip_noncanonical_spellings(headers: &mut HeaderMap, asserted: &[HeaderName]) {
     let bad: Vec<HeaderName> = headers
         .keys()
-        .filter(|k| is_noncanonical_spelling(k.as_str()))
+        .filter(|k| is_noncanonical_spelling(k.as_str(), asserted))
         .cloned()
         .collect();
     for k in bad {
@@ -1105,7 +1215,7 @@ fn apply_forwarded_headers(
     client_host: Option<&str>,
     cfg: &FwdCfg<'_>,
 ) {
-    strip_noncanonical_spellings(headers);
+    strip_noncanonical_spellings(headers, cfg.asserted);
     let trusted = cfg.trusted;
     let xfp = HeaderName::from_static("x-forwarded-proto");
     let xport = HeaderName::from_static("x-forwarded-port");
@@ -1389,6 +1499,7 @@ mod tests {
             trusted: t,
             forwarded_header,
             xff,
+            asserted: &[],
         }
     }
 
@@ -1763,6 +1874,91 @@ mod tests {
             assert_eq!(get(&m, "x--custom"), Some("keep"));
             assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
         }
+    }
+
+    #[test]
+    fn override_xff_trusted_and_forwarded_header_feed_fwdcfg() {
+        // The overrides reach apply_forwarded_headers through FwdCfg: Replace
+        // writes the client only, an empty trust list ignores forged values,
+        // forwarded_header = true appends `Forwarded`.
+        let h = [
+            ("x-forwarded-for", "6.6.6.6"),
+            ("x-forwarded-proto", "https"),
+        ];
+        let hdrs = |h: &[(&str, &str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in h {
+                m.append(
+                    HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            m
+        };
+        let hp = HeaderPolicy {
+            xff: Some(XffMode::Replace),
+            trusted_proxies: Some(TrustedProxies::default()),
+            forwarded_header: Some(true),
+            ..HeaderPolicy::default()
+        };
+        // Table says: trust 10/8, append, no Forwarded.
+        let table_trusted = tp(&["10.0.0.0/8"]);
+        let mut m = hdrs(&h);
+        let t = hp.trusted_proxies.as_ref().unwrap_or(&table_trusted);
+        apply_forwarded_headers(
+            &mut m,
+            "10.1.2.3".parse().unwrap(),
+            "http",
+            Some("h"),
+            &FwdCfg {
+                trusted: t,
+                forwarded_header: hp.forwarded_header.unwrap_or(false),
+                xff: hp.xff.unwrap_or(XffMode::Append),
+                asserted: &hp.asserted,
+            },
+        );
+        assert_eq!(get(&m, "x-forwarded-for"), Some("10.1.2.3"));
+        assert_eq!(get(&m, "x-forwarded-proto"), Some("http"));
+        assert!(get(&m, "forwarded").unwrap().contains("for=10.1.2.3"));
+        // No overrides: the table's trust applies, so the forged proto is kept.
+        let m = run(&["10.0.0.0/8"], "10.1.2.3", "http", &h);
+        assert_eq!(get(&m, "x-forwarded-proto"), Some("https"));
+        assert_eq!(get(&m, "forwarded"), None);
+    }
+
+    #[test]
+    fn asserted_names_join_the_noncanonical_fold() {
+        let t = tp(&[]);
+        let asserted = [HeaderName::from_static("x-tenant")];
+        let mut m = HeaderMap::new();
+        for k in ["x_tenant", "X.Tenant", "-x-tenant", "x--tenant", "x_other"] {
+            m.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                "v".parse().unwrap(),
+            );
+        }
+        m.append("x-tenant", "canonical".parse().unwrap());
+        apply_forwarded_headers(
+            &mut m,
+            "1.2.3.4".parse().unwrap(),
+            "http",
+            None,
+            &FwdCfg {
+                trusted: &t,
+                forwarded_header: false,
+                xff: XffMode::Append,
+                asserted: &asserted,
+            },
+        );
+        for k in ["x_tenant", "x.tenant", "-x-tenant", "x--tenant"] {
+            assert_eq!(get(&m, k), None, "{k}");
+        }
+        assert_eq!(get(&m, "x_other"), Some("v"));
+        // The canonical name is the caller's step-21 business, not the fold's.
+        assert_eq!(get(&m, "x-tenant"), Some("canonical"));
+        // Without `asserted` the same spellings survive.
+        assert!(!is_noncanonical_spelling("x_tenant", &[]));
+        assert!(is_noncanonical_spelling("x_tenant", &asserted));
     }
 
     #[test]

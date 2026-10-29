@@ -7,7 +7,7 @@ pub mod conn;
 pub mod pipeline;
 
 pub use conn::{ConnCtx, TlsInfo};
-pub use pipeline::{warn_if_private_peer, Policy, Proxy};
+pub use pipeline::{warn_if_private_peer, HeaderPolicy, Policy, Proxy};
 
 use hyper::body::Incoming;
 use hyper_util::client::legacy::connect::HttpConnector;
